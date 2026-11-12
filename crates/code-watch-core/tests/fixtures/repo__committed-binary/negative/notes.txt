@@ -1,1 +1,1 @@
-plain text mentioning ELF and MZ
+MZ notes about ELF

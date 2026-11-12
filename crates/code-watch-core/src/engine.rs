@@ -118,6 +118,7 @@ impl Engine {
             }
             let (binary_rules, text_rules): (Vec<_>, Vec<_>) =
                 wanted.into_iter().partition(|r| r.is_binary_rule());
+            let mut claimed_binary = false;
             if !binary_rules.is_empty() {
                 let head = read_head(entry.path());
                 let executable = entry.metadata().is_ok_and(|m| is_executable(&m));
@@ -126,9 +127,7 @@ impl Engine {
                         .iter()
                         .flat_map(|r| r.check_head(rel, &head, executable)),
                 );
-                if binary_rules.iter().any(|r| r.claims_binary(&head)) {
-                    continue;
-                }
+                claimed_binary = binary_rules.iter().any(|r| r.claims_binary(&head));
             }
             if text_rules.is_empty() {
                 continue;
@@ -137,6 +136,7 @@ impl Engine {
                 Ok(content) => {
                     findings.extend(text_rules.iter().flat_map(|r| r.check_file(rel, &content)));
                 }
+                Err(_) if claimed_binary => {}
                 Err(reason) => skipped.push(Skipped {
                     path: rel.to_string_lossy().into_owned(),
                     reason,
@@ -299,24 +299,35 @@ mod tests {
     }
 
     #[test]
-    fn each_binary_format_is_recognised_and_not_reported_as_skipped() {
+    fn a_binary_is_reported_once_and_not_as_unreadable() {
         let dir = tempfile::tempdir().unwrap();
-        for (name, magic) in [
-            ("elf.py", &b"\x7fELF\x00"[..]),
-            ("macho.js", &[0xcf, 0xfa, 0xed, 0xfe, 0][..]),
-            ("macho32.js", &[0xfe, 0xed, 0xfa, 0xce, 0][..]),
-            ("pe.rb", &b"MZ\x90\x00"[..]),
-        ] {
-            fs::write(dir.path().join(name), magic).unwrap();
-        }
+        fs::write(dir.path().join("payload.py"), b"\x7fELF\x00\xff").unwrap();
         let report = Engine::embedded().unwrap().scan_dir(dir.path()).unwrap();
         let hits = report
             .findings()
             .iter()
             .filter(|f| f.rule_id == "repo/committed-binary")
             .count();
-        assert_eq!(hits, 4);
+        assert_eq!(hits, 1);
         assert!(report.skipped().is_empty());
+    }
+
+    #[test]
+    fn a_script_starting_with_mz_is_still_scanned_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("x.sh"),
+            "MZ=1; echo aGk= | base64 -d | sh\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("n.txt"), "MZ notes\n").unwrap();
+        let report = Engine::embedded().unwrap().scan_dir(dir.path()).unwrap();
+        let ids: Vec<_> = report
+            .findings()
+            .iter()
+            .map(|f| f.rule_id.as_str())
+            .collect();
+        assert_eq!(ids, ["repo/base64-into-shell"]);
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! Every embedded rule must come with a positive and a negative fixture: a rule that cannot
 //! fail is a finding. Repo rules use `tests/fixtures/<id>/{positive,negative}/` directories
-//! (inert text only), command rules use `positive.txt` / `negative.txt` with one command per line.
+//! (inert text only; every file in `positive/` must fire on its own, so a fixture per regex
+//! alternative proves each alternative), command rules use `positive.txt` / `negative.txt` with one command per line.
 
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use code_watch_core::{Engine, RuleSet, Target};
 
@@ -22,6 +24,22 @@ fn lines(path: PathBuf) -> Vec<String> {
         .collect()
 }
 
+fn files_under(dir: &Path) -> Vec<String> {
+    ignore::WalkBuilder::new(dir)
+        .standard_filters(false)
+        .build()
+        .flatten()
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .map(|e| {
+            e.path()
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
 #[test]
 fn every_rule_has_a_positive_and_a_negative_fixture() {
     let engine = Engine::embedded().unwrap();
@@ -29,12 +47,23 @@ fn every_rule_has_a_positive_and_a_negative_fixture() {
         let dir = fixture_dir(&rule.id);
         match rule.target() {
             Target::Repo => {
-                let positive = engine.scan_dir(&dir.join("positive")).unwrap();
-                assert!(
-                    positive.findings().iter().any(|f| f.rule_id == rule.id),
-                    "{} did not fire on its positive fixture",
-                    rule.id
-                );
+                let positive_dir = dir.join("positive");
+                let positive = engine.scan_dir(&positive_dir).unwrap();
+                let fired: HashSet<_> = positive
+                    .findings()
+                    .iter()
+                    .filter(|f| f.rule_id == rule.id)
+                    .filter_map(|f| f.evidence.file.clone())
+                    .collect();
+                let files = files_under(&positive_dir);
+                assert!(!files.is_empty(), "{} has no positive fixture", rule.id);
+                for file in files {
+                    assert!(
+                        fired.contains(&file),
+                        "{} did not fire on positive fixture {file}",
+                        rule.id
+                    );
+                }
                 let negative = engine.scan_dir(&dir.join("negative")).unwrap();
                 assert!(
                     negative.findings().iter().all(|f| f.rule_id != rule.id),
