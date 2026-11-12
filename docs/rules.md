@@ -60,8 +60,14 @@ them out" is expressed: each half alone does not fire.
 
 ## Rules built in Rust
 
-Rules that need the command split into words (lookalike domains, `osascript`, `LaunchAgents` writes) live in
+Rules that need the command split into words (lookalike domains, `osascript`, `LaunchAgents` and `LaunchDaemons` writes) live in
 `crates/code-watch-core/src/command/` and are listed in `command::RULES`. They are not in the TOML files. Their
 fixtures work like command-regex fixtures (`positive.txt` / `negative.txt`, one command per line) and the fixture test
 runs them with the macOS-only rules enabled on every platform. `--json` carries `skipped_rules`: the ids of rules that
 exist but are not active on this platform.
+
+What they do not see, by design: operators glued to a word (`curl x|sh`, left to the regex rules), pipelines inside a
+`$(...)`, nesting deeper than three levels, variables, heredocs, and the script an `osascript` reads from a file or
+standard input. A lookalike is one edit away (or the same name under another suffix, or the same Unicode skeleton) from
+the known list; `SIBLINGS` in `domains.rs` lists real sites that must never be flagged, so a new known domain that
+collides with a real one gets a negative fixture and a sibling entry.

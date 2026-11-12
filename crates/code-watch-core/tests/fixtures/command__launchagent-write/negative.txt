@@ -2,3 +2,6 @@ ls ~/Library/LaunchAgents
 cat ~/Library/LaunchAgents/com.example.plist > /tmp/out
 launchctl list
 cp a.plist ~/Library/Preferences/
+cp ~/Library/LaunchAgents/com.example.plist /tmp/
+mv /Library/LaunchDaemons/com.example.plist ./
+echo ">~/Library/LaunchAgents/x"
