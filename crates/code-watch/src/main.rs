@@ -7,6 +7,8 @@ use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use code_watch_core::{Engine, Report, render};
 
+mod hook;
+
 /// Exit code for errors and bad usage. Verdicts use 0, 1 and 2, so 2 always means "block".
 const EXIT_ERROR: u8 = 3;
 
@@ -33,6 +35,10 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Scan every repository on clone, through a git template hook (changes your global git config)
+    InstallHook,
+    /// Remove what install-hook added, leaving your git config as it was
+    UninstallHook,
 }
 
 fn main() -> ExitCode {
@@ -57,6 +63,24 @@ fn real_main() -> ExitCode {
             return ExitCode::from(if ok { 0 } else { EXIT_ERROR });
         }
     };
+    let hook_result = match &cli.command {
+        Cmd::InstallHook => Some(
+            std::env::current_exe()
+                .map_err(|e| hook::HookError(e.to_string()))
+                .and_then(|exe| hook::install(&exe)),
+        ),
+        Cmd::UninstallHook => Some(hook::uninstall()),
+        _ => None,
+    };
+    if let Some(result) = hook_result {
+        return match result {
+            Ok(message) => {
+                println!("code-watch: {message}");
+                ExitCode::SUCCESS
+            }
+            Err(hook::HookError(message)) => fail(&message),
+        };
+    }
     let report = match run(&cli) {
         Ok(report) => report,
         Err(e) => return fail(&format!("{e:#}")),
@@ -87,6 +111,7 @@ fn run(cli: &Cli) -> anyhow::Result<Report> {
     Ok(match &cli.command {
         Cmd::Scan { dir } => engine.scan_dir(dir)?,
         Cmd::Check { command } => engine.check_command(&command.join(" ")),
+        Cmd::InstallHook | Cmd::UninstallHook => unreachable!("handled before run"),
     })
 }
 
