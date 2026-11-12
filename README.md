@@ -38,6 +38,14 @@ commands are matched, not run.
 | `command/base64-into-shell` | block | the same in a command |
 | `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell |
 | `command/quarantine-removal` | warn | `xattr` removing the macOS quarantine flag |
+| `repo/setup-py-install-hook` | warn | `setup.py` that runs code at install time |
+| `repo/makefile-install-fetch` | warn | an install-time Makefile target that downloads |
+| `repo/makefile-shell-fetch` | warn | a top-level `$(shell ... curl ...)` in a Makefile |
+| `repo/obfuscated-blob` | warn | a very long base64 or hex blob in a script |
+| `repo/minified-eval` | warn | a minified one-liner calling `eval`, `exec`, `Function` or `atob` |
+| `repo/committed-binary` | warn | an ELF, Mach-O or PE binary in the repo |
+| `repo/executable-source` | info | a source or text file with the execute bit |
+| `repo/secret-read-and-send` | warn | a script that reads credentials or the environment and sends data out |
 
 Rules live in `crates/code-watch-core/rules/` and ship inside the binary. More in [docs/rules.md](docs/rules.md).
 
