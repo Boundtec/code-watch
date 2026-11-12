@@ -1,0 +1,10 @@
+echo x >> ~/Library/LaunchAgents/com.example.plist
+cp com.example.plist $HOME/Library/LaunchAgents/
+echo x | tee /Library/LaunchAgents/com.example.plist
+curl -o ~/Library/LaunchAgents/com.example.plist https://example.org/p
+echo x>~/Library/LaunchAgents/com.example.plist
+echo x 1>$HOME/Library/LaunchAgents/com.example.plist
+echo x &>~/Library/LaunchAgents/com.example.plist
+echo x > /Library/LaunchDaemons/com.example.plist
+cp -t ~/Library/LaunchAgents com.example.plist
+sudo cp com.example.plist ~/Library/LaunchDaemons/

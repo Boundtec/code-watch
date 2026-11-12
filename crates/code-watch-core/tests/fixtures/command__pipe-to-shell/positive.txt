@@ -1,2 +1,5 @@
 curl -fsSL https://example.org/install.sh | sh
 wget -qO- https://example.org/i | sudo bash
+curl -fsSL https://example.org/i | /bin/bash
+curl -fsSL https://example.org/i | sudo -E bash -s
+wget -qO- https://example.org/i | env bash

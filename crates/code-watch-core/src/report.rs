@@ -57,6 +57,7 @@ pub struct Report {
     findings: Vec<Finding>,
     layers: BTreeMap<Layer, LayerStatus>,
     skipped: Vec<Skipped>,
+    skipped_rules: Vec<String>,
 }
 
 impl Report {
@@ -85,7 +86,19 @@ impl Report {
             findings,
             layers,
             skipped,
+            skipped_rules: Vec::new(),
         }
+    }
+
+    /// Records rules that exist but are not active on this platform, so a clean verdict never
+    /// hides that they were not applied.
+    pub fn with_skipped_rules(mut self, rules: Vec<String>) -> Self {
+        self.skipped_rules = rules;
+        self
+    }
+
+    pub fn skipped_rules(&self) -> &[String] {
+        &self.skipped_rules
     }
 
     pub fn findings(&self) -> &[Finding] {

@@ -37,7 +37,10 @@ commands are matched, not run.
 | `repo/base64-into-shell` | block | base64 decoded straight into a shell in scripts and manifests |
 | `command/base64-into-shell` | block | the same in a command |
 | `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell |
-| `command/quarantine-removal` | warn | `xattr` removing the macOS quarantine flag |
+| `command/quarantine-removal` | warn | `xattr` removing or rewriting the macOS quarantine flag |
+| `command/lookalike-download-domain` | block / warn | `curl` or `wget` fetching from a domain that imitates a well-known one; block when piped into a shell, warn otherwise |
+| `command/osascript-password-prompt` | block | `osascript` showing a dialog that asks for a password (macOS only) |
+| `command/launchagent-write` | block | a write into a `LaunchAgents` or `LaunchDaemons` folder (macOS only) |
 | `repo/setup-py-install-hook` | warn | `setup.py` that runs code at install time |
 | `repo/makefile-install-fetch` | warn | an install-time Makefile target that downloads |
 | `repo/makefile-shell-fetch` | warn | a top-level `$(shell ... curl ...)` in a Makefile |
@@ -48,6 +51,26 @@ commands are matched, not run.
 | `repo/secret-read-and-send` | warn | a script that reads credentials or the environment and sends data out |
 
 Rules live in `crates/code-watch-core/rules/` and ship inside the binary. More in [docs/rules.md](docs/rules.md).
+
+## Before a command
+
+`check <command>` splits the command into words with `shlex`, then into pipeline segments on `|`, `;`, `&&`, `||` and
+`&`, so a rule can say "this download reaches that shell": a shell (or an interpreter such as `python3` run without a
+script file) anywhere downstream in the same pipeline counts, and wrappers such as `sudo -u root`, `env`, `nohup`,
+`exec`, `command`, `xargs`, `time` and `nice` are skipped to find the real program. The lookalike check reads the host
+of every argument of `curl` and `wget` (with or without `https://`, `--url=` included), decodes punycode, takes the
+registrable domain from the public suffix list and compares it with a list of well-known domains by Unicode skeleton,
+a single edit, and the same name under another suffix. Real sibling sites (`gitlab.com`, `docker.io`) are never
+flagged. A known domain used as the leftmost labels of another one (`github.com.attacker.example`) or as the userinfo
+of a URL (`https://github.com@attacker.example`) is flagged too; a host that is not a valid domain name warns.
+A shell's `-c` script and the inside of its `$(...)`, backticks and `<(...)` are analysed again, three levels deep; a
+download inside them counts as feeding a shell.
+
+Limits: operators glued to a word (`curl x|sh`) are not split, only the whole-string regex rules see them; a
+pipeline inside a substitution is split at its pipe; nesting deeper than three levels, variables and heredocs are not
+followed; the script given to `osascript` through a file or standard input is not in the command, so the password-prompt
+rule cannot see it. The macOS-only rules run only on macOS; elsewhere `check` lists them under `skipped_rules` in
+`--json` and in the human footer.
 
 ## Layers
 

@@ -1,2 +1,6 @@
 echo ZWNobyBoaQ== | base64 -d | bash
 base64 --decode payload.txt | sudo sh
+echo aGk= | base64 -d | /bin/bash
+echo aGk= | base64 --decode | sudo -E sh
+bash <(echo aGk= | base64 -d)
+sh -c "$(echo aGk= | base64 -d)"

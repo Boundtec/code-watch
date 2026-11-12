@@ -1,6 +1,7 @@
 //! Detection engine of code-watch. The CLI, the git hook, the agent adapters and the PATH
 //! shims are thin callers of [`Engine`].
 
+pub mod command;
 pub mod engine;
 pub mod finding;
 mod names;
