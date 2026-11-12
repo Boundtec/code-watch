@@ -148,7 +148,7 @@ fn positional_args(seg: &Segment) -> Option<Vec<&str>> {
                 if !attached {
                     args.next()?;
                 }
-            } else if !(flags.long_plain.contains(&name.as_str()) && !attached) {
+            } else if !flags.long_plain.contains(&name.as_str()) || attached {
                 return None;
             }
         } else if let Some(cluster) = arg.strip_prefix('-').filter(|c| !c.is_empty()) {
