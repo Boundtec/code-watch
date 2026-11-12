@@ -1,0 +1,1 @@
+setup(cmdclass={"install": X})

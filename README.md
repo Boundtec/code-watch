@@ -40,6 +40,7 @@ commands are matched, not run.
 | `command/quarantine-removal` | warn | `xattr` removing the macOS quarantine flag |
 | `repo/setup-py-install-hook` | warn | `setup.py` that runs code at install time |
 | `repo/makefile-install-fetch` | warn | an install-time Makefile target that downloads |
+| `repo/makefile-shell-fetch` | warn | a top-level `$(shell ... curl ...)` in a Makefile |
 | `repo/obfuscated-blob` | warn | a very long base64 or hex blob in a script |
 | `repo/minified-eval` | warn | a minified one-liner calling `eval`, `exec`, `Function` or `atob` |
 | `repo/committed-binary` | warn | an ELF, Mach-O or PE binary in the repo |

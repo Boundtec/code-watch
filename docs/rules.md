@@ -27,7 +27,7 @@ match = { kind = "json_pointer", files = ["**/package.json"], pointers = ["/scri
 | `json_pointer` | repo files | `files` (globs), `pointers` (RFC 6901) | a pointer exists in the JSON file |
 | `file_regex` | repo files | `files`, `pattern` | the pattern matches; one finding per file, at the first match |
 | `all_regex` | repo files | `files`, `patterns` (list) | every pattern matches somewhere in the same file; the finding points at the first pattern's line |
-| `binary_file` | repo files | `files`, `formats` (`elf`, `mach_o`, `pe`) | the file starts with that format's magic bytes; checked before the text is read, so a binary is never also reported as unreadable |
+| `binary_file` | repo files | `files`, `formats` (`elf`, `mach_o`, `pe`) | the file starts with that format's magic bytes; the file is also scanned as text when it is valid UTF-8 (a script starting with `MZ` is not a PE file); a recognised binary is never reported as unreadable. PE needs the DOS header's `e_lfanew` to point at `PE\0\0`, and fat Mach-O needs an architecture count of 1 to 20 (a Java class file has the same `cafebabe` magic) |
 | `executable_file` | repo files | `files` | the file has a unix execute bit (never fires on non-unix hosts) |
 | `command_regex` | a command string | `pattern` | the pattern matches the command |
 
@@ -39,13 +39,14 @@ them out" is expressed: each half alone does not fire.
 
 | Id | Severity | Catches |
 |---|---|---|
-| `repo/setup-py-install-hook` | warn | `cmdclass`, `os.system`, `subprocess.*`, `exec(` or `eval(` in `setup.py` |
-| `repo/makefile-install-fetch` | warn | an `all`, `install`, `setup` or `bootstrap` target that runs `curl` or `wget` |
-| `repo/obfuscated-blob` | warn | a base64 or hex run of 200+ characters in a script |
-| `repo/minified-eval` | warn | a line of 400+ characters that calls `eval`, `exec`, `Function` or `atob` (method calls such as `re.exec(` are ignored) |
+| `repo/setup-py-install-hook` | warn | `cmdclass`, `subprocess`, `__import__`, `urlopen`, `urlretrieve`, `system(`, `os.popen(`, `exec(` or `eval(` in `setup.py` |
+| `repo/makefile-install-fetch` | warn | an `all`, `install`, `setup` or `bootstrap` target whose recipe runs `curl` or `wget`. Limit: a prerequisite target that fetches (`install: fetch`, `fetch:` runs `curl`) is not followed |
+| `repo/makefile-shell-fetch` | warn | a top-level `$(shell ... curl ...)` or `!=` assignment, which runs on every make invocation |
+| `repo/obfuscated-blob` | warn | 240+ base64 or hex characters in a script, also when wrapped over lines or split into quoted, `+` or `\` joined pieces; a data URI or an embedded PEM in a script warns too, which is acceptable for a warn (lockfile hashes and `.pem` files are not scripts and are not scanned) |
+| `repo/minified-eval` | warn | a line of 400+ characters that calls `eval`, `exec`, `Function` or `atob` (method calls such as `re.exec(` are ignored; `window.`, `globalThis.` and `self.` receivers are not) |
 | `repo/committed-binary` | warn | an ELF, Mach-O or PE file in the repo |
 | `repo/executable-source` | info | a source, data or text file with the execute bit |
-| `repo/secret-read-and-send` | warn | one script that reads `~/.ssh`, `~/.aws`, the keychain or the whole environment and also makes a network call; warn because legitimate deploy scripts do both |
+| `repo/secret-read-and-send` | warn | one script that reads `.ssh`, `.aws`, `.kube`, `.gnupg`, `.npmrc`, `.netrc`, `.git-credentials`, Docker config, the keychain or the whole environment and also makes a network call; warn because legitimate deploy scripts do both |
 
 ## Adding a rule
 
@@ -55,3 +56,4 @@ them out" is expressed: each half alone does not fire.
    `positive.txt` and `negative.txt` with one command per line. Fixtures are inert text: no real malware, secrets or tokens.
 3. `cargo test` fails if a rule has no fixtures, does not fire on the positive, or fires on the negative.
 4. Add a row to the table in the README.
+5. A regex with alternatives needs a positive fixture per alternative: every file in `positive/` must fire on its own, so deleting an alternative turns a fixture red.
