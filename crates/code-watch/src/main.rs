@@ -9,6 +9,8 @@ use clap::{Parser, Subcommand};
 use code_watch_core::allow::find_repo_root;
 use code_watch_core::{Allowlists, Engine, Report, render};
 
+mod hook;
+
 /// Exit code for errors and bad usage. Verdicts use 0, 1 and 2, so 2 always means "block".
 const EXIT_ERROR: u8 = 3;
 
@@ -35,6 +37,10 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Scan every repository on clone, through a git template hook (changes your global git config)
+    InstallHook,
+    /// Remove what install-hook added, leaving your git config as it was
+    UninstallHook,
 }
 
 fn main() -> ExitCode {
@@ -60,7 +66,11 @@ fn real_main() -> ExitCode {
         }
     };
     let report = match run(&cli) {
-        Ok(report) => report,
+        Ok(Outcome::Report(report)) => report,
+        Ok(Outcome::Message(message)) => {
+            println!("code-watch: {message}");
+            return ExitCode::SUCCESS;
+        }
         Err(e) => return fail(&format!("{e:#}")),
     };
     let text = if cli.json {
@@ -84,21 +94,28 @@ fn fail(message: &str) -> ExitCode {
     ExitCode::from(EXIT_ERROR)
 }
 
-fn run(cli: &Cli) -> anyhow::Result<Report> {
-    let engine = Engine::embedded()?;
+/// What a subcommand produces: a scan report, or a plain message for the hook commands.
+enum Outcome {
+    Report(Report),
+    Message(String),
+}
+
+fn run(cli: &Cli) -> anyhow::Result<Outcome> {
     let user_dir = user_config_dir(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir());
     Ok(match &cli.command {
         Cmd::Scan { dir } => {
             let allow = Allowlists::load(user_dir.as_deref(), Some(dir))?;
-            engine.scan_dir_with(dir, &allow)?
+            Outcome::Report(Engine::embedded()?.scan_dir_with(dir, &allow)?)
         }
         Cmd::Check { command } => {
             let repo = std::env::current_dir()
                 .ok()
                 .and_then(|d| find_repo_root(&d));
             let allow = Allowlists::load(user_dir.as_deref(), repo.as_deref())?;
-            engine.check_command_with(&command.join(" "), &allow)
+            Outcome::Report(Engine::embedded()?.check_command_with(&command.join(" "), &allow))
         }
+        Cmd::InstallHook => Outcome::Message(hook::install(&std::env::current_exe()?)?),
+        Cmd::UninstallHook => Outcome::Message(hook::uninstall()?),
     })
 }
 

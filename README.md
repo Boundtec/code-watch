@@ -78,6 +78,12 @@ rule cannot see it. The macOS-only rules run only on macOS; elsewhere `check` li
 `.code-watch.toml` can only allow non-block rules unless your file also lists them. Hidden findings are listed under
 `suppressed` in `--json` and counted in the footer. Details in [docs/allowlist.md](docs/allowlist.md).
 
+## Scan on clone
+
+`code-watch install-hook` scans every new clone through a global git template hook; `uninstall-hook` removes it and
+leaves your git config as it was. It refuses rather than overwrite a template directory of your own. Details in
+[docs/git-hook.md](docs/git-hook.md).
+
 ## Layers
 
 Rules always run and need no key. The CVE layer and the optional LLM layer are not built yet; every report says which
