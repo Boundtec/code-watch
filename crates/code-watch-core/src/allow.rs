@@ -4,12 +4,13 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
-use crate::finding::{Evidence, Finding, Layer, Severity};
+use crate::finding::{Evidence, Finding, Layer, Severity, clean_text};
 
 const SUPPORTED_SCHEMA: u32 = 1;
 const USER_FILE: &str = "allow.toml";
@@ -150,7 +151,10 @@ impl Allowlists {
             (&self.repo, REPO_FILE),
         ] {
             for e in entries.iter().filter(|e| !known_ids.contains(&e.rule)) {
-                warnings.push(format!("unknown rule id {:?} in {file}", e.rule));
+                warnings.push(format!(
+                    "unknown rule id {:?} in {file}",
+                    clean_text(&e.rule)
+                ));
             }
         }
         Applied {
@@ -252,27 +256,46 @@ fn parse(text: &str, path: &str) -> Result<Vec<Entry>, AllowError> {
                 path: path_matcher,
                 domain: raw.domain,
                 package: raw.package,
-                reason: raw.reason,
+                reason: raw.reason.as_deref().map(clean_text),
             })
         })
         .collect()
 }
 
-/// `Ok(None)` when there is no file. The file is read only if it is a regular file (never a
-/// symlink) of a sane size; every other outcome is a problem text for the report.
-fn read_repo_file(path: &Path) -> Result<Option<Vec<Entry>>, String> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("cannot be read: {e}")),
-    };
-    if !meta.is_file() {
-        return Err("is not a regular file (symlinks are not followed)".into());
+/// Opens without following a symlink and without blocking on a FIFO, so a file swapped in after
+/// any earlier check cannot be followed or hang the scan.
+fn open_untrusted(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    if meta.len() > MAX_REPO_FILE_BYTES {
+    options.open(path)
+}
+
+/// `Ok(None)` when there is no file. The file is read only if the opened handle is a regular
+/// file (never a symlink) and at most `MAX_REPO_FILE_BYTES` long; every other outcome is a
+/// problem text for the report.
+fn read_repo_file(path: &Path) -> Result<Option<Vec<Entry>>, String> {
+    let file = match open_untrusted(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot be opened (symlinks are not followed): {e}")),
+    };
+    let is_file = file.metadata().is_ok_and(|m| m.is_file());
+    if !is_file {
+        return Err("is not a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_REPO_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot be read: {e}"))?;
+    if bytes.len() as u64 > MAX_REPO_FILE_BYTES {
         return Err(format!("is larger than {MAX_REPO_FILE_BYTES} bytes"));
     }
-    let text = fs::read_to_string(path).map_err(|e| format!("cannot be read: {e}"))?;
+    let text = String::from_utf8(bytes).map_err(|_| "is not valid UTF-8".to_string())?;
     parse(&text, REPO_FILE).map(Some).map_err(|e| e.to_string())
 }
 
@@ -661,6 +684,54 @@ mod tests {
         let a = load_repo(repo.path());
         assert_eq!(ids(&a.kept), ["w", REPO_INVALID]);
         assert!(a.kept[1].evidence.excerpt.contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_like_the_repo_file_is_ignored_and_does_not_hang() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            std::ffi::CString::new(dir.path().join(REPO_FILE).as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let a = load_repo(dir.path());
+        assert_eq!(ids(&a.kept), ["w", REPO_INVALID]);
+        assert!(a.kept[1].evidence.excerpt.contains("not a regular file"));
+    }
+
+    #[test]
+    fn a_file_of_exactly_the_cap_is_read_and_one_byte_more_is_not() {
+        let mut body = b"schema = 1\n[[allow]]\nrule = \"w\"\n#".to_vec();
+        body.resize(MAX_REPO_FILE_BYTES as usize, b'x');
+        assert!(load_repo(repo_with(&body).path()).kept.is_empty());
+        body.push(b'x');
+        assert_eq!(
+            ids(&load_repo(repo_with(&body).path()).kept),
+            ["w", REPO_INVALID]
+        );
+    }
+
+    #[test]
+    fn text_from_a_hostile_repo_file_reaches_the_report_without_control_characters() {
+        let dir = repo_with(
+            "schema = 1\n[[allow]]\nrule = \"gone\\u001b[2J\\u202e\"\nreason = \"a\\u001b[31m\\u202eb\"\n\
+             [[allow]]\nrule = \"w\"\nreason = \"x\\u001b[31m\\u202ey\"\n"
+                .as_bytes(),
+        );
+        let a = load_repo(dir.path());
+        let reason = a.suppressed[0].reason.as_deref().unwrap();
+        assert_eq!(reason, "x?[31m?y");
+        assert!(
+            a.warnings[0]
+                .chars()
+                .all(|c| !c.is_control() && c != '\u{202e}'),
+            "{}",
+            a.warnings[0]
+        );
+        let broken = repo_with(b"schema = 1\n[[allow]]\nrule = \"w\"\n\x1b[31mbogus\x1b = 1\n");
+        let a = load_repo(broken.path());
+        assert_eq!(a.kept[1].rule_id, REPO_INVALID);
+        assert!(a.kept[1].evidence.excerpt.chars().all(|c| !c.is_control()));
     }
 
     #[test]

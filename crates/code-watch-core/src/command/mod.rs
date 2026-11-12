@@ -2,11 +2,14 @@
 //! segments. Whole-string patterns stay in `rules/command.toml`.
 
 mod domains;
+mod fetch;
 mod parse;
 
 use crate::finding::{Evidence, Finding, Layer, Severity};
 use domains::Verdict;
 use parse::Segment;
+
+pub use fetch::stamp_fetch_domain;
 
 pub struct BuiltinRule {
     pub id: &'static str,
@@ -86,36 +89,6 @@ fn analyze_text(
             for (inner, feeds) in nested_texts(seg) {
                 analyze_text(&inner, command, macos, depth + 1, feeds, findings);
             }
-        }
-    }
-}
-
-/// The distinct hosts that `curl` and `wget` segments of the command fetch, including inside
-/// `sh -c` and substitutions. An allowlist `domain` entry may only match a command that fetches
-/// exactly one host.
-pub fn fetched_hosts(command: &str) -> Vec<String> {
-    let mut hosts = Vec::new();
-    collect_hosts(command, 0, &mut hosts);
-    hosts.sort();
-    hosts.dedup();
-    hosts
-}
-
-fn collect_hosts(text: &str, depth: usize, hosts: &mut Vec<String>) {
-    if depth >= MAX_DEPTH {
-        return;
-    }
-    for seg in parse::segments(text) {
-        match seg.program() {
-            Some(p) if FETCHERS.contains(&p) => {
-                hosts.extend(seg.args().iter().filter_map(|w| domains::fetched_host(w)));
-            }
-            Some(p) if SHELLS.contains(&p) || p == "eval" => {
-                for (inner, _) in nested_texts(&seg) {
-                    collect_hosts(&inner, depth + 1, hosts);
-                }
-            }
-            _ => {}
         }
     }
 }

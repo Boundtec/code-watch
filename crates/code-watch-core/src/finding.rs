@@ -34,18 +34,22 @@ pub struct Evidence {
 
 impl Evidence {
     pub fn new(file: Option<String>, line: Option<usize>, excerpt: &str) -> Self {
-        let excerpt: String = excerpt
-            .trim()
-            .chars()
-            .map(|c| if is_invisible(c) { '?' } else { c })
-            .take(MAX_EXCERPT_CHARS)
-            .collect();
+        let excerpt = clean_text(excerpt);
         Self {
             file,
             line,
             excerpt,
         }
     }
+}
+
+/// Trims, truncates and replaces invisible characters, for any text taken from untrusted input.
+pub(crate) fn clean_text(text: &str) -> String {
+    text.trim()
+        .chars()
+        .map(|c| if is_invisible(c) { '?' } else { c })
+        .take(MAX_EXCERPT_CHARS)
+        .collect()
 }
 
 /// Control characters and Unicode format characters (bidi overrides, zero-width joiners) can

@@ -190,3 +190,31 @@ fn check_outside_any_repo_uses_the_user_file_only() {
     fs::remove_dir(repo.path().join(".git")).unwrap();
     assert_eq!(check_in(repo.path()), 1);
 }
+
+#[test]
+fn hostile_allowlist_text_never_puts_control_bytes_in_the_output() {
+    let xdg = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("package.json"),
+        r#"{"scripts":{"postinstall":"x"}}"#,
+    )
+    .unwrap();
+    for body in [
+        "schema = 1\n[[allow]]\nrule = \"gone\\u001b[2J\\u202e\"\nreason = \"\\u001b[31m\\u202e\"\n\
+         [[allow]]\nrule = \"repo/npm-lifecycle-script\"\nreason = \"\\u001b[31m\\u202e\"\n",
+        "schema = 1\n\u{1b}[31mbogus\u{1b} = \u{202e}1\n",
+    ] {
+        fs::write(repo.path().join(".code-watch.toml"), body).unwrap();
+        for json in [false, true] {
+            let mut cmd = with_config(xdg.path());
+            if json {
+                cmd.arg("--json");
+            }
+            let out = cmd.arg("scan").arg(repo.path()).output().unwrap();
+            let text = String::from_utf8(out.stdout).unwrap();
+            let bad = |c: char| (c.is_control() && c != '\n') || c == '\u{202e}';
+            assert!(!text.chars().any(bad), "json={json}: {text:?}");
+        }
+    }
+}
