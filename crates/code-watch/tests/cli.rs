@@ -66,3 +66,15 @@ fn a_usage_error_exits_with_the_error_code_not_the_block_code() {
     let out = code_watch().arg("bogus").output().unwrap();
     assert_eq!(out.status.code(), Some(3));
 }
+
+#[test]
+fn a_closed_stdout_exits_with_the_error_code_not_a_panic() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let status = std::process::Command::new(assert_cmd::cargo::cargo_bin("code-watch"))
+        .args(["check", "ls"])
+        .stdout(writer)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(3));
+}
