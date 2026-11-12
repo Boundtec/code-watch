@@ -19,4 +19,4 @@ id = "command/quarantine-removal"
 severity = "warn"
 title = "The command removes the macOS quarantine flag, which skips the Gatekeeper check"
 remediation = "Only remove quarantine from software whose source you have verified."
-match = { kind = "command_regex", pattern = '\bxattr\b[^|;&]*\s-[a-zA-Z]*[dc]' }
+match = { kind = "command_regex", pattern = '\bxattr\b[^|;&]*(\s-[a-zA-Z]*c|\s-[a-zA-Z]*d[^|;&]*com\.apple\.quarantine)' }

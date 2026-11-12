@@ -1,2 +1,3 @@
 xattr -d com.apple.quarantine /Applications/Demo.app
 xattr -cr Demo.app
+xattr -r -d com.apple.quarantine Demo.app

@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+use std::panic::{self, UnwindSafe};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -34,6 +36,19 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    panic::set_hook(Box::new(|info| {
+        let _ = writeln!(io::stderr(), "code-watch: internal error: {info}");
+    }));
+    guarded(real_main)
+}
+
+/// Runs `f` and turns a panic into the error exit code: the default 101 would be read as a
+/// verdict-less crash by hooks that only know 0, 1, 2 and 3.
+fn guarded(f: impl FnOnce() -> ExitCode + UnwindSafe) -> ExitCode {
+    panic::catch_unwind(f).unwrap_or(ExitCode::from(EXIT_ERROR))
+}
+
+fn real_main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
@@ -42,21 +57,29 @@ fn main() -> ExitCode {
             return ExitCode::from(if ok { 0 } else { EXIT_ERROR });
         }
     };
-    match run(&cli) {
-        Ok(report) => {
-            let text = if cli.json {
-                render::to_json(&report)
-            } else {
-                render::to_human(&report)
-            };
-            println!("{}", text.trim_end());
-            ExitCode::from(report.verdict().exit_code())
+    let report = match run(&cli) {
+        Ok(report) => report,
+        Err(e) => return fail(&format!("{e:#}")),
+    };
+    let text = if cli.json {
+        match render::to_json(&report) {
+            Ok(text) => text,
+            Err(e) => return fail(&e.to_string()),
         }
-        Err(e) => {
-            eprintln!("code-watch: {e:#}");
-            ExitCode::from(EXIT_ERROR)
-        }
+    } else {
+        render::to_human(&report)
+    };
+    let mut stdout = io::stdout().lock();
+    match writeln!(stdout, "{}", text.trim_end()).and_then(|()| stdout.flush()) {
+        Ok(()) => ExitCode::from(report.verdict().exit_code()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::from(EXIT_ERROR),
+        Err(e) => fail(&e.to_string()),
     }
+}
+
+fn fail(message: &str) -> ExitCode {
+    let _ = writeln!(io::stderr(), "code-watch: {message}");
+    ExitCode::from(EXIT_ERROR)
 }
 
 fn run(cli: &Cli) -> anyhow::Result<Report> {
@@ -65,4 +88,17 @@ fn run(cli: &Cli) -> anyhow::Result<Report> {
         Cmd::Scan { dir } => engine.scan_dir(dir)?,
         Cmd::Check { command } => engine.check_command(&command.join(" ")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_exits_with_the_error_code() {
+        panic::set_hook(Box::new(|_| {}));
+        let code = guarded(|| panic!("boom"));
+        let _ = panic::take_hook();
+        assert_eq!(code, ExitCode::from(EXIT_ERROR));
+    }
 }

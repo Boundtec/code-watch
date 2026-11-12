@@ -1,9 +1,10 @@
 use std::fs;
+use std::io;
 use std::path::Path;
 
 use ignore::WalkBuilder;
 
-use crate::report::Report;
+use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{RuleError, RuleSet, Target};
 
 /// Files above this size are not read: rules look at manifests and scripts, and a hostile repo
@@ -14,6 +15,35 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 pub enum ScanError {
     #[error("{0} is not a directory")]
     NotADirectory(String),
+}
+
+fn read_target(path: &Path) -> Result<String, SkipReason> {
+    let len = fs::metadata(path)
+        .map_err(|_| SkipReason::Unreadable)?
+        .len();
+    if len > MAX_FILE_BYTES {
+        return Err(SkipReason::TooLarge);
+    }
+    fs::read_to_string(path).map_err(|e| match e.kind() {
+        io::ErrorKind::InvalidData => SkipReason::NotUtf8,
+        _ => SkipReason::Unreadable,
+    })
+}
+
+/// The path a walk error belongs to, relative to the scanned root, or "." when the walker did
+/// not say.
+fn error_path(err: &ignore::Error, root: &Path) -> String {
+    match err {
+        ignore::Error::WithPath { path, .. } => path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned(),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            error_path(err, root)
+        }
+        _ => ".".into(),
+    }
 }
 
 pub struct Engine {
@@ -31,7 +61,8 @@ impl Engine {
 
     /// Scans a repository without executing or following anything in it: symlinks are not
     /// followed, `.gitignore` is not honoured (ignored files still run on the developer's
-    /// machine) and only `.git` is skipped. Unreadable and non-UTF-8 files are skipped.
+    /// machine) and only `.git` is skipped. A file a rule targets that cannot be read is
+    /// reported in the `skipped` list and as a warning, never silently dropped.
     pub fn scan_dir(&self, dir: &Path) -> Result<Report, ScanError> {
         if !dir.is_dir() {
             return Err(ScanError::NotADirectory(dir.display().to_string()));
@@ -41,7 +72,18 @@ impl Engine {
             .filter_entry(|e| e.file_name() != ".git")
             .build();
         let mut findings = Vec::new();
-        for entry in walker.flatten() {
+        let mut skipped = Vec::new();
+        for entry in walker {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    skipped.push(Skipped {
+                        path: error_path(&err, dir),
+                        reason: SkipReason::WalkError,
+                    });
+                    continue;
+                }
+            };
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -52,15 +94,20 @@ impl Engine {
                 .iter()
                 .filter(|r| r.target() == Target::Repo && r.applies_to(rel))
                 .collect();
-            if wanted.is_empty() || entry.metadata().map_or(true, |m| m.len() > MAX_FILE_BYTES) {
+            if wanted.is_empty() {
                 continue;
             }
-            let Ok(content) = fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            findings.extend(wanted.iter().flat_map(|r| r.check_file(rel, &content)));
+            match read_target(entry.path()) {
+                Ok(content) => {
+                    findings.extend(wanted.iter().flat_map(|r| r.check_file(rel, &content)));
+                }
+                Err(reason) => skipped.push(Skipped {
+                    path: rel.to_string_lossy().into_owned(),
+                    reason,
+                }),
+            }
         }
-        Ok(Report::from_rules(findings))
+        Ok(Report::from_scan(findings, skipped))
     }
 
     pub fn check_command(&self, command: &str) -> Report {
@@ -117,16 +164,101 @@ mod tests {
         assert!(report.findings().is_empty());
     }
 
+    fn scan(dir: &Path) -> Report {
+        Engine::embedded().unwrap().scan_dir(dir).unwrap()
+    }
+
+    fn assert_unscanned(report: &Report, path: &str, reason: SkipReason) {
+        assert_eq!(
+            report.skipped(),
+            [Skipped {
+                path: path.into(),
+                reason
+            }]
+        );
+        assert!(
+            report
+                .findings()
+                .iter()
+                .any(|f| f.rule_id == "repo/unscanned-target")
+        );
+        assert_eq!(report.verdict(), crate::report::Verdict::Warn);
+    }
+
     #[test]
-    fn oversized_files_are_skipped() {
+    fn an_oversized_target_is_reported_not_allowed() {
         let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".vscode")).unwrap();
         let pad = " ".repeat(MAX_FILE_BYTES as usize);
         fs::write(
-            dir.path().join("package.json"),
-            format!(r#"{{"scripts":{{"postinstall":"echo hi"}}}}{pad}"#),
+            dir.path().join(".vscode/tasks.json"),
+            format!(r#"{{"tasks":[{{"runOptions":{{"runOn":"folderOpen"}}}}]}}{pad}"#),
         )
         .unwrap();
-        let report = Engine::embedded().unwrap().scan_dir(dir.path()).unwrap();
-        assert!(report.findings().is_empty());
+        let report = scan(dir.path());
+        assert_unscanned(&report, ".vscode/tasks.json", SkipReason::TooLarge);
+    }
+
+    #[test]
+    fn a_large_file_no_rule_targets_is_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("data.bin"),
+            vec![b'x'; MAX_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let report = scan(dir.path());
+        assert!(report.skipped().is_empty() && report.findings().is_empty());
+    }
+
+    #[test]
+    fn a_non_utf8_target_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), [0xff, 0xfe, b'{', b'}']).unwrap();
+        assert_unscanned(&scan(dir.path()), "package.json", SkipReason::NotUtf8);
+    }
+
+    #[test]
+    fn a_bom_prefixed_package_json_is_still_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            "\u{feff}{\"scripts\":{\"postinstall\":\"echo hi\"}}",
+        )
+        .unwrap();
+        let report = scan(dir.path());
+        assert!(report.skipped().is_empty());
+        assert_eq!(report.findings()[0].rule_id, "repo/npm-lifecycle-script");
+    }
+
+    #[cfg(unix)]
+    fn deny(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_target_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("package.json");
+        fs::write(&file, "{}").unwrap();
+        deny(&file, 0o000);
+        let report = scan(dir.path());
+        deny(&file, 0o644);
+        assert_unscanned(&report, "package.json", SkipReason::Unreadable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("package.json"), "{}").unwrap();
+        deny(&sub, 0o000);
+        let report = scan(dir.path());
+        deny(&sub, 0o755);
+        assert_unscanned(&report, "sub", SkipReason::WalkError);
     }
 }
