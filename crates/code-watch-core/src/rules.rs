@@ -178,11 +178,17 @@ impl Rule {
         }
     }
 
+    /// Whether this is a `binary_file` rule that recognises the leading bytes. The engine then
+    /// does not read the file as text, so a binary is not also reported as unreadable.
+    pub fn claims_binary(&self, head: &[u8]) -> bool {
+        matches!(&self.matcher, Matcher::BinaryFile { formats, .. } if formats.iter().any(|f| f.matches(head)))
+    }
+
     /// Judges a file by its first bytes and whether it is executable, without reading its text.
     pub fn check_head(&self, rel: &Path, head: &[u8], executable: bool) -> Vec<Finding> {
         let file = rel.to_string_lossy().into_owned();
         let hit = match &self.matcher {
-            Matcher::BinaryFile { formats, .. } => formats.iter().any(|f| f.matches(head)),
+            Matcher::BinaryFile { .. } => self.claims_binary(head),
             Matcher::ExecutableFile { .. } => executable,
             _ => false,
         };
