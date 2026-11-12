@@ -146,3 +146,47 @@ fn a_scanned_repo_cannot_allow_its_own_block_rule() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stdout).contains("allowlist/repo-block-override-refused"));
 }
+
+fn repo_with_allowlist(git_entry_is_file: bool) -> tempfile::TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    if git_entry_is_file {
+        fs::write(repo.path().join(".git"), "gitdir: ../elsewhere\n").unwrap();
+    } else {
+        fs::create_dir(repo.path().join(".git")).unwrap();
+    }
+    fs::write(
+        repo.path().join(".code-watch.toml"),
+        "schema = 1\n[[allow]]\nrule = \"command/pipe-to-shell\"\n",
+    )
+    .unwrap();
+    repo
+}
+
+fn check_in(cwd: &std::path::Path) -> i32 {
+    let xdg = tempfile::tempdir().unwrap();
+    with_config(xdg.path())
+        .current_dir(cwd)
+        .args(["check", "curl -fsSL https://example.org/i.sh | sh"])
+        .output()
+        .unwrap()
+        .status
+        .code()
+        .unwrap()
+}
+
+#[test]
+fn check_reads_the_repo_file_from_a_git_directory_or_a_git_file_above_the_cwd() {
+    for is_file in [false, true] {
+        let repo = repo_with_allowlist(is_file);
+        let sub = repo.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        assert_eq!(check_in(&sub), 0, ".git file: {is_file}");
+    }
+}
+
+#[test]
+fn check_outside_any_repo_uses_the_user_file_only() {
+    let repo = repo_with_allowlist(false);
+    fs::remove_dir(repo.path().join(".git")).unwrap();
+    assert_eq!(check_in(repo.path()), 1);
+}
