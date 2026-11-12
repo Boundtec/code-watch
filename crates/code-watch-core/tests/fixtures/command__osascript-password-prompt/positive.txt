@@ -1,0 +1,3 @@
+osascript -e 'display dialog "Enter your password" with hidden answer default answer ""'
+osascript -e 'display dialog "Password:" default answer ""'
+sudo osascript -e 'display dialog "x" with hidden answer'

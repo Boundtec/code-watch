@@ -1,0 +1,3 @@
+osascript -e 'display notification "done"'
+osascript -e 'tell application "Finder" to activate'
+echo 'display dialog with hidden answer'

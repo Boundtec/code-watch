@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use code_watch_core::{Engine, RuleSet, Target};
+use code_watch_core::{Engine, RuleSet, Target, command};
 
 fn fixture_dir(rule_id: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,13 +22,43 @@ fn lines(path: PathBuf) -> Vec<String> {
         .collect()
 }
 
+/// Runs one command line against one rule; the built-in rules are checked with the macOS-only
+/// ones enabled, whatever platform the tests run on.
+fn fires(engine: &Engine, id: &str, cmd: &str, builtin: bool) -> bool {
+    if builtin {
+        command::analyze(cmd, true).iter().any(|f| f.rule_id == id)
+    } else {
+        engine
+            .check_command(cmd)
+            .findings()
+            .iter()
+            .any(|f| f.rule_id == id)
+    }
+}
+
+fn assert_command_fixtures(engine: &Engine, id: &str, builtin: bool) {
+    let dir = fixture_dir(id);
+    let positive = lines(dir.join("positive.txt"));
+    let negative = lines(dir.join("negative.txt"));
+    assert!(
+        !positive.is_empty() && !negative.is_empty(),
+        "{id} needs both fixtures"
+    );
+    for cmd in positive {
+        assert!(fires(engine, id, &cmd, builtin), "{id} missed: {cmd}");
+    }
+    for cmd in negative {
+        assert!(!fires(engine, id, &cmd, builtin), "{id} fired on: {cmd}");
+    }
+}
+
 #[test]
 fn every_rule_has_a_positive_and_a_negative_fixture() {
     let engine = Engine::embedded().unwrap();
     for rule in RuleSet::embedded().unwrap().rules() {
-        let dir = fixture_dir(&rule.id);
         match rule.target() {
             Target::Repo => {
+                let dir = fixture_dir(&rule.id);
                 let positive = engine.scan_dir(&dir.join("positive")).unwrap();
                 assert!(
                     positive.findings().iter().any(|f| f.rule_id == rule.id),
@@ -42,32 +72,11 @@ fn every_rule_has_a_positive_and_a_negative_fixture() {
                     rule.id
                 );
             }
-            Target::Command => {
-                let positive = lines(dir.join("positive.txt"));
-                let negative = lines(dir.join("negative.txt"));
-                assert!(
-                    !positive.is_empty() && !negative.is_empty(),
-                    "{} needs both fixtures",
-                    rule.id
-                );
-                for cmd in positive {
-                    let report = engine.check_command(&cmd);
-                    assert!(
-                        report.findings().iter().any(|f| f.rule_id == rule.id),
-                        "{} missed: {cmd}",
-                        rule.id
-                    );
-                }
-                for cmd in negative {
-                    let report = engine.check_command(&cmd);
-                    assert!(
-                        report.findings().iter().all(|f| f.rule_id != rule.id),
-                        "{} fired on: {cmd}",
-                        rule.id
-                    );
-                }
-            }
+            Target::Command => assert_command_fixtures(&engine, &rule.id, false),
         }
+    }
+    for rule in command::RULES {
+        assert_command_fixtures(&engine, rule.id, true);
     }
 }
 

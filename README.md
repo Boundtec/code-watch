@@ -37,9 +37,25 @@ commands are matched, not run.
 | `repo/base64-into-shell` | block | base64 decoded straight into a shell in scripts and manifests |
 | `command/base64-into-shell` | block | the same in a command |
 | `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell |
-| `command/quarantine-removal` | warn | `xattr` removing the macOS quarantine flag |
+| `command/quarantine-removal` | warn | `xattr` removing or rewriting the macOS quarantine flag |
+| `command/lookalike-download-domain` | block / warn | `curl` or `wget` fetching from a domain that imitates a well-known one; block when piped into a shell, warn otherwise |
+| `command/osascript-password-prompt` | block | `osascript` showing a dialog that asks for a password (macOS only) |
+| `command/launchagent-write` | block | a write into a `LaunchAgents` folder (macOS only) |
 
 Rules live in `crates/code-watch-core/rules/` and ship inside the binary. More in [docs/rules.md](docs/rules.md).
+
+## Before a command
+
+`check <command>` splits the command into words with `shlex`, then into pipeline segments on `|`, `;`, `&&`, `||` and
+`&`, so a rule can say "this download is piped into that shell". The lookalike check reads the host of every argument
+of `curl` and `wget` (with or without `https://`), decodes punycode, takes the registrable domain from the public
+suffix list and compares it with a list of well-known domains by Unicode skeleton and edit distance. A known domain
+used as the leftmost labels of another one (`github.com.attacker.example`) or as the userinfo of a URL
+(`https://github.com@attacker.example`) is flagged too.
+
+Limits: operators glued to a word (`curl x|sh`) are not split, only the whole-string regex rules see them; command
+substitution (`sh -c "$(curl ...)"`) is not expanded. The macOS-only rules run only on macOS; elsewhere `check` lists
+them under `skipped_rules` in `--json` and in the human footer.
 
 ## Layers
 

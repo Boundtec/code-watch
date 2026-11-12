@@ -1,0 +1,4 @@
+ls ~/Library/LaunchAgents
+cat ~/Library/LaunchAgents/com.example.plist > /tmp/out
+launchctl list
+cp a.plist ~/Library/Preferences/

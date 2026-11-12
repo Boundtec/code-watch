@@ -27,3 +27,11 @@ Patterns use the Rust `regex` crate (linear time, safe on hostile input).
    `negative/` directory, for command rules `positive.txt` and `negative.txt` (one command per line). Fixtures are inert
    text: no real malware, secrets or tokens.
 3. `cargo test` fails if a rule has no fixtures or does not fire / fires on the wrong one.
+
+## Rules built in Rust
+
+Rules that need the command split into words (lookalike domains, `osascript`, `LaunchAgents` writes) live in
+`crates/code-watch-core/src/command/` and are listed in `command::RULES`. They are not in the TOML files. Their
+fixtures work like command-regex fixtures (`positive.txt` / `negative.txt`, one command per line) and the fixture test
+runs them with the macOS-only rules enabled on every platform. `--json` carries `skipped_rules`: the ids of rules that
+exist but are not active on this platform.

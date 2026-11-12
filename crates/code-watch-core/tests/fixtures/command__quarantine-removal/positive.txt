@@ -1,3 +1,5 @@
 xattr -d com.apple.quarantine /Applications/Demo.app
 xattr -cr Demo.app
 xattr -r -d com.apple.quarantine Demo.app
+xattr -w com.apple.quarantine 0 Thing.app
+sudo xattr -rd com.apple.quarantine /Applications/Thing.app

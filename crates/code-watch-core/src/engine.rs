@@ -4,6 +4,7 @@ use std::path::Path;
 
 use ignore::WalkBuilder;
 
+use crate::command;
 use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{RuleError, RuleSet, Target};
 
@@ -111,14 +112,16 @@ impl Engine {
     }
 
     pub fn check_command(&self, command: &str) -> Report {
-        let findings = self
+        let macos = cfg!(target_os = "macos");
+        let mut findings: Vec<_> = self
             .rules
             .rules()
             .iter()
             .filter(|r| r.target() == Target::Command)
             .flat_map(|r| r.check_command(command))
             .collect();
-        Report::from_rules(findings)
+        findings.extend(command::analyze(command, macos));
+        Report::from_rules(findings).with_skipped_rules(command::skipped_rules(macos))
     }
 }
 

@@ -1,0 +1,4 @@
+echo x >> ~/Library/LaunchAgents/com.example.plist
+cp com.example.plist $HOME/Library/LaunchAgents/
+echo x | tee /Library/LaunchAgents/com.example.plist
+curl -o ~/Library/LaunchAgents/com.example.plist https://example.org/p

@@ -15,6 +15,7 @@ struct JsonReport<'a> {
     layers: &'a std::collections::BTreeMap<Layer, LayerStatus>,
     findings: &'a [Finding],
     skipped: &'a [Skipped],
+    skipped_rules: &'a [String],
 }
 
 pub fn to_json(report: &Report) -> serde_json::Result<String> {
@@ -24,6 +25,7 @@ pub fn to_json(report: &Report) -> serde_json::Result<String> {
         layers: report.layers(),
         findings: report.findings(),
         skipped: report.skipped(),
+        skipped_rules: report.skipped_rules(),
     };
     serde_json::to_string_pretty(&view)
 }
@@ -52,6 +54,13 @@ pub fn to_human(report: &Report) -> String {
         .map(|(layer, status)| format!("{layer} {status}"))
         .collect();
     let _ = writeln!(out, "layers: {}", layers.join(", "));
+    if !report.skipped_rules().is_empty() {
+        let _ = writeln!(
+            out,
+            "rules skipped on this platform: {}",
+            report.skipped_rules().join(", ")
+        );
+    }
     let skipped = report.skipped().len();
     if skipped > 0 {
         let noun = if skipped == 1 { "file" } else { "files" };
@@ -95,5 +104,14 @@ mod tests {
         assert_eq!(v["layers"]["llm"], "off");
         assert_eq!(v["findings"], serde_json::json!([]));
         assert_eq!(v["skipped"], serde_json::json!([]));
+        assert_eq!(v["skipped_rules"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn skipped_rules_are_listed_in_both_outputs() {
+        let report = Report::from_rules(vec![]).with_skipped_rules(vec!["command/x".into()]);
+        assert!(to_human(&report).contains("rules skipped on this platform: command/x\n"));
+        let v: serde_json::Value = serde_json::from_str(&to_json(&report).unwrap()).unwrap();
+        assert_eq!(v["skipped_rules"], serde_json::json!(["command/x"]));
     }
 }

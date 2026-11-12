@@ -1,2 +1,4 @@
 base64 -d notes.b64 > notes.txt
 echo hi | base64
+echo aGk= | base64 -d | shasum -a 256
+echo aGk= | base64 -d > out.txt
