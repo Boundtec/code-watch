@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::allow::Suppressed;
 use crate::finding::{Evidence, Finding, Layer, Severity};
 use crate::names::display_as_wire_name;
 
@@ -58,6 +59,8 @@ pub struct Report {
     layers: BTreeMap<Layer, LayerStatus>,
     skipped: Vec<Skipped>,
     skipped_rules: Vec<String>,
+    suppressed: Vec<Suppressed>,
+    allowlist_warnings: Vec<String>,
 }
 
 impl Report {
@@ -87,6 +90,8 @@ impl Report {
             layers,
             skipped,
             skipped_rules: Vec::new(),
+            suppressed: Vec::new(),
+            allowlist_warnings: Vec::new(),
         }
     }
 
@@ -95,6 +100,21 @@ impl Report {
     pub fn with_skipped_rules(mut self, rules: Vec<String>) -> Self {
         self.skipped_rules = rules;
         self
+    }
+
+    /// Records what the allowlists hid. The verdict ignores these findings, the output lists them.
+    pub fn with_allowlist(mut self, suppressed: Vec<Suppressed>, warnings: Vec<String>) -> Self {
+        self.suppressed = suppressed;
+        self.allowlist_warnings = warnings;
+        self
+    }
+
+    pub fn suppressed(&self) -> &[Suppressed] {
+        &self.suppressed
+    }
+
+    pub fn allowlist_warnings(&self) -> &[String] {
+        &self.allowlist_warnings
     }
 
     pub fn skipped_rules(&self) -> &[String] {
@@ -134,6 +154,8 @@ fn unscanned_finding(s: &Skipped) -> Finding {
             &format!("not scanned: {}", s.reason),
         ),
         remediation: "Read the file by hand before running anything in this repository.".into(),
+        domain: None,
+        package: None,
     }
 }
 
@@ -150,6 +172,8 @@ mod tests {
             title: String::new(),
             evidence: Evidence::new(None, None, ""),
             remediation: String::new(),
+            domain: None,
+            package: None,
         }
     }
 

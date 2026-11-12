@@ -90,6 +90,36 @@ fn analyze_text(
     }
 }
 
+/// The distinct hosts that `curl` and `wget` segments of the command fetch, including inside
+/// `sh -c` and substitutions. An allowlist `domain` entry may only match a command that fetches
+/// exactly one host.
+pub fn fetched_hosts(command: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    collect_hosts(command, 0, &mut hosts);
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+fn collect_hosts(text: &str, depth: usize, hosts: &mut Vec<String>) {
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    for seg in parse::segments(text) {
+        match seg.program() {
+            Some(p) if FETCHERS.contains(&p) => {
+                hosts.extend(seg.args().iter().filter_map(|w| domains::fetched_host(w)));
+            }
+            Some(p) if SHELLS.contains(&p) || p == "eval" => {
+                for (inner, _) in nested_texts(&seg) {
+                    collect_hosts(&inner, depth + 1, hosts);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Ids of the rules that exist but are not active on this platform.
 pub fn skipped_rules(macos: bool) -> Vec<String> {
     if macos {
@@ -196,6 +226,8 @@ fn finding(id: &str, severity: Severity, excerpt: &str) -> Finding {
         title: rule.title.into(),
         evidence: Evidence::new(None, None, excerpt),
         remediation: rule.remediation.into(),
+        domain: None,
+        package: None,
     }
 }
 
@@ -220,7 +252,9 @@ fn lookalike(seg: &Segment, into_shell: bool, command: &str) -> Option<Finding> 
         ),
         _ => (Severity::Warn, format!("{host} could not be read")),
     };
-    Some(finding(LOOKALIKE, severity, &format!("{what}: {command}")))
+    let mut found = finding(LOOKALIKE, severity, &format!("{what}: {command}"));
+    found.domain = Some(host);
+    Some(found)
 }
 
 fn osascript(seg: &Segment, command: &str) -> Option<Finding> {

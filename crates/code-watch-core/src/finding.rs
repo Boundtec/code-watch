@@ -62,6 +62,13 @@ pub struct Finding {
     pub title: String,
     pub evidence: Evidence,
     pub remediation: String,
+    /// The host the finding is about, set by the rule that parsed it. Allowlist `domain` entries
+    /// match only this field, never the excerpt, which is untrusted and truncated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// The package the finding is about, set by the layer that knows it (the OSV layer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
 }
 
 #[cfg(test)]
