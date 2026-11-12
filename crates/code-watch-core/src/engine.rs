@@ -259,12 +259,14 @@ mod tests {
     #[test]
     fn a_domain_entry_never_hides_a_finding_that_is_not_about_the_fetch() {
         let allow = allow_domain_as_user("command/base64-into-shell", "example.org");
-        let r = check(
+        for cmd in [
             "curl https://example.org/x -o f; echo ZXZpbA== | base64 -d | sh",
-            &allow,
-        );
-        assert_eq!(r.verdict(), crate::report::Verdict::Block);
-        assert!(r.suppressed().is_empty());
+            "curl https://example.org/x -o f ; echo ZXZpbA== | base64 -d | sh",
+        ] {
+            let r = check(cmd, &allow);
+            assert_eq!(r.verdict(), crate::report::Verdict::Block, "{cmd}");
+            assert!(r.suppressed().is_empty(), "{cmd}");
+        }
     }
 
     #[test]
