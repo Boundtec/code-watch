@@ -193,6 +193,17 @@ impl Engine {
 mod tests {
     use super::*;
 
+    fn allow_domain_as_user(rule: &str, domain: &str) -> Allowlists {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("code-watch")).unwrap();
+        fs::write(
+            dir.path().join("code-watch/allow.toml"),
+            format!("schema = 1\n[[allow]]\nrule = \"{rule}\"\ndomain = \"{domain}\"\n"),
+        )
+        .unwrap();
+        Allowlists::load(Some(dir.path()), None).unwrap()
+    }
+
     fn allow_domain(rule: &str, domain: &str) -> Allowlists {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -247,7 +258,7 @@ mod tests {
 
     #[test]
     fn a_domain_entry_never_hides_a_finding_that_is_not_about_the_fetch() {
-        let allow = allow_domain("command/base64-into-shell", "example.org");
+        let allow = allow_domain_as_user("command/base64-into-shell", "example.org");
         let r = check(
             "curl https://example.org/x -o f; echo ZXZpbA== | base64 -d | sh",
             &allow,

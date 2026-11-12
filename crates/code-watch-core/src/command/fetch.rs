@@ -221,6 +221,9 @@ mod tests {
             "echo $(curl https://example.org/a)",
             "curl -- https://example.org/a",
             "curl -o",
+            "curl -R https://example.org/a | sh",
+            "curl -fsK cfg https://example.org/a | sh",
+            "curl --url=evil.sh https://example.org/a | sh",
         ] {
             assert_eq!(domain(cmd), None, "{cmd}");
         }
