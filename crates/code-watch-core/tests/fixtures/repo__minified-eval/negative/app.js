@@ -1,0 +1,2 @@
+var a=1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;a=a+1;re.exec(text);
+var r=2;

@@ -66,10 +66,51 @@ enum RawMatcher {
         files: Vec<String>,
         pattern: String,
     },
+    AllRegex {
+        files: Vec<String>,
+        patterns: Vec<String>,
+    },
+    BinaryFile {
+        files: Vec<String>,
+        formats: Vec<BinaryFormat>,
+    },
+    ExecutableFile {
+        files: Vec<String>,
+    },
     CommandRegex {
         pattern: String,
     },
 }
+
+/// Executable formats recognised by their leading bytes. `cafebabe` is left out on purpose: Java
+/// class files share it with fat Mach-O.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BinaryFormat {
+    Elf,
+    MachO,
+    Pe,
+}
+
+impl BinaryFormat {
+    fn matches(self, head: &[u8]) -> bool {
+        match self {
+            Self::Elf => head.starts_with(b"\x7fELF"),
+            Self::MachO => [
+                [0xfe, 0xed, 0xfa, 0xce],
+                [0xfe, 0xed, 0xfa, 0xcf],
+                [0xce, 0xfa, 0xed, 0xfe],
+                [0xcf, 0xfa, 0xed, 0xfe],
+            ]
+            .iter()
+            .any(|magic| head.starts_with(magic)),
+            Self::Pe => head.starts_with(b"MZ"),
+        }
+    }
+}
+
+/// How many leading bytes the engine reads to recognise a binary.
+pub const HEAD_BYTES: usize = 4;
 
 enum Matcher {
     JsonPointer {
@@ -79,6 +120,17 @@ enum Matcher {
     FileRegex {
         files: GlobSet,
         regex: Regex,
+    },
+    AllRegex {
+        files: GlobSet,
+        regexes: Vec<Regex>,
+    },
+    BinaryFile {
+        files: GlobSet,
+        formats: Vec<BinaryFormat>,
+    },
+    ExecutableFile {
+        files: GlobSet,
     },
     CommandRegex(Regex),
 }
@@ -94,18 +146,43 @@ pub struct Rule {
 impl Rule {
     pub fn target(&self) -> Target {
         match self.matcher {
-            Matcher::JsonPointer { .. } | Matcher::FileRegex { .. } => Target::Repo,
             Matcher::CommandRegex(_) => Target::Command,
+            _ => Target::Repo,
         }
+    }
+
+    /// Whether the rule judges a file by its leading bytes and mode instead of its text.
+    pub fn is_binary_rule(&self) -> bool {
+        matches!(
+            self.matcher,
+            Matcher::BinaryFile { .. } | Matcher::ExecutableFile { .. }
+        )
     }
 
     /// Whether the rule wants to read the file at `rel` (a path relative to the scanned root).
     pub fn applies_to(&self, rel: &Path) -> bool {
         match &self.matcher {
-            Matcher::JsonPointer { files, .. } | Matcher::FileRegex { files, .. } => {
-                files.is_match(rel)
-            }
+            Matcher::JsonPointer { files, .. }
+            | Matcher::FileRegex { files, .. }
+            | Matcher::AllRegex { files, .. }
+            | Matcher::BinaryFile { files, .. }
+            | Matcher::ExecutableFile { files } => files.is_match(rel),
             Matcher::CommandRegex(_) => false,
+        }
+    }
+
+    /// Judges a file by its first bytes and whether it is executable, without reading its text.
+    pub fn check_head(&self, rel: &Path, head: &[u8], executable: bool) -> Vec<Finding> {
+        let file = rel.to_string_lossy().into_owned();
+        let hit = match &self.matcher {
+            Matcher::BinaryFile { formats, .. } => formats.iter().any(|f| f.matches(head)),
+            Matcher::ExecutableFile { .. } => executable,
+            _ => false,
+        };
+        if hit {
+            vec![self.finding(Evidence::new(Some(file), None, "executable file"))]
+        } else {
+            Vec::new()
         }
     }
 
@@ -142,7 +219,19 @@ impl Rule {
                 })
                 .into_iter()
                 .collect(),
-            Matcher::CommandRegex(_) => Vec::new(),
+            Matcher::AllRegex { regexes, .. } => {
+                let mut matches = regexes.iter().map(|r| r.find(content));
+                let first = matches.next().flatten();
+                match first {
+                    Some(m) if matches.all(|x| x.is_some()) => {
+                        let line = content[..m.start()].matches('\n').count() + 1;
+                        let text = content.lines().nth(line - 1).unwrap_or_default();
+                        vec![self.finding(Evidence::new(Some(file), Some(line), text))]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -219,6 +308,20 @@ fn compile(raw: RawRule) -> Result<Rule, RuleError> {
         RawMatcher::FileRegex { files, pattern } => Matcher::FileRegex {
             files: globs(files).map_err(&bad)?,
             regex: Regex::new(pattern).map_err(|e| bad(e.to_string()))?,
+        },
+        RawMatcher::AllRegex { files, patterns } => Matcher::AllRegex {
+            files: globs(files).map_err(&bad)?,
+            regexes: patterns
+                .iter()
+                .map(|p| Regex::new(p).map_err(|e| bad(e.to_string())))
+                .collect::<Result<_, _>>()?,
+        },
+        RawMatcher::BinaryFile { files, formats } => Matcher::BinaryFile {
+            files: globs(files).map_err(&bad)?,
+            formats: formats.clone(),
+        },
+        RawMatcher::ExecutableFile { files } => Matcher::ExecutableFile {
+            files: globs(files).map_err(&bad)?,
         },
         RawMatcher::CommandRegex { pattern } => {
             Matcher::CommandRegex(Regex::new(pattern).map_err(|e| bad(e.to_string()))?)

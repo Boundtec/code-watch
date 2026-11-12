@@ -20,3 +20,41 @@ severity = "block"
 title = "A script decodes base64 straight into a shell"
 remediation = "Decode the payload to a file and read it before running anything."
 match = { kind = "file_regex", files = ["**/package.json", "**/*.sh", "**/Makefile", "**/setup.py", "**/.vscode/tasks.json"], pattern = '(?i)\bbase64\b[^|;&\n]*(-d\b|-D\b|--decode\b)[^|;&\n]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b' }
+
+[[rule]]
+id = "repo/setup-py-install-hook"
+severity = "warn"
+title = "setup.py runs code at install time"
+remediation = "Read setup.py before pip install; prefer a wheel, or install with --no-build-isolation in a throwaway environment."
+match = { kind = "file_regex", files = ["**/setup.py"], pattern = '''\bcmdclass\s*=|\b(os\.system|os\.popen|subprocess\.\w+)\s*\(|(^|[^.\w])(exec|eval)\s*\(''' }
+
+[[rule]]
+id = "repo/makefile-install-fetch"
+severity = "warn"
+title = "A default or install Makefile target downloads from the network"
+remediation = "Read the Makefile recipe before running make; do not run targets that fetch and execute remote content."
+match = { kind = "file_regex", files = ["**/Makefile", "**/GNUmakefile"], pattern = '''(?m)^(all|install|setup|bootstrap)\s*:[^\n]*\n(\t[^\n]*\n)*?\t[^\n]*\b(curl|wget)\b''' }
+
+[[rule]]
+id = "repo/obfuscated-blob"
+severity = "warn"
+title = "A script contains a very long base64 or hex blob"
+remediation = "Decode the blob to a file and read it; do not run a script that hides its payload."
+match = { kind = "file_regex", files = ["**/*.{js,mjs,cjs,ts,py,sh,rb,php,ps1}"], pattern = '[A-Za-z0-9+/]{200,}' }
+
+[[rule]]
+id = "repo/minified-eval"
+severity = "warn"
+title = "A very long line evaluates dynamic code"
+remediation = "Treat a minified one-liner that calls eval, exec, Function or atob as obfuscated; read the unminified source or do not run it."
+match = { kind = "file_regex", files = ["**/*.{js,mjs,cjs,py,sh,rb,php,ps1}"], pattern = '''(?m)^(?:[^\n]{400,}(?:^|[^.\w])(?:eval|exec|atob|Function)\s*\(|[^\n]*(?:^|[^.\w])(?:eval|exec|atob|Function)\s*\([^\n]{400,}$)''' }
+
+[[rule]]
+id = "repo/secret-read-and-send"
+severity = "warn"
+title = "A script reads credentials or the environment and also sends data out"
+remediation = "Check where the data goes before running this script; a legitimate deploy script names its own host."
+match = { kind = "all_regex", files = ["**/*.{py,js,mjs,cjs,ts,sh,rb,php,ps1}"], patterns = [
+  '''~/\.(ssh|aws)\b|\$HOME/\.(ssh|aws)\b|\.ssh/id_|\.aws/credentials|find-generic-password|Library/Keychains|dict\(os\.environ\)|json\.dumps\(os\.environ\)|JSON\.stringify\(process\.env\)|\bprintenv\b|\benv\s*\|''',
+  '''\b(curl|wget|ncat?)\s|requests\.(post|put)|urllib\.request\.urlopen|http\.client|\bfetch\s*\(|axios\.(post|put)|XMLHttpRequest|socket\.(socket|connect)|net\.connect|\.sendall?\(''',
+] }
