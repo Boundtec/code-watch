@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/code-watch-core", "crates/code-watch"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+authors = ["Sebastián Cuccorese"]
+repository = "https://github.com/Boundtec/code-watch"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

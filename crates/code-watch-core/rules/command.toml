@@ -1,0 +1,22 @@
+schema = 1
+
+[[rule]]
+id = "command/base64-into-shell"
+severity = "block"
+title = "The command decodes base64 straight into a shell"
+remediation = "Decode the payload to a file and read it before running anything."
+match = { kind = "command_regex", pattern = '(?i)\bbase64\b[^|;&]*(-d\b|-D\b|--decode\b)[^|;&]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b' }
+
+[[rule]]
+id = "command/pipe-to-shell"
+severity = "warn"
+title = "The command pipes a download straight into a shell"
+remediation = "Download the script to a file, read it, then run it."
+match = { kind = "command_regex", pattern = '\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b' }
+
+[[rule]]
+id = "command/quarantine-removal"
+severity = "warn"
+title = "The command removes the macOS quarantine flag, which skips the Gatekeeper check"
+remediation = "Only remove quarantine from software whose source you have verified."
+match = { kind = "command_regex", pattern = '\bxattr\b[^|;&]*\s-[a-zA-Z]*[dc]' }

@@ -1,0 +1,22 @@
+schema = 1
+
+[[rule]]
+id = "repo/npm-lifecycle-script"
+severity = "warn"
+title = "package.json runs a script automatically on install"
+remediation = "Read the script before running npm, pnpm or yarn install here, or install with --ignore-scripts."
+match = { kind = "json_pointer", files = ["**/package.json"], pointers = ["/scripts/preinstall", "/scripts/install", "/scripts/postinstall"] }
+
+[[rule]]
+id = "repo/vscode-folderopen-task"
+severity = "block"
+title = "A VS Code task runs automatically when the folder is opened"
+remediation = "Do not open this folder in VS Code or Cursor with workspace trust enabled; review .vscode/tasks.json first."
+match = { kind = "file_regex", files = ["**/.vscode/tasks.json"], pattern = '"runOn"\s*:\s*"folderOpen"' }
+
+[[rule]]
+id = "repo/base64-into-shell"
+severity = "block"
+title = "A script decodes base64 straight into a shell"
+remediation = "Decode the payload to a file and read it before running anything."
+match = { kind = "file_regex", files = ["**/package.json", "**/*.sh", "**/Makefile", "**/setup.py", "**/.vscode/tasks.json"], pattern = '(?i)\bbase64\b[^|;&\n]*(-d\b|-D\b|--decode\b)[^|;&\n]*\|\s*(sudo\s+)?(ba|z|da|k)?sh\b' }

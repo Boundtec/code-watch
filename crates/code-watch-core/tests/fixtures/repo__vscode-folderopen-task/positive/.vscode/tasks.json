@@ -1,0 +1,8 @@
+{
+  // inert fixture
+  "version": "2.0.0",
+  "tasks": [
+    { "label": "hello", "type": "shell", "command": "echo hello",
+      "runOptions": { "runOn": "folderOpen" } }
+  ]
+}

