@@ -44,8 +44,7 @@ and `--json` lists them under `skipped_layers`.
 ### Rules format
 
 Versioned TOML files in `rules/` of the repo, embedded with `include_dir`-style build-time embedding (a small
-`build.rs` or `include_str!` list). One file per layer. Each rule: `id`, `since` (rules schema version), `severity`,
-`target`, a matcher (`path_glob`, `json_pointer` + `regex`, or `command_pattern`), `message`, `remediation`. The file
+`build.rs` or `include_str!` list). One file per layer. Each rule: `id`, `severity`, `title`, `remediation` and a `match` table whose `kind` is `json_pointer`, `file_regex` or `command_regex` (the target, repo or command, follows from the kind; there is no per-rule `since`, only the file-level schema). The file
 carries `schema = 1`; the binary refuses newer schemas and says so. No hosted feed: rules update with each release.
 Each rule needs a positive and a negative fixture; a test fails if a rule has none.
 
@@ -192,5 +191,5 @@ traits with fakes); repo content is never executed or interpolated into a shell.
 |---|---|
 | Should `check` block by default or only warn for `warn`-severity findings in agent adapters? | Block on `block` only; `warn` becomes the agent's "ask" so a human decides; a `--strict` flag turns warnings into blocks |
 | Crate layout: one crate or a workspace (`core` + `bin`) | Workspace: lets someone embed the engine; costs nothing now |
-| MSRV | Latest stable minus two; today most deps need 1.85 to 1.90 |
+| MSRV | Latest stable minus two; today most deps need 1.85 to 1.90. CI and `rust-toolchain.toml` pin the exact toolchain (1.94.0) |
 | Crate name on crates.io | Reserve `code-watch` when the GitHub repo is created |
