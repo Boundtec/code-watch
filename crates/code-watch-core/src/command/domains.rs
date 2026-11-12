@@ -83,6 +83,14 @@ pub(super) fn inspect(arg: &str) -> Option<(String, Verdict)> {
     Some((host, verdict))
 }
 
+/// The host of an absolute URL argument; an address without a scheme is not trusted as a host.
+pub(super) fn url_host(arg: &str) -> Option<String> {
+    if !arg.contains("://") {
+        return None;
+    }
+    authority_of(arg).map(|(_, host)| host)
+}
+
 fn spoofed_by_userinfo(userinfo: Option<&str>, host: &str) -> Verdict {
     let user = userinfo
         .and_then(|u| u.split(':').next())

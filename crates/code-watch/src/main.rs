@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::panic::{self, UnwindSafe};
 use std::path::PathBuf;
@@ -5,7 +6,8 @@ use std::process::ExitCode;
 
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
-use code_watch_core::{Engine, Report, render};
+use code_watch_core::allow::find_repo_root;
+use code_watch_core::{Allowlists, Engine, Report, render};
 
 mod hook;
 
@@ -99,19 +101,45 @@ enum Outcome {
 }
 
 fn run(cli: &Cli) -> anyhow::Result<Outcome> {
+    let user_dir = user_config_dir(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir());
     Ok(match &cli.command {
-        Cmd::Scan { dir } => Outcome::Report(Engine::embedded()?.scan_dir(dir)?),
+        Cmd::Scan { dir } => {
+            let allow = Allowlists::load(user_dir.as_deref(), Some(dir))?;
+            Outcome::Report(Engine::embedded()?.scan_dir_with(dir, &allow)?)
+        }
         Cmd::Check { command } => {
-            Outcome::Report(Engine::embedded()?.check_command(&command.join(" ")))
+            let repo = std::env::current_dir()
+                .ok()
+                .and_then(|d| find_repo_root(&d));
+            let allow = Allowlists::load(user_dir.as_deref(), repo.as_deref())?;
+            Outcome::Report(Engine::embedded()?.check_command_with(&command.join(" "), &allow))
         }
         Cmd::InstallHook => Outcome::Message(hook::install(&std::env::current_exe()?)?),
         Cmd::UninstallHook => Outcome::Message(hook::uninstall()?),
     })
 }
 
+/// `$XDG_CONFIG_HOME` when it is an absolute path, else `~/.config`; the same on macOS and Linux.
+fn user_config_dir(xdg: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    xdg.map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| h.join(".config")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xdg_config_home_wins_when_absolute_else_home_dot_config() {
+        let home = Some(PathBuf::from("/h"));
+        let dir = |xdg: Option<&str>| user_config_dir(xdg.map(OsString::from), home.clone());
+        assert_eq!(dir(Some("/x")), Some(PathBuf::from("/x")));
+        assert_eq!(dir(Some("rel")), Some(PathBuf::from("/h/.config")));
+        assert_eq!(dir(Some("")), Some(PathBuf::from("/h/.config")));
+        assert_eq!(dir(None), Some(PathBuf::from("/h/.config")));
+        assert_eq!(user_config_dir(None, None), None);
+    }
 
     #[test]
     fn a_panic_exits_with_the_error_code() {

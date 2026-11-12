@@ -2,11 +2,14 @@
 //! segments. Whole-string patterns stay in `rules/command.toml`.
 
 mod domains;
+mod fetch;
 mod parse;
 
 use crate::finding::{Evidence, Finding, Layer, Severity};
 use domains::Verdict;
 use parse::Segment;
+
+pub use fetch::stamp_fetch_domain;
 
 pub struct BuiltinRule {
     pub id: &'static str,
@@ -196,6 +199,8 @@ fn finding(id: &str, severity: Severity, excerpt: &str) -> Finding {
         title: rule.title.into(),
         evidence: Evidence::new(None, None, excerpt),
         remediation: rule.remediation.into(),
+        domain: None,
+        package: None,
     }
 }
 
@@ -220,7 +225,9 @@ fn lookalike(seg: &Segment, into_shell: bool, command: &str) -> Option<Finding> 
         ),
         _ => (Severity::Warn, format!("{host} could not be read")),
     };
-    Some(finding(LOOKALIKE, severity, &format!("{what}: {command}")))
+    let mut found = finding(LOOKALIKE, severity, &format!("{what}: {command}"));
+    found.domain = Some(host);
+    Some(found)
 }
 
 fn osascript(seg: &Segment, command: &str) -> Option<Finding> {

@@ -34,18 +34,22 @@ pub struct Evidence {
 
 impl Evidence {
     pub fn new(file: Option<String>, line: Option<usize>, excerpt: &str) -> Self {
-        let excerpt: String = excerpt
-            .trim()
-            .chars()
-            .map(|c| if is_invisible(c) { '?' } else { c })
-            .take(MAX_EXCERPT_CHARS)
-            .collect();
+        let excerpt = clean_text(excerpt);
         Self {
             file,
             line,
             excerpt,
         }
     }
+}
+
+/// Trims, truncates and replaces invisible characters, for any text taken from untrusted input.
+pub(crate) fn clean_text(text: &str) -> String {
+    text.trim()
+        .chars()
+        .map(|c| if is_invisible(c) { '?' } else { c })
+        .take(MAX_EXCERPT_CHARS)
+        .collect()
 }
 
 /// Control characters and Unicode format characters (bidi overrides, zero-width joiners) can
@@ -62,6 +66,13 @@ pub struct Finding {
     pub title: String,
     pub evidence: Evidence,
     pub remediation: String,
+    /// The host the finding is about, set by the rule that parsed it. Allowlist `domain` entries
+    /// match only this field, never the excerpt, which is untrusted and truncated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// The package the finding is about, set by the layer that knows it (the OSV layer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
 }
 
 #[cfg(test)]

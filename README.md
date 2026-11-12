@@ -72,6 +72,12 @@ followed; the script given to `osascript` through a file or standard input is no
 rule cannot see it. The macOS-only rules run only on macOS; elsewhere `check` lists them under `skipped_rules` in
 `--json` and in the human footer.
 
+## Allowlists
+
+`~/.config/code-watch/allow.toml` (or `$XDG_CONFIG_HOME`) decides which findings are hidden; a repo's own
+`.code-watch.toml` can only allow non-block rules unless your file also lists them. Hidden findings are listed under
+`suppressed` in `--json` and counted in the footer. Details in [docs/allowlist.md](docs/allowlist.md).
+
 ## Scan on clone
 
 `code-watch install-hook` scans every new clone through a global git template hook; `uninstall-hook` removes it and

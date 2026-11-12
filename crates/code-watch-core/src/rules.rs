@@ -304,6 +304,8 @@ impl Rule {
             title: self.title.clone(),
             evidence,
             remediation: self.remediation.clone(),
+            domain: None,
+            package: None,
         }
     }
 }
