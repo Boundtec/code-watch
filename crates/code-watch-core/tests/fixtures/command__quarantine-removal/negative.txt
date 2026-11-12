@@ -1,2 +1,3 @@
 xattr -l Demo.app
 xattr -p com.apple.quarantine Demo.app
+xattr -d com.example.foo file
