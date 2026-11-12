@@ -1,12 +1,12 @@
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::Path;
 
 use ignore::WalkBuilder;
 
 use crate::command;
 use crate::report::{Report, SkipReason, Skipped};
-use crate::rules::{RuleError, RuleSet, Target};
+use crate::rules::{HEAD_BYTES, RuleError, RuleSet, Target};
 
 /// Files above this size are not read: rules look at manifests and scripts, and a hostile repo
 /// must not be able to make a scan allocate without bound.
@@ -29,6 +29,25 @@ fn read_target(path: &Path) -> Result<String, SkipReason> {
         io::ErrorKind::InvalidData => SkipReason::NotUtf8,
         _ => SkipReason::Unreadable,
     })
+}
+
+fn read_head(path: &Path) -> Vec<u8> {
+    let mut head = [0u8; HEAD_BYTES];
+    let read = File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    head[..read].to_vec()
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_: &fs::Metadata) -> bool {
+    false
 }
 
 /// The path a walk error belongs to, relative to the scanned root, or "." when the walker did
@@ -98,10 +117,27 @@ impl Engine {
             if wanted.is_empty() {
                 continue;
             }
+            let (binary_rules, text_rules): (Vec<_>, Vec<_>) =
+                wanted.into_iter().partition(|r| r.is_binary_rule());
+            let mut claimed_binary = false;
+            if !binary_rules.is_empty() {
+                let head = read_head(entry.path());
+                let executable = entry.metadata().is_ok_and(|m| is_executable(&m));
+                findings.extend(
+                    binary_rules
+                        .iter()
+                        .flat_map(|r| r.check_head(rel, &head, executable)),
+                );
+                claimed_binary = binary_rules.iter().any(|r| r.claims_binary(&head));
+            }
+            if text_rules.is_empty() {
+                continue;
+            }
             match read_target(entry.path()) {
                 Ok(content) => {
-                    findings.extend(wanted.iter().flat_map(|r| r.check_file(rel, &content)));
+                    findings.extend(text_rules.iter().flat_map(|r| r.check_file(rel, &content)));
                 }
+                Err(_) if claimed_binary => {}
                 Err(reason) => skipped.push(Skipped {
                     path: rel.to_string_lossy().into_owned(),
                     reason,
@@ -263,5 +299,45 @@ mod tests {
         let report = scan(dir.path());
         deny(&sub, 0o755);
         assert_unscanned(&report, "sub", SkipReason::WalkError);
+    }
+
+    #[test]
+    fn a_binary_is_reported_once_and_not_as_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("payload.py"), b"\x7fELF\x00\xff").unwrap();
+        let report = Engine::embedded().unwrap().scan_dir(dir.path()).unwrap();
+        let hits = report
+            .findings()
+            .iter()
+            .filter(|f| f.rule_id == "repo/committed-binary")
+            .count();
+        assert_eq!(hits, 1);
+        assert!(report.skipped().is_empty());
+    }
+
+    #[test]
+    fn a_script_starting_with_mz_is_still_scanned_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("x.sh"),
+            "MZ=1; echo aGk= | base64 -d | sh\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("n.txt"), "MZ notes\n").unwrap();
+        let report = Engine::embedded().unwrap().scan_dir(dir.path()).unwrap();
+        let ids: Vec<_> = report
+            .findings()
+            .iter()
+            .map(|f| f.rule_id.as_str())
+            .collect();
+        assert_eq!(ids, ["repo/base64-into-shell"]);
+    }
+
+    #[test]
+    fn unreadable_text_is_still_skipped_when_it_is_not_a_known_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("setup.py"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+        let report = Engine::embedded().unwrap().scan_dir(dir.path()).unwrap();
+        assert_eq!(report.skipped().len(), 1);
     }
 }
