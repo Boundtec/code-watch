@@ -151,10 +151,7 @@ impl Allowlists {
             (&self.repo, REPO_FILE),
         ] {
             for e in entries.iter().filter(|e| !known_ids.contains(&e.rule)) {
-                warnings.push(format!(
-                    "unknown rule id {:?} in {file}",
-                    clean_text(&e.rule)
-                ));
+                warnings.push(format!("unknown rule id {:?} in {file}", e.rule));
             }
         }
         Applied {
