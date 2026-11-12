@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::finding::{Finding, Layer, Severity};
+use crate::finding::{Evidence, Finding, Layer, Severity};
+use crate::names::display_as_wire_name;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -17,6 +18,25 @@ pub enum Verdict {
     Allow,
     Warn,
     Block,
+}
+
+/// Why a file a rule wanted to read was not scanned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    TooLarge,
+    Unreadable,
+    NotUtf8,
+    WalkError,
+}
+
+display_as_wire_name!(LayerStatus, Verdict, SkipReason);
+
+/// A path the scan could not read, so the verdict says nothing about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Skipped {
+    pub path: String,
+    pub reason: SkipReason,
 }
 
 impl Verdict {
@@ -36,11 +56,19 @@ impl Verdict {
 pub struct Report {
     findings: Vec<Finding>,
     layers: BTreeMap<Layer, LayerStatus>,
+    skipped: Vec<Skipped>,
 }
 
 impl Report {
     /// Builds a report from the rules layer. The OSV and LLM layers are off until they exist.
-    pub fn from_rules(mut findings: Vec<Finding>) -> Self {
+    pub fn from_rules(findings: Vec<Finding>) -> Self {
+        Self::from_scan(findings, Vec::new())
+    }
+
+    /// Builds a report from a directory scan. Every skipped path adds a `warn` finding, so a
+    /// file that could not be read never produces a clean verdict.
+    pub fn from_scan(mut findings: Vec<Finding>, skipped: Vec<Skipped>) -> Self {
+        findings.extend(skipped.iter().map(unscanned_finding));
         findings.sort_by(|a, b| {
             b.severity
                 .cmp(&a.severity)
@@ -53,7 +81,11 @@ impl Report {
             (Layer::Osv, LayerStatus::Off),
             (Layer::Llm, LayerStatus::Off),
         ]);
-        Self { findings, layers }
+        Self {
+            findings,
+            layers,
+            skipped,
+        }
     }
 
     pub fn findings(&self) -> &[Finding] {
@@ -64,12 +96,31 @@ impl Report {
         &self.layers
     }
 
+    pub fn skipped(&self) -> &[Skipped] {
+        &self.skipped
+    }
+
     pub fn verdict(&self) -> Verdict {
         match self.findings.iter().map(|f| f.severity).max() {
             Some(Severity::Block) => Verdict::Block,
             Some(Severity::Warn) => Verdict::Warn,
             Some(Severity::Info) | None => Verdict::Allow,
         }
+    }
+}
+
+fn unscanned_finding(s: &Skipped) -> Finding {
+    Finding {
+        rule_id: "repo/unscanned-target".into(),
+        severity: Severity::Warn,
+        layer: Layer::Rules,
+        title: "A file the rules target could not be scanned".into(),
+        evidence: Evidence::new(
+            Some(s.path.clone()),
+            None,
+            &format!("not scanned: {}", s.reason),
+        ),
+        remediation: "Read the file by hand before running anything in this repository.".into(),
     }
 }
 

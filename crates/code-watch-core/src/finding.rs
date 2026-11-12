@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use unicode_general_category::{GeneralCategory, get_general_category};
+
+use crate::names::display_as_wire_name;
 
 const MAX_EXCERPT_CHARS: usize = 200;
 
@@ -18,6 +21,8 @@ pub enum Layer {
     Llm,
 }
 
+display_as_wire_name!(Severity, Layer);
+
 /// Where a finding was seen. The excerpt comes from untrusted input, so it is truncated and
 /// stripped of control characters (a hostile repo must not be able to drive the terminal).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -32,7 +37,7 @@ impl Evidence {
         let excerpt: String = excerpt
             .trim()
             .chars()
-            .map(|c| if c.is_control() { '?' } else { c })
+            .map(|c| if is_invisible(c) { '?' } else { c })
             .take(MAX_EXCERPT_CHARS)
             .collect();
         Self {
@@ -41,6 +46,12 @@ impl Evidence {
             excerpt,
         }
     }
+}
+
+/// Control characters and Unicode format characters (bidi overrides, zero-width joiners) can
+/// reorder or hide text on a terminal.
+fn is_invisible(c: char) -> bool {
+    c.is_control() || get_general_category(c) == GeneralCategory::Format
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -66,6 +77,12 @@ mod tests {
     fn evidence_strips_control_characters() {
         let e = Evidence::new(None, None, "a\u{1b}[31mred\u{7}");
         assert_eq!(e.excerpt, "a?[31mred?");
+    }
+
+    #[test]
+    fn evidence_strips_format_characters_that_spoof_the_terminal() {
+        let e = Evidence::new(None, None, "a\u{202e}txt.exe\u{200b}b");
+        assert_eq!(e.excerpt, "a?txt.exe?b");
     }
 
     #[test]

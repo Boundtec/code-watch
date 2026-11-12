@@ -23,7 +23,9 @@ pub enum RuleError {
         file: String,
         source: toml::de::Error,
     },
-    #[error("rules file {file} uses schema {found}, this build supports {SUPPORTED_SCHEMA}")]
+    #[error(
+        "rules file {file} uses schema {found}, this build supports {SUPPORTED_SCHEMA}: this rules file needs a newer code-watch"
+    )]
     Schema { file: String, found: u32 },
     #[error("rule {id}: invalid pattern: {reason}")]
     Pattern { id: String, reason: String },
@@ -37,9 +39,14 @@ pub enum Target {
     Command,
 }
 
+/// Read before the rest of the file so a newer schema is refused as such, not as "unknown field".
+#[derive(Deserialize)]
+struct SchemaProbe {
+    schema: u32,
+}
+
 #[derive(Deserialize)]
 struct RawFile {
-    schema: u32,
     #[serde(default)]
     rule: Vec<RawRule>,
 }
@@ -113,7 +120,9 @@ impl Rule {
         let file = rel.to_string_lossy().into_owned();
         match &self.matcher {
             Matcher::JsonPointer { pointers, .. } => {
-                let Ok(doc) = serde_json::from_str::<serde_json::Value>(content) else {
+                // npm tolerates a leading BOM and serde_json does not.
+                let json = content.strip_prefix('\u{feff}').unwrap_or(content);
+                let Ok(doc) = serde_json::from_str::<serde_json::Value>(json) else {
                     return Vec::new();
                 };
                 pointers
@@ -181,16 +190,18 @@ impl RuleSet {
         let mut rules = Vec::new();
         let mut seen = HashSet::new();
         for (file, text) in sources {
-            let raw: RawFile = toml::from_str(text).map_err(|source| RuleError::Parse {
+            let parse_error = |source| RuleError::Parse {
                 file: (*file).into(),
                 source,
-            })?;
-            if raw.schema != SUPPORTED_SCHEMA {
+            };
+            let probe: SchemaProbe = toml::from_str(text).map_err(parse_error)?;
+            if probe.schema != SUPPORTED_SCHEMA {
                 return Err(RuleError::Schema {
                     file: (*file).into(),
-                    found: raw.schema,
+                    found: probe.schema,
                 });
             }
+            let raw: RawFile = toml::from_str(text).map_err(parse_error)?;
             for r in raw.rule {
                 if !seen.insert(r.id.clone()) {
                     return Err(RuleError::Duplicate(r.id));
@@ -266,6 +277,14 @@ match = { kind = "command_regex", pattern = "boom" }
             .err()
             .unwrap();
         assert!(matches!(err, RuleError::Schema { found: 2, .. }));
+    }
+
+    #[test]
+    fn newer_schema_with_new_fields_is_refused_as_newer() {
+        let text = "schema = 2\n[[rule]]\nid = \"x\"\nbrand_new_field = true\n";
+        let err = RuleSet::from_sources(&[("x.toml", text)]).err().unwrap();
+        assert!(matches!(err, RuleError::Schema { found: 2, .. }));
+        assert!(err.to_string().contains("needs a newer code-watch"));
     }
 
     #[test]
