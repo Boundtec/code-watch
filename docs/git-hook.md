@@ -14,8 +14,10 @@ code-watch uninstall-hook   # turn it off; your git config is as it was before
 
 - Clean repo: nothing extra.
 - Warnings: the findings, then a line telling you to review them. The clone succeeds (exit 0).
-- Block: the findings, then "BLOCK. Do not open or run anything here" with the `rm -rf` command to delete it. git
-  cannot undo a clone from this hook, so the clone stays on disk and `git clone` exits with the hook's code 2.
+- Block: the findings, then "BLOCK. Do not open or run anything in this directory" and the directory path on its own
+  line (control characters removed; it is never printed as a command, because the folder name can be chosen by the
+  repo's owner). git cannot undo a clone from this hook, so the clone stays on disk and `git clone` exits with the
+  hook's code 2. Delete the directory yourself.
   Warnings exit 0 on purpose: a failing hook makes git report a failed checkout, which would make every warning look
   like a broken clone.
 - Branch switches and file checkouts are not scanned; only a clone or a new worktree is.
@@ -31,6 +33,13 @@ code-watch uninstall-hook   # turn it off; your git config is as it was before
 | `GIT_TEMPLATE_DIR` is set, or another setting overrides ours | the hook would never run |
 | `git` is not on PATH | nothing to configure |
 
-Uninstall only acts when `init.templateDir` is exactly ours; otherwise it says so and changes nothing. If you had no
-global git config file, git leaves an empty one after install and uninstall. Needs git 2.18 or newer, which removes the
+## After uninstall
+
+git copies the hook into each clone's `.git/hooks/post-checkout`, with the absolute path of the binary baked in. Clones
+made while the hook was installed keep that copy after `uninstall-hook` (it fires again on `git worktree add`). To remove
+it from a clone, delete `.git/hooks/post-checkout` there if it contains the line `# code-watch managed hook`.
+
+Install also refuses if `post-checkout` in our template folder exists and was not written by code-watch, or is a symlink.
+Uninstall only acts when `init.templateDir` is exactly ours; otherwise it says so and changes nothing. It removes our template folder and the empty `code-watch` folder above it. If you had no
+global git config file, git leaves an empty one after install and uninstall. Tested with git 2.48, which removes the
 empty `[init]` section on unset.

@@ -63,26 +63,12 @@ fn real_main() -> ExitCode {
             return ExitCode::from(if ok { 0 } else { EXIT_ERROR });
         }
     };
-    let hook_result = match &cli.command {
-        Cmd::InstallHook => Some(
-            std::env::current_exe()
-                .map_err(|e| hook::HookError(e.to_string()))
-                .and_then(|exe| hook::install(&exe)),
-        ),
-        Cmd::UninstallHook => Some(hook::uninstall()),
-        _ => None,
-    };
-    if let Some(result) = hook_result {
-        return match result {
-            Ok(message) => {
-                println!("code-watch: {message}");
-                ExitCode::SUCCESS
-            }
-            Err(hook::HookError(message)) => fail(&message),
-        };
-    }
     let report = match run(&cli) {
-        Ok(report) => report,
+        Ok(Outcome::Report(report)) => report,
+        Ok(Outcome::Message(message)) => {
+            println!("code-watch: {message}");
+            return ExitCode::SUCCESS;
+        }
         Err(e) => return fail(&format!("{e:#}")),
     };
     let text = if cli.json {
@@ -106,12 +92,20 @@ fn fail(message: &str) -> ExitCode {
     ExitCode::from(EXIT_ERROR)
 }
 
-fn run(cli: &Cli) -> anyhow::Result<Report> {
-    let engine = Engine::embedded()?;
+/// What a subcommand produces: a scan report, or a plain message for the hook commands.
+enum Outcome {
+    Report(Report),
+    Message(String),
+}
+
+fn run(cli: &Cli) -> anyhow::Result<Outcome> {
     Ok(match &cli.command {
-        Cmd::Scan { dir } => engine.scan_dir(dir)?,
-        Cmd::Check { command } => engine.check_command(&command.join(" ")),
-        Cmd::InstallHook | Cmd::UninstallHook => unreachable!("handled before run"),
+        Cmd::Scan { dir } => Outcome::Report(Engine::embedded()?.scan_dir(dir)?),
+        Cmd::Check { command } => {
+            Outcome::Report(Engine::embedded()?.check_command(&command.join(" ")))
+        }
+        Cmd::InstallHook => Outcome::Message(hook::install(&std::env::current_exe()?)?),
+        Cmd::UninstallHook => Outcome::Message(hook::uninstall()?),
     })
 }
 

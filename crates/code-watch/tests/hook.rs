@@ -40,7 +40,8 @@ impl Sandbox {
     }
 
     fn isolate(&self, cmd: &mut Command) {
-        cmd.env("HOME", self.path("home"))
+        cmd.current_dir(self.root.path())
+            .env("HOME", self.path("home"))
             .env("XDG_CONFIG_HOME", self.path("xdg"))
             .env("XDG_DATA_HOME", self.path("data"))
             .env("GIT_CONFIG_GLOBAL", self.gitconfig())
@@ -76,6 +77,10 @@ impl Sandbox {
 
     /// A repository with one commit holding `files`, ready to be cloned.
     fn source_repo(&self, files: &[(&str, &str)]) -> PathBuf {
+        self.source_repo_as(files, "sha1")
+    }
+
+    fn source_repo_as(&self, files: &[(&str, &str)], object_format: &str) -> PathBuf {
         let dir = self.path("src");
         fs::create_dir(&dir).unwrap();
         for (name, content) in files {
@@ -83,9 +88,17 @@ impl Sandbox {
         }
         let d = dir.to_str().unwrap();
         assert!(
-            self.git(&["-C", d, "init", "-q", "-b", "main"])
-                .status
-                .success()
+            self.git(&[
+                "-C",
+                d,
+                "init",
+                "-q",
+                "-b",
+                "main",
+                &format!("--object-format={object_format}")
+            ])
+            .status
+            .success()
         );
         assert!(self.git(&["-C", d, "add", "."]).status.success());
         assert!(
@@ -135,7 +148,7 @@ fn install_then_uninstall_restores_a_config_with_other_keys_byte_for_byte() {
     let out = sb.code_watch(&["uninstall-hook"]);
     assert_eq!(out.status.code(), Some(0), "{}", both(&out));
     assert_eq!(fs::read_to_string(sb.gitconfig()).unwrap(), OTHER_KEYS);
-    assert!(!sb.path("data/code-watch/git-template").exists());
+    assert!(!sb.path("data/code-watch").exists());
 }
 
 #[test]
@@ -275,7 +288,6 @@ fn cloning_a_blocked_repo_prints_the_verdict_and_leaves_the_clone_on_disk() {
     let (out, dst) = clone(&sb, &src);
     let shown = both(&out);
     assert!(shown.contains("BLOCK"), "{shown}");
-    assert!(shown.contains("rm -rf"), "{shown}");
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -322,4 +334,147 @@ fn a_branch_checkout_does_not_scan() {
     let out = sb.git(&["-C", d, "checkout", "main"]);
     assert!(!both(&out).contains("code-watch"), "{}", both(&out));
     assert!(!both(&out).contains("repo/"), "{}", both(&out));
+}
+
+/// The part of the output the hook printed after its BLOCK line.
+fn after_block(out: &Output) -> Vec<u8> {
+    let err = &out.stderr;
+    let at = err
+        .windows(5)
+        .position(|w| w == b"BLOCK")
+        .expect("BLOCK line");
+    err[at..].to_vec()
+}
+
+#[test]
+fn the_block_advice_never_builds_a_command_from_the_checkout_path() {
+    let sb = Sandbox::new();
+    let src = sb.source_repo(&[BLOCKER]);
+    assert!(sb.code_watch(&["install-hook"]).status.success());
+    let name = "x';touch PWNED;'y$(x)\u{1b}[31m";
+    let dst = sb.path(name);
+    let out = sb.git(&["clone", src.to_str().unwrap(), dst.to_str().unwrap()]);
+    let advice = after_block(&out);
+    assert!(
+        advice
+            .iter()
+            .all(|b| *b == b'\n' || (*b >= 0x20 && *b != 0x7f)),
+        "raw control bytes in {advice:?}"
+    );
+    let advice = String::from_utf8(advice).unwrap();
+    assert!(!advice.contains("rm -rf"), "{advice}");
+    let last = advice.lines().last().unwrap();
+    assert!(last.ends_with("x';touch PWNED;'y$(x)[31m"), "{advice}");
+    assert!(!sb.path("PWNED").exists() && !dst.join("PWNED").exists());
+}
+
+#[test]
+fn a_sha256_clone_is_scanned() {
+    let sb = Sandbox::new();
+    let src = sb.source_repo_as(&[LIFECYCLE], "sha256");
+    assert!(sb.code_watch(&["install-hook"]).status.success());
+    let (out, _) = clone(&sb, &src);
+    assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+    assert!(
+        both(&out).contains("repo/npm-lifecycle-script"),
+        "{}",
+        both(&out)
+    );
+}
+
+#[test]
+fn an_override_outside_the_global_config_rolls_the_install_back_completely() {
+    let sb = Sandbox::new();
+    fs::write(sb.gitconfig(), OTHER_KEYS).unwrap();
+    let mut cmd = Command::new(&sb.bin);
+    cmd.arg("install-hook");
+    sb.isolate(&mut cmd);
+    let out = cmd
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "init.templateDir")
+        .env("GIT_CONFIG_VALUE_0", sb.path("elsewhere"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", both(&out));
+    assert!(both(&out).contains("overrides init.templateDir"));
+    assert_eq!(fs::read_to_string(sb.gitconfig()).unwrap(), OTHER_KEYS);
+    assert!(!sb.path("data/code-watch").exists());
+}
+
+#[test]
+fn uninstall_keeps_a_hook_the_user_replaced() {
+    let sb = Sandbox::new();
+    assert!(sb.code_watch(&["install-hook"]).status.success());
+    let theirs = "#!/bin/sh\necho theirs\n";
+    fs::write(sb.template_hook(), theirs).unwrap();
+    assert!(sb.code_watch(&["uninstall-hook"]).status.success());
+    assert!(sb.config_value("init.templateDir").is_none());
+    assert_eq!(fs::read_to_string(sb.template_hook()).unwrap(), theirs);
+}
+
+#[test]
+fn a_repo_local_hooks_path_does_not_block_the_install() {
+    let sb = Sandbox::new();
+    let repo = sb.path("husky-repo");
+    fs::create_dir(&repo).unwrap();
+    let r = repo.to_str().unwrap();
+    assert!(sb.git(&["-C", r, "init", "-q"]).status.success());
+    assert!(
+        sb.git(&["-C", r, "config", "core.hooksPath", ".husky"])
+            .status
+            .success()
+    );
+    let mut cmd = Command::new(&sb.bin);
+    cmd.arg("install-hook");
+    sb.isolate(&mut cmd);
+    let out = cmd.current_dir(&repo).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+}
+
+#[test]
+fn a_hook_file_we_did_not_write_is_never_overwritten() {
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.template_hook().parent().unwrap()).unwrap();
+    let theirs = "#!/bin/sh\necho theirs\n";
+    fs::write(sb.template_hook(), theirs).unwrap();
+    let out = sb.code_watch(&["install-hook"]);
+    assert_eq!(out.status.code(), Some(3), "{}", both(&out));
+    assert_eq!(fs::read_to_string(sb.template_hook()).unwrap(), theirs);
+    assert!(sb.config_value("init.templateDir").is_none());
+}
+
+#[test]
+fn a_symlinked_hook_is_refused_and_its_target_is_untouched() {
+    let sb = Sandbox::new();
+    let target = sb.path("target-hook");
+    let content = "#!/bin/sh\n# code-watch managed hook\necho target\n";
+    fs::write(&target, content).unwrap();
+    fs::create_dir_all(sb.template_hook().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, sb.template_hook()).unwrap();
+    let out = sb.code_watch(&["install-hook"]);
+    assert_eq!(out.status.code(), Some(3), "{}", both(&out));
+    assert!(sb.template_hook().is_symlink());
+    assert_eq!(fs::read_to_string(&target).unwrap(), content);
+}
+
+#[test]
+fn a_moved_binary_is_found_again_on_the_path() {
+    let sb = Sandbox::new();
+    let src = sb.source_repo(&[LIFECYCLE]);
+    assert!(sb.code_watch(&["install-hook"]).status.success());
+    let on_path = sb.path("on-path");
+    fs::create_dir(&on_path).unwrap();
+    fs::rename(&sb.bin, on_path.join("code-watch")).unwrap();
+    let path = format!("{}:{}", on_path.display(), std::env::var("PATH").unwrap());
+    let dst = sb.path("dst");
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", src.to_str().unwrap(), dst.to_str().unwrap()]);
+    sb.isolate(&mut cmd);
+    let out = cmd.env("PATH", path).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+    assert!(
+        both(&out).contains("repo/npm-lifecycle-script"),
+        "{}",
+        both(&out)
+    );
 }
