@@ -208,7 +208,6 @@ fn compound_command(compound: &CompoundCommand) -> Parsed<Group> {
             stages: vec![stage(&c.body)?],
         }),
         CompoundCommand::Arithmetic(a) => {
-            attached.subs.extend(convert_text(&a.expr.value)?.subs);
             pipelines.extend(parse(&a.expr.value)?);
         }
     }
