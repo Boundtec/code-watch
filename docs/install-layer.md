@@ -7,8 +7,8 @@ reported as `install/unchecked` (warn), never as clean. The rule throughout: whe
 
 | Command | What is shown | What is read |
 |---|---|---|
-| `npm install`, `i`, `ci`, `add` | the project's `preinstall`, `install`, `postinstall`, `prepublish`, `preprepare`, `prepare`, `postprepare` scripts (warn, one each, with line and text); workspace members too; dependencies that run scripts, grouped (warn) | `package.json`, `package-lock.json` or `npm-shrinkwrap.json` (`hasInstallScript`), `node_modules/.package-lock.json`, `.npmrc`; the manifest of an installed dependency |
-| `pnpm install`, `add` | the same own scripts; dependencies with build scripts, only when pnpm will run them | `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `package.json` (`pnpm` key, `packageManager`), installed manifests in `node_modules/.pnpm` |
+| `npm install`, `i`, `ci`, `add` and their aliases (`ic`, `install-clean`, `it`, `cit`, `install-ci-test`), also behind `corepack` | the project's `preinstall`, `install`, `postinstall`, `prepublish`, `preprepare`, `prepare`, `postprepare` scripts (warn, one each, with line and text); workspace members too; dependencies that run scripts, grouped (warn) | `package.json`, `package-lock.json` or `npm-shrinkwrap.json` (`hasInstallScript`), `node_modules/.package-lock.json`, `.npmrc`; the manifest of an installed dependency |
+| `pnpm install`, `i`, `add`, `it`, `install-test` | the same own scripts; dependencies with build scripts, only when pnpm will run them | `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `package.json` (`pnpm` key, `packageManager`), installed manifests in `node_modules/.pnpm` |
 | `yarn`, `yarn install`, `yarn add` | the same own scripts | `yarn.lock`, `.yarnrc.yml` |
 | `pip install`, `python [flags] -m pip install`, `pip3.X` | a local directory (also without `./`), a VCS address, any non-wheel URL, a PEP 508 `name @ url`, a source archive, `--no-binary`, and named packages that "may build from source" (warn); `--only-binary :all:` with no such target (info) | requirements files (`-r`, three levels), `pyproject.toml`, `setup.py` of a local directory |
 | `brew install`, `reinstall`, `upgrade`, `tap` | a formula or tap outside `homebrew/*`, or a `.rb` file or URL (warn) | nothing |
@@ -21,8 +21,9 @@ The text is judged by the same command rules as `check`.
   the command line. A named package (`npm i x`, `yarn add x`, `pnpm add x`), a missing or stale lockfile, a lockfile that
   does not record scripts (npm v1, yarn 1), a pnpm project with packages not installed, or an unreadable file each give a
   warn that dependencies "may run" install scripts (`install/dependency-scripts` or `install/dependency-scripts-unknown`).
-- **Scripts off.** `--ignore-scripts` (`--ignore-scripts false` is not off; `=false` neither), `ignore-scripts=true` in
-  the project's `.npmrc` (last line wins) or `ignoreScripts: true` in `pnpm-workspace.yaml` for pnpm give
+- **Scripts off.** `--ignore-scripts` (`--ignore-scripts false`, `=false` and `--no-ignore-scripts` are not off, and
+  beat a project setting; a flag after `--` is a package argument), `ignore-scripts=true` in the project's `.npmrc`
+  (last line wins) or `ignoreScripts: true` in `pnpm-workspace.yaml` for pnpm give
   `install/no-scripts`: lifecycle scripts are off. It does not say nothing runs. Only the project's own settings are read,
   never `~/.npmrc` or the environment, and an environment setting such as `npm_config_ignore_scripts=false` overrides the
   project. Yarn 2 and later have no `--ignore-scripts` and do not read `.npmrc`; their config is `.yarnrc.yml`.
@@ -35,19 +36,23 @@ The text is judged by the same command rules as `check`.
 - **pnpm 10 and later do not run dependency build scripts unless allowed** (`onlyBuiltDependencies`,
   `onlyBuiltDependenciesFile`, `allowBuilds` or `dangerouslyAllowAllBuilds` in `pnpm-workspace.yaml` or the `pnpm` key of
   `package.json`). Allowed ones are listed as running; the rest are one info line, "blocked by pnpm unless allowed". An
-  `onlyBuiltDependenciesFile` is read when it is a path inside the project; otherwise the packages "may run". The version
-  comes from `packageManager`; when it is missing the packages "may run" (warn). The pnpm 10 lockfile does not record
-  which packages build, so a package counts when its installed manifest has an install script or a `binding.gyp`.
-- **Yarn.** Yarn 4 runs no dependency scripts unless `enableScripts` is on; the lockfile does not list them, so it
-  says so (info, never "none found"). Yarn 1 runs them and does not list them either (warn).
+  `onlyBuiltDependenciesFile` is read when it resolves to a file inside the project (symlinks followed); otherwise the
+  packages "may run". The version comes from `packageManager`; when it is missing the packages "may run" (warn). When
+  it is 10 or later and nothing is allowed, the result is one info line: no dependency build runs. The lockfile
+  (version 9, written by pnpm 9 and 10) has no `requiresBuild` or other marker of packages that build (pnpm's lockfile
+  specification lists none), so a package counts when its installed manifest has an install script or a `binding.gyp`.
+- **Yarn.** Yarn 2 and later run dependency build scripts unless `enableScripts` is false (it defaults to true), and the
+  lockfile does not list them: a project without the setting gets a warn that they may run. `enableScripts: false` or
+  `--mode=skip-build` gives an info. Yarn 1 runs them and does not list them either (warn).
 - **Where it runs.** `check`, the agent adapters and the PATH shims judge an install against the directory they are
   called from, and find it anywhere the command parser looks (`cd x && npm i`, `sh -c '...'`, `$(...)`). A caller with no
   directory (the library's `check_command`) gets no install findings. The shims cover exactly `git`, `npm`, `pnpm`,
   `yarn`, `pip`, `brew` and `curl`: not `pip3`, `python -m pip`, `npx` or `pnpx`, which are judged only through `check` and
   the adapters.
 - **Directory.** `--prefix`, `-C`, `--dir`, `--cwd` and a `cd x &&` before the install move where it is judged. The
-  lockfile and settings are read from the nearest ancestor that has one, up to the repository root, so a workspace member
-  uses the root's.
+  lockfile and settings are read from the project directory, or from the nearest ancestor that has one and lists the
+  project in its `workspaces` (or `pnpm-workspace.yaml` `packages`), up to the repository root; the lockfile of an
+  unrelated parent project is not used.
 - **Global installs** (`npm i -g x`, `pnpm add -g`, `yarn global add`) give `install/global-package` (warn) per
   package, with the package name, so the user allowlist can trust one: `package = "@scope/*"` (a glob, case-insensitive).
 - **Allowlist.** Rule ids are `install/*`. The user file can allow any of them; a repository file never can, as for
@@ -56,6 +61,20 @@ The text is judged by the same command rules as `check`.
   analysed: `npm update|rebuild|link|dedupe|exec`, `npx`, `pnpx`, `pnpm update|rebuild|dlx|approve-builds|recursive`,
   `yarn up|dlx|workspace|workspaces`, `uv pip install`, `uv sync`, `uvx`, `bun install`, `bunx`, `pipx`, `poetry install`
   and `brew bundle`.
+
+## What it says for everyday commands
+
+| Command (clean project) | Verdict |
+|---|---|
+| `pip install requests`, `-U pip`, `--user black pytest`, `-r requirements.txt` (index names only), `--require-hashes -r ...` | info: "may build from source if no wheel fits; not checked offline" |
+| `pip install ./dir`, a VCS address, a URL or an archive | warn |
+| `pip install --only-binary :all: requests` | info (wheels only) |
+| `pip list`, `pip freeze`, `brew install jq`, `brew install node git` | nothing |
+| `npm ci`, `npm i` with a lockfile that lists every dependency and no install script | info: none found |
+| `npm i lodash`, `npm install -D typescript`, `npm i` with no lockfile | warn: scripts certainly run |
+| `pnpm install`, pnpm 10 or later in `packageManager`, nothing allowed to build | info: builds are blocked |
+| `pnpm install`, pnpm version unknown | warn |
+| `yarn install`, yarn 1 or yarn 2+ without `enableScripts: false` | warn |
 
 Not covered: changes of index or registry (`--index-url`, `--extra-index-url`, `--find-links`, a registry in `.npmrc`)
 are not reported; this layer shows what runs, not where packages come from. `pip download` and `pip wheel` are not

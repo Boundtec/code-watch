@@ -173,6 +173,24 @@ pub(crate) fn shown(path: &Path, cwd: &Path) -> String {
         .into_owned()
 }
 
+/// An address as it may be shown: no user, password, query or fragment, which is where tokens go.
+pub(crate) fn redact(address: &str) -> String {
+    let bare = address.split(['?', '#']).next().unwrap_or("");
+    match bare.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, tail) = rest
+                .split_once('/')
+                .map_or((rest, None), |(a, t)| (a, Some(t)));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            match tail {
+                Some(tail) => format!("{scheme}://{host}/{tail}"),
+                None => format!("{scheme}://{host}"),
+            }
+        }
+        None => bare.to_string(),
+    }
+}
+
 /// Whether `word` is `name` or a versioned form of an interpreter or pip (`python3.12`, `pip3.9`).
 fn versioned(word: &str, name: &str) -> bool {
     word.strip_prefix(name)
@@ -303,6 +321,15 @@ pub fn analyze(commands: &[Vec<String>], cwd: &Path, judge: &Judge) -> Vec<Findi
             }
             "npm" | "pnpm" | "yarn" => {
                 findings.extend(node::analyze(program, args, &here, cwd, judge))
+            }
+            "corepack" => {
+                let mut rest = args.iter().skip_while(|a| a.starts_with('-'));
+                if let Some(manager) = rest.next().map(String::as_str)
+                    && matches!(manager, "npm" | "pnpm" | "yarn")
+                {
+                    let after: Vec<String> = rest.cloned().collect();
+                    findings.extend(node::analyze(manager, &after, &here, cwd, judge));
+                }
             }
             "brew" => findings.extend(brew::analyze(args)),
             p if versioned(p, "pip") => findings.extend(pip::analyze(args, &here, cwd, judge)),

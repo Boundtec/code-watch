@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use globset::Glob;
 
 use super::read::{MAX_LOCK_BYTES, MAX_TEXT_BYTES, ReadError, read_optional};
-use super::{Judge, finding, list, shown, unchecked};
+use super::{Judge, finding, list, redact, shown, unchecked};
 use crate::finding::{Finding, Severity};
 
 /// The scripts a project install may run, in npm's order. pnpm and yarn run a subset; listing
@@ -23,7 +23,6 @@ const SCRIPTS: &[&str] = &[
 const MAX_MEMBERS: usize = 50;
 /// Installed manifests read to find dependency scripts.
 const MAX_INSPECTED: usize = 5000;
-/// Parent directories searched for a lockfile.
 const MAX_WALK_UP: usize = 16;
 
 const INSTALL_WORDS: &[&str] = &[
@@ -40,7 +39,10 @@ const INSTALL_WORDS: &[&str] = &[
     "isntall",
     "add",
     "ci",
+    "ic",
     "clean-install",
+    "install-clean",
+    "isntall-clean",
     "it",
     "cit",
     "install-test",
@@ -168,7 +170,9 @@ struct Invocation {
     global: bool,
     packages: Vec<String>,
     dir: PathBuf,
-    ignore_scripts: bool,
+    /// The command line's own word on scripts; absent leaves the project's settings to say.
+    ignore_scripts: Option<bool>,
+    skip_build: bool,
 }
 
 enum Parsed {
@@ -179,12 +183,17 @@ enum Parsed {
 
 fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
     let mut global = false;
-    let mut ignore_scripts = false;
+    let mut ignore_scripts = None;
+    let mut skip_build = false;
     let mut dir = here.to_path_buf();
     let mut positionals: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
+        if arg == "--" {
+            positionals.extend(args[i + 1..].iter().map(String::as_str));
+            break;
+        }
         let (flag, inline) = match arg.split_once('=') {
             Some((f, v)) if arg.starts_with('-') => (f, Some(v)),
             _ => (arg, None),
@@ -199,9 +208,16 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
                     next.filter(|n| matches!(*n, "true" | "false"))
                         .inspect(|_| i += 1)
                 });
-                ignore_scripts = value != Some("false");
+                ignore_scripts = Some(value != Some("false"));
             }
-            "--no-ignore-scripts" => ignore_scripts = false,
+            "--no-ignore-scripts" => ignore_scripts = Some(false),
+            "--mode" => {
+                let value = inline.or_else(|| {
+                    i += 1;
+                    args.get(i).map(String::as_str)
+                });
+                skip_build = value == Some("skip-build");
+            }
             "--prefix" | "-C" | "--dir" | "--cwd" => {
                 let value = inline.or_else(|| {
                     i += 1;
@@ -239,6 +255,7 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
                 packages: Vec::new(),
                 dir,
                 ignore_scripts,
+                skip_build,
             }),
             _ => Parsed::Other,
         };
@@ -265,6 +282,7 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
                     packages,
                     dir,
                     ignore_scripts,
+                    skip_build,
                 })
             }
             Some(other) if runs_code_unchecked(manager, other) => {
@@ -276,7 +294,15 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
     if !is_install(manager, sub) {
         return Parsed::NotChecked(format!("{manager} {sub}"));
     }
-    if matches!(sub, "ci" | "clean-install" | "cit") {
+    if matches!(
+        sub,
+        "ci" | "ic"
+            | "clean-install"
+            | "install-clean"
+            | "isntall-clean"
+            | "cit"
+            | "install-ci-test"
+    ) {
         packages.clear();
     }
     Parsed::Install(Invocation {
@@ -284,13 +310,14 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
         packages,
         dir,
         ignore_scripts,
+        skip_build,
     })
 }
 
 fn is_install(manager: &str, sub: &str) -> bool {
     match manager {
         "npm" => INSTALL_WORDS.contains(&sub),
-        "pnpm" => matches!(sub, "install" | "i" | "add"),
+        "pnpm" => matches!(sub, "install" | "i" | "add" | "it" | "install-test"),
         _ => matches!(sub, "install" | "add"),
     }
 }
@@ -319,6 +346,7 @@ pub(super) fn analyze(
         return inv
             .packages
             .iter()
+            .map(|spec| redact(spec))
             .map(|spec| {
                 finding(
                     "install/global-package",
@@ -326,7 +354,7 @@ pub(super) fn analyze(
                     None,
                     None,
                     &format!("{manager} global install of {spec}"),
-                    Some(package_name(spec).to_string()),
+                    Some(package_name(&spec).to_string()),
                 )
             })
             .collect();
@@ -338,11 +366,15 @@ pub(super) fn analyze(
         root: find_root(manager, &inv.dir),
         cwd,
         judge,
+        skip_build: inv.skip_build,
     };
     project.repo_code(&mut out);
-    // Yarn berry has no --ignore-scripts and does not read .npmrc.
-    let flagged = inv.ignore_scripts && !project.berry();
-    if flagged || project.scripts_off(&mut out) {
+    // Yarn berry has no --ignore-scripts and does not read .npmrc; elsewhere the command line beats the project's settings.
+    let off = match inv.ignore_scripts {
+        Some(flag) => flag && !project.berry(),
+        None => project.scripts_off(&mut out),
+    };
+    if off {
         out.push(finding(
             "install/no-scripts",
             Severity::Info,
@@ -359,7 +391,7 @@ pub(super) fn analyze(
     let declared = project.own_scripts(!inv.packages.is_empty(), &mut remote, &mut out);
     let covered = project.dependency_scripts(&declared, &mut remote, &mut out);
     project.report_remote(&remote, &mut out);
-    for spec in &inv.packages {
+    for spec in inv.packages.iter().map(|spec| redact(spec)) {
         out.push(finding(
             "install/dependency-scripts",
             Severity::Warn,
@@ -368,7 +400,7 @@ pub(super) fn analyze(
             &format!(
                 "{spec} and its dependencies may run install scripts; they cannot be read offline"
             ),
-            Some(package_name(spec).to_string()),
+            Some(package_name(&spec).to_string()),
         ));
     }
     if covered && inv.packages.is_empty() && out.is_empty() {
@@ -385,8 +417,8 @@ pub(super) fn analyze(
 }
 
 /// The directory holding the lockfile or workspace file this install reads: the nearest
-/// ancestor with one, not looking above a repository root. Settings and lockfiles live there
-/// even when the command runs in a workspace member.
+/// ancestor with one that is a workspace root listing this directory as a member, not looking
+/// above a repository root. A lockfile of an unrelated parent project is not this project's.
 fn find_root(manager: &str, dir: &Path) -> PathBuf {
     let markers: &[&str] = match manager {
         "npm" => &["package-lock.json", "npm-shrinkwrap.json"],
@@ -394,7 +426,8 @@ fn find_root(manager: &str, dir: &Path) -> PathBuf {
         _ => &["yarn.lock"],
     };
     for ancestor in dir.ancestors().take(MAX_WALK_UP) {
-        if markers.iter().any(|m| ancestor.join(m).is_file()) {
+        let marked = markers.iter().any(|m| ancestor.join(m).is_file());
+        if marked && (ancestor == dir || lists_member(ancestor, dir)) {
             return ancestor.to_path_buf();
         }
         if ancestor.join(".git").exists() {
@@ -404,9 +437,57 @@ fn find_root(manager: &str, dir: &Path) -> PathBuf {
     dir.to_path_buf()
 }
 
-/// Dependencies declared by the manifests read: name and spec.
+/// Whether `root`'s `workspaces` (package.json) or `pnpm-workspace.yaml` `packages` globs match `member`;
+/// a `!` pattern excludes.
+fn lists_member(root: &Path, member: &Path) -> bool {
+    let Ok(relative) = member.strip_prefix(root) else {
+        return false;
+    };
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let mut patterns: Vec<String> = Vec::new();
+    if let Ok(Some((json, _))) = manifest_if_present(&root.join("package.json")) {
+        let ws = json.get("workspaces");
+        let list = ws.and_then(|w| {
+            w.as_array()
+                .or_else(|| w.get("packages").and_then(|p| p.as_array()))
+        });
+        patterns.extend(
+            list.into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .map(String::from),
+        );
+    }
+    if let Ok(Some(text)) = read_optional(&root.join("pnpm-workspace.yaml"), MAX_TEXT_BYTES)
+        && let Ok(y) = serde_norway::from_str::<serde_norway::Value>(&text)
+    {
+        patterns.extend(
+            y.get("packages")
+                .and_then(|p| p.as_sequence())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .map(String::from),
+        );
+    }
+    let matches = |pattern: &str| {
+        let pattern = pattern.trim_start_matches("./").trim_end_matches('/');
+        globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .is_ok_and(|g| g.compile_matcher().is_match(&relative))
+    };
+    let mut listed = false;
+    for pattern in &patterns {
+        match pattern.strip_prefix('!') {
+            Some(negated) => listed &= !matches(negated),
+            None => listed |= matches(pattern),
+        }
+    }
+    listed
+}
+
 type Declared = Vec<(String, String)>;
-/// Dependencies that do not come from a registry tarball, by name, with where from.
 type Remote = BTreeMap<String, String>;
 
 struct Project<'a> {
@@ -415,10 +496,10 @@ struct Project<'a> {
     root: PathBuf,
     cwd: &'a Path,
     judge: &'a Judge<'a>,
+    skip_build: bool,
 }
 
 impl Project<'_> {
-    /// A file next to the project's `package.json`.
     fn file(&self, name: &str) -> (PathBuf, String) {
         let path = self.dir.join(name);
         let shown = shown(&path, self.cwd);
@@ -951,6 +1032,18 @@ impl Project<'_> {
             }
         }
         let covered = self.covers(declared, &pnpm_locked(&lock), &shown, out);
+        let builds = PnpmBuilds::read(self, out);
+        if builds.blocks_all() {
+            out.push(finding(
+                "install/dependency-scripts-blocked",
+                Severity::Info,
+                Some(shown),
+                None,
+                "pnpm 10 and later run no dependency build scripts unless allowed, and nothing is allowed here",
+                None,
+            ));
+            return covered;
+        }
         if total > 0 && inspected == 0 && names.is_empty() {
             self.unknown(
                 &shown,
@@ -969,19 +1062,19 @@ impl Project<'_> {
             );
         }
         if !names.is_empty() {
-            self.report_pnpm_builds(&names, &dirs, &shown, out);
+            self.report_pnpm_builds(&builds, &names, &dirs, &shown, out);
         }
         covered && not_installed == 0
     }
 
     fn report_pnpm_builds(
         &self,
+        settings: &PnpmBuilds,
         names: &BTreeSet<String>,
         dirs: &BTreeMap<String, PathBuf>,
         shown: &str,
         out: &mut Vec<Finding>,
     ) {
-        let settings = PnpmBuilds::read(self, out);
         let dir_of = |n: &str| dirs.get(n).cloned();
         match settings.mode() {
             PnpmMode::RunsAll => self.report_dependencies(names, "will run", shown, &dir_of, out),
@@ -1067,27 +1160,37 @@ impl Project<'_> {
             }
         }
         let rc = self.yaml(".yarnrc.yml", out);
-        let enabled = rc
+        let setting = rc
             .as_ref()
             .and_then(|y| y.get("enableScripts"))
-            .and_then(|v| v.as_bool())
-            == Some(true);
-        if enabled {
-            out.push(finding(
+            .and_then(|v| v.as_bool());
+        match setting {
+            Some(false) => self.unknown(
+                &shown,
+                "yarn does not run dependency scripts while enableScripts is false (a package marked built in dependenciesMeta still runs, and an environment setting can override this)",
+                Severity::Info,
+                out,
+            ),
+            _ if self.skip_build => self.unknown(
+                &shown,
+                "yarn install --mode=skip-build runs no build scripts",
+                Severity::Info,
+                out,
+            ),
+            Some(true) => out.push(finding(
                 "install/dependency-scripts",
                 Severity::Warn,
                 Some(self.root_file(".yarnrc.yml").1),
                 None,
                 "enableScripts is on: dependencies may run install scripts and yarn.lock does not list them",
                 None,
-            ));
-        } else {
-            self.unknown(
+            )),
+            None => self.unknown(
                 &shown,
-                "yarn does not run dependency scripts unless enableScripts is on",
-                Severity::Info,
+                "yarn runs dependency build scripts unless enableScripts is false, and yarn.lock does not list them; they may run",
+                Severity::Warn,
                 out,
-            );
+            ),
         }
         false
     }
@@ -1221,16 +1324,6 @@ fn is_registry_tarball(resolved: &str) -> bool {
             .is_some_and(|p| p.ends_with(".tgz"))
 }
 
-/// A source address without a user, token or password in it.
-fn redact(source: &str) -> String {
-    let Some((scheme, rest)) = source.split_once("://") else {
-        return source.to_string();
-    };
-    let (authority, tail) = rest.split_once('/').map_or((rest, ""), |(a, t)| (a, t));
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    format!("{scheme}://{host}/{tail}")
-}
-
 /// Names of the dependencies the lockfile's importers (or older top-level maps) list.
 fn pnpm_locked(lock: &serde_norway::Value) -> HashSet<String> {
     let mut sources: Vec<&serde_norway::Value> = vec![lock];
@@ -1361,17 +1454,14 @@ impl PnpmBuilds {
         me
     }
 
-    /// The JSON array of package names in `onlyBuiltDependenciesFile`, a path inside the project.
+    /// The JSON array of package names in `onlyBuiltDependenciesFile`, a path that stays inside the project once symlinks are resolved.
     fn read_allow_file(&mut self, p: &Project, file: &str) {
-        let relative = Path::new(file);
-        let inside = relative.is_relative()
-            && !relative
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir));
+        let inside = std::fs::canonicalize(&p.root)
+            .ok()
+            .zip(std::fs::canonicalize(p.root.join(file)).ok())
+            .filter(|(root, target)| target.starts_with(root));
         let names = inside
-            .then(|| read_optional(&p.root.join(relative), MAX_TEXT_BYTES))
-            .and_then(Result::ok)
-            .flatten()
+            .and_then(|(_, target)| read_optional(&target, MAX_TEXT_BYTES).ok().flatten())
             .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok());
         match names {
             Some(names) => names.iter().for_each(|n| self.add(n)),
@@ -1390,6 +1480,14 @@ impl PnpmBuilds {
         if let Ok(glob) = Glob::new(name) {
             self.allowed.push(glob.compile_matcher());
         }
+    }
+
+    /// pnpm 10 or later with no setting that allows any build: every dependency build is blocked.
+    fn blocks_all(&self) -> bool {
+        self.major.is_some_and(|m| m >= 10)
+            && !self.allow_all
+            && self.allowed.is_empty()
+            && self.file_problem.is_none()
     }
 
     fn allows(&self, name: &str) -> bool {

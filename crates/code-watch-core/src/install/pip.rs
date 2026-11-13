@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use super::read::{MAX_TEXT_BYTES, read_optional, read_text};
-use super::{Judge, finding, list, shown, unchecked};
+use super::{Judge, finding, list, redact, shown, unchecked};
 use crate::finding::{Finding, Severity};
 
 /// Nested `-r` files followed.
@@ -136,21 +136,27 @@ pub(super) fn analyze(args: &[String], here: &Path, cwd: &Path, judge: &Judge) -
                 Severity::Warn,
                 None,
                 None,
-                &format!("pip builds {what} from source"),
+                &format!("pip builds {} from source", redact(what)),
                 None,
             )),
-            Target::Directory(dir) => out.extend(directory(dir, here, cwd, judge)),
+            Target::Directory(dir) => out.extend(directory(&redact(dir), here, cwd, judge)),
         }
     }
     let wheels_only = scan.only_binary_all && scan.no_binary.is_empty();
     if !scan.only_binary_all && !scan.no_binary.contains(":all:") && !scan.names.is_empty() {
+        // From an index alone, pip builds only when no wheel fits: worth saying, not worth a warn.
+        let index_only = scan.targets.is_empty() && scan.no_binary.is_empty();
         out.push(finding(
             "install/pip-build-code",
-            Severity::Warn,
+            if index_only {
+                Severity::Info
+            } else {
+                Severity::Warn
+            },
             None,
             None,
             &format!(
-                "pip may build these from source when the index has no wheel (not checked offline): {}",
+                "pip may build these from source if no wheel fits; not checked offline: {}",
                 list(&scan.names)
             ),
             None,
@@ -232,7 +238,7 @@ fn direct_reference(spec: &str) -> String {
 fn package_name(spec: &str) -> String {
     pep508_rs::Requirement::<pep508_rs::VerbatimUrl>::from_str(spec)
         .map(|r| r.name.to_string())
-        .unwrap_or_else(|_| spec.to_string())
+        .unwrap_or_else(|_| redact(spec))
 }
 
 fn classify(spec: &str, root: &Path) -> Kind {

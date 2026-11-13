@@ -1,6 +1,6 @@
 use crate::finding::{Finding, Severity};
 
-use super::finding;
+use super::{finding, redact};
 
 /// `brew install|reinstall|upgrade <user>/<repo>/<formula>`, `brew tap <user>/<repo>` and a
 /// formula given as a `.rb` path or URL run Ruby from outside homebrew's own taps. Nothing is
@@ -27,6 +27,7 @@ pub(super) fn analyze(args: &[String]) -> Vec<Finding> {
         _ => Vec::new(),
     };
     hits.into_iter()
+        .map(|name| redact(name))
         .map(|name| {
             finding(
                 "install/brew-unknown-tap",
@@ -34,7 +35,7 @@ pub(super) fn analyze(args: &[String]) -> Vec<Finding> {
                 None,
                 None,
                 &format!("brew {sub} {name}"),
-                Some(name.to_string()),
+                Some(name),
             )
         })
         .collect()
