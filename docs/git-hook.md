@@ -1,6 +1,6 @@
 # Scan on clone: the git hook
 
-`code-watch install-hook` makes every new `git clone` (and `git worktree add`) run `code-watch scan .` in the new
+`code-watch install-hook` makes every new `git clone` (and `git worktree add`) run `code-watch scan --user-allow-only .` in the new
 checkout. It does this with a global git template: a `post-checkout` hook in
 `$XDG_DATA_HOME/code-watch/git-template/hooks` (default `~/.local/share/...`), and `init.templateDir` in your global
 git config pointing at that folder. Nothing else is touched.
@@ -29,7 +29,7 @@ code-watch uninstall-hook   # turn it off; your git config is as it was before
 
 | Situation | Why |
 |---|---|
-| `init.templateDir` already points elsewhere | we never edit or copy a folder that is not ours; add `code-watch scan .` to your own `post-checkout` there |
+| `init.templateDir` already points elsewhere | we never edit or copy a folder that is not ours; add `code-watch scan --user-allow-only .` to your own `post-checkout` there |
 | `core.hooksPath` is set | git ignores template hooks while it is |
 | `GIT_TEMPLATE_DIR` is set, or another setting overrides ours | the hook would never run |
 | `git` is not on PATH | nothing to configure |

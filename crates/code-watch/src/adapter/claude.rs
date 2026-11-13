@@ -1,4 +1,4 @@
-use super::{Adapter, Call, Decision, Policy, Reply, pretool};
+use super::{Adapter, Call, Decision, Policy, Reply, UNCHECKED, pretool};
 
 pub struct ClaudeCode;
 
@@ -13,10 +13,10 @@ impl Adapter for ClaudeCode {
             Decision::Allow => None,
             Decision::Ask { reason, .. } => Some(pretool::decision("ask", reason)),
             Decision::Deny(reason) => Some(pretool::decision("deny", reason)),
+            Decision::Unchecked { closed, .. } => {
+                closed.then(|| pretool::decision("deny", UNCHECKED.into()))
+            }
         };
-        Reply {
-            stdout,
-            stderr: None,
-        }
+        Reply::new(stdout, None)
     }
 }

@@ -46,14 +46,12 @@ fn gate(checked: anyhow::Result<Report>, fail_open: bool) -> Gate {
                 message: render::to_human(&report),
             },
         },
-        Err(e) if fail_open => Gate::Run {
-            note: Some(format!("could not check this command, running it: {e:#}")),
+        Err(_) if fail_open => Gate::Run {
+            note: Some("could not check this command, running it.".to_string()),
         },
-        Err(e) => Gate::Stop {
+        Err(_) => Gate::Stop {
             code: EXIT_ERROR,
-            message: format!(
-                "could not check this command: {e:#}. Set {FAIL_OPEN_VAR}=1 to run commands it cannot check."
-            ),
+            message: crate::adapter::UNCHECKED.to_string(),
         },
     }
 }
@@ -143,6 +141,7 @@ pub fn run(name: &'static str, args: Vec<OsString>) -> ExitCode {
         cwd.as_deref(),
         &command_text(name, &args),
         crate::user_dir().as_deref(),
+        false,
     );
     match gate(checked, fail_open) {
         Gate::Run { note: Some(note) } => stderr(&note),
@@ -312,7 +311,8 @@ mod tests {
         let Gate::Stop { code: 3, message } = closed else {
             panic!("closed must stop");
         };
-        assert!(message.contains(FAIL_OPEN_VAR));
+        assert_eq!(message, crate::adapter::UNCHECKED);
+        assert!(!message.contains(FAIL_OPEN_VAR) && !message.contains("boom"));
         let open = gate(Err(anyhow::anyhow!("boom")), true);
         assert!(matches!(open, Gate::Run { note: Some(_) }));
     }

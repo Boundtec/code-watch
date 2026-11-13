@@ -55,11 +55,12 @@ The user file decides. The per-repo file is a convenience for teams and can neve
 | File | Location | What it can do |
 |---|---|---|
 | User (decides) | `~/.config/code-watch/allow.toml` (`$XDG_CONFIG_HOME` honoured) | allow any rule, including `block`-severity ones |
-| Per-repo (advisory) | `.code-watch.toml` at the repo root (a team can commit it) | allow only non-`block` rules; a `block` rule is allowed only if the user file also lists that rule id |
+| Per-repo (advisory) | `.code-watch.toml` at the repo root (a team can commit it) | allow only non-`block` repo rules (`repo/*`); never a `block` finding and never a `command/*` rule |
 
 Entries allow by `rule_id` plus an optional path glob / domain / package. Allow only suppresses findings of the rules
 layer and the OSV layer, by id; it never turns off a layer. Why the per-repo file is limited: a cloned repo is untrusted
-input and must not be able to whitelist itself.
+input, and the agent being guarded can write it, so it must not be able to whitelist itself. Adapters and the
+clone-time scan read the user file only; `check` reads the repo file just to report an attempt.
 
 ### The LLM layer behind one trait
 
@@ -90,7 +91,7 @@ and exits. Adapters and shims contain no rules.
 
 | Entry | What it is |
 |---|---|
-| git hook | `code-watch install-hook` sets a global `init.templateDir` with `post-checkout` that runs `code-watch scan .` |
+| git hook | `code-watch install-hook` sets a global `init.templateDir` with `post-checkout` that runs `code-watch scan --user-allow-only .` (the hook file carries a version marker; `install-hook` replaces an older one) |
 | agent adapters | each one is a tiny `code-watch adapter <agent>` subcommand that reads that agent's hook JSON on stdin, calls `check`, and prints that agent's response format |
 | PATH shims | `code-watch shims install <dir>` links `git`, `npm`, `pnpm`, `yarn`, `pip`, `brew`, `curl` to the binary, which dispatches on argv[0]: it checks its own argv, then execs the first real tool on `PATH` that is not a code-watch binary |
 
@@ -103,7 +104,7 @@ Adding an agent = one new adapter module implementing `trait Adapter { fn parse(
 | 0 | clean (info only) |
 | 1 | warn |
 | 2 | block |
-| 3 | internal or usage error (clap's usage error is mapped to 3 so 2 always means block); `--fail-open` / `--fail-closed` decides what adapters do with it |
+| 3 | internal or usage error (clap's usage error is mapped to 3 so 2 always means block). A fail-closed adapter (the default) exits 2 instead for every failure, since agents block only on 2; `--fail-open` keeps 3 |
 
 Human output: one line per finding (`BLOCK repo/npm-lifecycle-script package.json:12 ...`), a footer with layers that
 ran and layers that are off. `--json`: `{ "verdict", "layers": {rules, osv, llm: "ran"|"off"|"skipped"}, "findings": [...] }`
@@ -145,7 +146,7 @@ No async runtime anywhere. `cargo-deny` runs in CI to keep the license list hone
 ## 3. Agent hook APIs (read 2026-11-12, re-read 2026-11-13)
 
 Update 2026-11-13 (slice 11): Gemini CLI `BeforeTool` is as listed below, with no `ask` decision (only `allow`,
-`deny`, `block`), so a warning is a deny that says how to allow it; the OpenCode docs now describe a different plugin
+`deny`, `block`), so a warning is a deny that tells the model to ask the user; the OpenCode docs now describe a different plugin
 API (`Plugin.define`) without hook details, so the plugin follows the older `tool.execute.before` shape that
 third-party plugins use and is untested against a live OpenCode. OpenCode cannot ask either, so a warning is denied
 unless the plugin is installed with `--opencode-warn allow`.
@@ -170,7 +171,8 @@ entry. Any other agent or harness (Aider, Zed, a custom script, a plain terminal
 also cover commands an agent runs through paths the hook does not see.
 
 Gotcha shared by all: hook exit codes other than the documented block code fail open, so adapters wrap `check` so that
-an internal error (exit 3) follows `--fail-open` / `--fail-closed` explicitly instead of by accident.
+an internal error follows `--fail-open` / `--fail-closed` explicitly instead of by accident: fail-closed exits 2 with the
+reason on stderr. Codex has no fail-closed setting for a missing binary.
 
 ## 4. Build plan
 

@@ -6,7 +6,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-const MARKER: &str = "# code-watch managed hook";
+/// Every hook we wrote starts its marker line with this; `MARKER` adds the script's version.
+const MARKER_PREFIX: &str = "# code-watch managed hook";
+const MARKER: &str = "# code-watch managed hook v2";
 const KEY: &str = "init.templateDir";
 
 /// Directory that holds our template (and nothing of the user's).
@@ -66,7 +68,7 @@ if [ -z "$bin" ]; then
   exit 0
 fi
 dir=$(printf '%s' "$PWD" | tr -d '\000-\037\177')
-"$bin" scan .
+"$bin" scan --user-allow-only .
 status=$?
 case $status in
   0) exit 0 ;;
@@ -79,6 +81,10 @@ esac
 }
 
 fn is_ours(hook: &Path) -> bool {
+    fs::read_to_string(hook).is_ok_and(|s| s.lines().any(|l| l.starts_with(MARKER_PREFIX)))
+}
+
+fn is_current(hook: &Path) -> bool {
     fs::read_to_string(hook).is_ok_and(|s| s.lines().any(|l| l == MARKER))
 }
 
@@ -121,6 +127,7 @@ pub fn install(binary: &Path) -> Result<String> {
 
     let hook = dir.join("hooks/post-checkout");
     let existed = hook.symlink_metadata().is_ok();
+    let outdated = existed && !hook.is_symlink() && is_ours(&hook) && !is_current(&hook);
     if existed && (hook.is_symlink() || !is_ours(&hook)) {
         bail!(
             "{} exists and was not written by code-watch; not touching it",
@@ -154,7 +161,9 @@ pub fn install(binary: &Path) -> Result<String> {
             "a setting outside the global git config overrides init.templateDir, so the hook would never run; nothing was left behind"
         );
     }
-    Ok(if current.is_some() {
+    Ok(if outdated {
+        "updated from an older version; the hook was rewritten".into()
+    } else if current.is_some() {
         "already installed; hook refreshed".into()
     } else {
         format!(
