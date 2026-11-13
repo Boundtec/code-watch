@@ -324,7 +324,10 @@ pub fn analyze(commands: &[Vec<String>], cwd: &Path, judge: &Judge) -> Vec<Findi
             }
             "corepack" => {
                 let mut rest = args.iter().skip_while(|a| a.starts_with('-'));
-                if let Some(manager) = rest.next().map(String::as_str)
+                // `corepack pnpm@9 install` names the version it pins after the manager.
+                if let Some(manager) = rest
+                    .next()
+                    .map(|m| m.split_once('@').map_or(m.as_str(), |(name, _)| name))
                     && matches!(manager, "npm" | "pnpm" | "yarn")
                 {
                     let after: Vec<String> = rest.cloned().collect();

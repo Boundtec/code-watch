@@ -173,6 +173,8 @@ struct Invocation {
     /// The command line's own word on scripts; absent leaves the project's settings to say.
     ignore_scripts: Option<bool>,
     skip_build: bool,
+    /// The command line allows dependency builds (pnpm 10 blocks them by default).
+    allows_builds: bool,
 }
 
 enum Parsed {
@@ -185,6 +187,7 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
     let mut global = false;
     let mut ignore_scripts = None;
     let mut skip_build = false;
+    let mut allows_builds = false;
     let mut dir = here.to_path_buf();
     let mut positionals: Vec<&str> = Vec::new();
     let mut i = 0;
@@ -217,6 +220,19 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
                     args.get(i).map(String::as_str)
                 });
                 skip_build = value == Some("skip-build");
+            }
+            "--dangerously-allow-all-builds" => allows_builds |= inline != Some("false"),
+            "--allow-build" => {
+                allows_builds = true;
+                if inline.is_none() {
+                    i += 1;
+                }
+            }
+            f if f
+                .strip_prefix("--config.")
+                .is_some_and(|key| config_key_allows_builds(key, inline)) =>
+            {
+                allows_builds = true;
             }
             "--prefix" | "-C" | "--dir" | "--cwd" => {
                 let value = inline.or_else(|| {
@@ -256,6 +272,7 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
                 dir,
                 ignore_scripts,
                 skip_build,
+                allows_builds,
             }),
             _ => Parsed::Other,
         };
@@ -283,6 +300,7 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
                     dir,
                     ignore_scripts,
                     skip_build,
+                    allows_builds,
                 })
             }
             Some(other) if runs_code_unchecked(manager, other) => {
@@ -311,7 +329,23 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
         dir,
         ignore_scripts,
         skip_build,
+        allows_builds,
     })
+}
+
+/// pnpm's `--config.<key>[=value]` spells a setting in either case style; a key that allows
+/// builds counts unless it is set to false. Any `onlyBuiltDependencies` or `allowBuild` form
+/// counts, since which packages it names is not worth parsing: the result can only show more.
+fn config_key_allows_builds(key: &str, inline: Option<&str>) -> bool {
+    let key: String = key
+        .chars()
+        .filter(|c| *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if key.starts_with("dangerouslyallowallbuilds") {
+        return inline != Some("false");
+    }
+    key.starts_with("onlybuiltdependencies") || key.starts_with("allowbuild")
 }
 
 fn is_install(manager: &str, sub: &str) -> bool {
@@ -367,6 +401,7 @@ pub(super) fn analyze(
         cwd,
         judge,
         skip_build: inv.skip_build,
+        allows_builds: inv.allows_builds,
     };
     project.repo_code(&mut out);
     // Yarn berry has no --ignore-scripts and does not read .npmrc; elsewhere the command line beats the project's settings.
@@ -497,6 +532,7 @@ struct Project<'a> {
     cwd: &'a Path,
     judge: &'a Judge<'a>,
     skip_build: bool,
+    allows_builds: bool,
 }
 
 impl Project<'_> {
@@ -1266,6 +1302,19 @@ fn npmrc_ignores_scripts(text: &str) -> Option<bool> {
     off
 }
 
+/// Whether an `.npmrc` sets a key that allows dependency builds to run (pnpm 10 still reads
+/// them there): `dangerously-allow-all-builds` unless false, or any `only-built-dependencies`
+/// or `allow-build` form. Which packages a list names is not read, so it counts as all.
+fn npmrc_allows_builds(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with(['#', ';']))
+        .filter_map(|line| line.split_once('='))
+        .any(|(key, value)| {
+            config_key_allows_builds(key.trim(), Some(value.trim().trim_matches(['"', '\''])))
+        })
+}
+
 /// The `dependencies`, `devDependencies` and `optionalDependencies` of a manifest. Specs that
 /// fetch from git or a URL go into `remote` too.
 fn collect_dependencies(json: &serde_json::Value, declared: &mut Declared, remote: &mut Remote) {
@@ -1413,6 +1462,20 @@ impl PnpmBuilds {
             Ok(None) => {}
             Err(why) => {
                 me.manifest_problem = Some(format!("{shown} {why}"));
+            }
+        }
+        me.allow_all = p.allows_builds;
+        for (path, name) in [p.file(".npmrc"), p.root_file(".npmrc")] {
+            match read_optional(&path, MAX_TEXT_BYTES) {
+                Ok(Some(text)) => me.allow_all |= npmrc_allows_builds(&text),
+                Ok(None) => {}
+                Err(e) => {
+                    out.push(unchecked(&name, e.describe()));
+                    me.file_problem = Some(format!("{name} could not be read"));
+                }
+            }
+            if p.root == p.dir {
+                break;
             }
         }
         for source in sources {

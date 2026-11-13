@@ -63,6 +63,8 @@ struct Scan {
     targets: BTreeSet<Target>,
     /// Index packages named on the command line or in requirements files.
     names: BTreeSet<String>,
+    /// Options that point pip at a source other than PyPI, by name (their values can hold credentials).
+    other_index: BTreeSet<String>,
     problems: Vec<(String, String)>,
 }
 
@@ -111,6 +113,7 @@ pub(super) fn analyze(args: &[String], here: &Path, cwd: &Path, judge: &Judge) -
         no_binary: BTreeSet::new(),
         targets: BTreeSet::new(),
         names: BTreeSet::new(),
+        other_index: BTreeSet::new(),
         problems: Vec::new(),
     };
     read_args(&args[at + 1..], here, cwd, 0, &mut scan);
@@ -145,7 +148,8 @@ pub(super) fn analyze(args: &[String], here: &Path, cwd: &Path, judge: &Judge) -
     let wheels_only = scan.only_binary_all && scan.no_binary.is_empty();
     if !scan.only_binary_all && !scan.no_binary.contains(":all:") && !scan.names.is_empty() {
         // From an index alone, pip builds only when no wheel fits: worth saying, not worth a warn.
-        let index_only = scan.targets.is_empty() && scan.no_binary.is_empty();
+        let index_only =
+            scan.targets.is_empty() && scan.no_binary.is_empty() && scan.other_index.is_empty();
         out.push(finding(
             "install/pip-build-code",
             if index_only {
@@ -156,8 +160,16 @@ pub(super) fn analyze(args: &[String], here: &Path, cwd: &Path, judge: &Judge) -
             None,
             None,
             &format!(
-                "pip may build these from source if no wheel fits; not checked offline: {}",
-                list(&scan.names)
+                "pip may build these from source if no wheel fits; not checked offline: {}{}",
+                list(&scan.names),
+                if scan.other_index.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; {} point pip at a source other than PyPI, where a package can be a source distribution that builds",
+                        list(&scan.other_index)
+                    )
+                }
             ),
             None,
         ));
@@ -309,6 +321,17 @@ fn binary_flag(flag: &str, value: Option<&str>, scan: &mut Scan) {
     }
 }
 
+/// The options that make pip look for packages somewhere else than PyPI, in their long spelling.
+fn other_index_flag(flag: &str) -> Option<&'static str> {
+    match flag {
+        "-i" | "--index-url" => Some("--index-url"),
+        "--extra-index-url" => Some("--extra-index-url"),
+        "-f" | "--find-links" => Some("--find-links"),
+        "--trusted-host" => Some("--trusted-host"),
+        _ => None,
+    }
+}
+
 /// `-rreq.txt` as (`-r`, `req.txt`); anything else as (flag, inline value of `--flag=value`).
 fn split_flag(arg: &str) -> (&str, Option<&str>) {
     if let Some(long) = arg.strip_prefix("--") {
@@ -359,6 +382,11 @@ fn read_args(args: &[String], here: &Path, cwd: &Path, depth: usize, scan: &mut 
             "--only-binary" | "--no-binary" => {
                 let v = value();
                 binary_flag(flag, v, scan);
+            }
+            f if other_index_flag(f).is_some() => {
+                let _ = value();
+                scan.other_index
+                    .extend(other_index_flag(f).map(str::to_string));
             }
             f if VALUE_FLAGS.contains(&f) => {
                 let _ = value();

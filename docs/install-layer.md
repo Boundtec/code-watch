@@ -67,17 +67,20 @@ The text is judged by the same command rules as `check`.
 | Command (clean project) | Verdict |
 |---|---|
 | `pip install requests`, `-U pip`, `--user black pytest`, `-r requirements.txt` (index names only), `--require-hashes -r ...` | info: "may build from source if no wheel fits; not checked offline" |
+| `pip install --extra-index-url ... requests`, `-i`, `--index-url`, `-f`, `--find-links`, `--trusted-host` (on the command or in a requirements file) | warn: the packages may come from a source other than PyPI |
 | `pip install ./dir`, a VCS address, a URL or an archive | warn |
 | `pip install --only-binary :all: requests` | info (wheels only) |
 | `pip list`, `pip freeze`, `brew install jq`, `brew install node git` | nothing |
 | `npm ci`, `npm i` with a lockfile that lists every dependency and no install script | info: none found |
 | `npm i lodash`, `npm install -D typescript`, `npm i` with no lockfile | warn: scripts certainly run |
 | `pnpm install`, pnpm 10 or later in `packageManager`, nothing allowed to build | info: builds are blocked |
+| the same with `--dangerously-allow-all-builds`, `--config.dangerously-allow-all-builds`, `--allow-build`, `--config.only-built-dependencies`, or such a key in `.npmrc` | warn: the builds run |
 | `pnpm install`, pnpm version unknown | warn |
 | `yarn install`, yarn 1 or yarn 2+ without `enableScripts: false` | warn |
 
-Not covered: changes of index or registry (`--index-url`, `--extra-index-url`, `--find-links`, a registry in `.npmrc`)
-are not reported; this layer shows what runs, not where packages come from. `pip download` and `pip wheel` are not
+Not covered: a registry in `.npmrc` or `--registry` for npm, pnpm and yarn is not reported; this layer shows what runs,
+not where those packages come from. A pip index or link source (`--index-url`, `--extra-index-url`, `--find-links`) is
+reported as a warn, because a named package from it can be a source distribution that builds. `pip download` and `pip wheel` are not
 recognised. Lockfile versions are not compared with the ranges in `package.json`, only names. A named pip package is
 reported as "may build from source" because whether pip builds it depends on the index, which is never fetched.
 Docs checked 2026-11-13: npm (using-npm/scripts), pnpm (settings/build), Yarn (yarnrc `enableScripts`), pip (`pip install`).
