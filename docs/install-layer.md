@@ -25,6 +25,9 @@ none found is info. The text is judged by the same command rules as `check`.
   package counts when its installed manifest has an install script; with nothing installed it says it cannot tell.
 - **Yarn.** Yarn 4 runs no dependency scripts unless `enableScripts` is on; the lockfile does not list them, so it
   says so. Yarn 1 runs them and does not list them either.
+- **Where it runs.** `check`, the agent adapters and the `npm`/`pnpm`/`yarn`/`pip`/`brew` shims judge an install against
+  the directory they are called from, and find it anywhere the command parser looks (`cd x && npm i`, `sh -c '...'`,
+  `$(...)`). A caller with no directory (the library's `check_command`) gets no install findings.
 - **Directory.** `--prefix`, `-C`, `--dir`, `--cwd` and a `cd x &&` before the install move where it is judged.
 - **Global installs** (`npm i -g x`, `pnpm add -g`, `yarn global add`) give `install/global-package` (warn) per
   package, with the package name, so the user allowlist can trust one: `package = "@scope/*"` (a glob, case-insensitive).

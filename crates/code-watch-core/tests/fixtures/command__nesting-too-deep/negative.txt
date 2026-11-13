@@ -1,0 +1,2 @@
+echo $(echo $(echo hi))
+sh -c 'echo hi'

