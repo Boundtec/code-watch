@@ -14,12 +14,23 @@ struct JsonReport<'a> {
     schema: u32,
     verdict: Verdict,
     layers: &'a std::collections::BTreeMap<Layer, LayerStatus>,
-    findings: &'a [Finding],
+    findings: Vec<JsonFinding<'a>>,
     skipped: &'a [Skipped],
     skipped_rules: &'a [String],
     skipped_layers: &'a std::collections::BTreeMap<Layer, String>,
     suppressed: &'a [Suppressed],
     allowlist_warnings: &'a [String],
+    llm_held_back: usize,
+}
+
+/// A finding plus `unverified: true` when a model wrote it, so a consumer never has to infer
+/// that from the rule id.
+#[derive(Serialize)]
+struct JsonFinding<'a> {
+    #[serde(flatten)]
+    finding: &'a Finding,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    unverified: bool,
 }
 
 pub fn to_json(report: &Report) -> serde_json::Result<String> {
@@ -27,12 +38,20 @@ pub fn to_json(report: &Report) -> serde_json::Result<String> {
         schema: JSON_SCHEMA,
         verdict: report.verdict(),
         layers: report.layers(),
-        findings: report.findings(),
+        findings: report
+            .findings()
+            .iter()
+            .map(|finding| JsonFinding {
+                finding,
+                unverified: finding.layer == Layer::Llm,
+            })
+            .collect(),
         skipped: report.skipped(),
         skipped_rules: report.skipped_rules(),
         skipped_layers: report.layer_notes(),
         suppressed: report.suppressed(),
         allowlist_warnings: report.allowlist_warnings(),
+        llm_held_back: report.llm_held_back(),
     };
     serde_json::to_string_pretty(&view)
 }
@@ -54,9 +73,14 @@ pub fn to_human(report: &Report) -> String {
             (Some(file), None) => format!(" {}", clean_text(file)),
             _ => String::new(),
         };
+        let marker = if f.layer == Layer::Llm {
+            " [model-written, unverified]"
+        } else {
+            ""
+        };
         let _ = writeln!(
             out,
-            "{:<5} {}{place}: {}",
+            "{:<5} {}{marker}{place}: {}",
             f.severity.to_string().to_uppercase(),
             sanitize(&f.rule_id),
             sanitize(&f.title)
@@ -92,6 +116,11 @@ pub fn to_human(report: &Report) -> String {
     if skipped > 0 {
         let noun = if skipped == 1 { "file" } else { "files" };
         let _ = writeln!(out, "{skipped} {noun} not scanned");
+    }
+    let held = report.llm_held_back();
+    if held > 0 {
+        let noun = if held == 1 { "file" } else { "files" };
+        let _ = writeln!(out, "{held} credential {noun} not sent to the model");
     }
     let _ = writeln!(out, "verdict: {}", report.verdict());
     out
@@ -230,5 +259,49 @@ mod tests {
         assert!(to_human(&report).contains("rules skipped on this platform: command/x\n"));
         let v: serde_json::Value = serde_json::from_str(&to_json(&report).unwrap()).unwrap();
         assert_eq!(v["skipped_rules"], serde_json::json!(["command/x"]));
+    }
+
+    fn llm_finding() -> Finding {
+        Finding {
+            rule_id: "llm/x".into(),
+            severity: crate::finding::Severity::Warn,
+            layer: Layer::Llm,
+            title: "t".into(),
+            evidence: crate::finding::Evidence::new(None, None, ""),
+            remediation: "r".into(),
+            domain: None,
+            package: None,
+            advisories: vec![],
+        }
+    }
+
+    #[test]
+    fn a_model_finding_is_marked_unverified_in_human_and_json_and_a_rules_finding_is_not() {
+        let mut rules = llm_finding();
+        rules.layer = Layer::Rules;
+        rules.rule_id = "r/x".into();
+        let report = Report::from_rules(vec![llm_finding(), rules]);
+        let human = to_human(&report);
+        assert_eq!(human.matches("[model-written, unverified]").count(), 1);
+        let v: serde_json::Value = serde_json::from_str(&to_json(&report).unwrap()).unwrap();
+        let flags: Vec<_> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| (f["layer"].as_str().unwrap(), f.get("unverified").cloned()))
+            .collect();
+        assert!(flags.contains(&("llm", Some(serde_json::json!(true)))));
+        assert!(flags.contains(&("rules", None)));
+    }
+
+    #[test]
+    fn held_back_credential_files_are_counted_in_human_and_json() {
+        let report = Report::from_rules(vec![]).with_llm(crate::llm::LlmOutcome::Ran {
+            findings: crate::llm::LlmFindings::empty(),
+            held_back: 2,
+        });
+        assert!(to_human(&report).contains("2 credential files not sent to the model"));
+        let v: serde_json::Value = serde_json::from_str(&to_json(&report).unwrap()).unwrap();
+        assert_eq!(v["llm_held_back"], 2);
     }
 }
