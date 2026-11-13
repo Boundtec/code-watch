@@ -7,8 +7,8 @@ use super::read::{MAX_LOCK_BYTES, MAX_TEXT_BYTES, ReadError, read_optional};
 use super::{Judge, finding, shown, unchecked};
 use crate::finding::{Finding, Severity};
 
-/// The scripts a project install may run, in npm's order (npm docs, using-npm/scripts, read
-/// 2026-11-13). pnpm and yarn run a subset; listing the superset errs toward showing more.
+/// The scripts a project install may run, in npm's order. pnpm and yarn run a subset; listing
+/// the superset errs toward showing more.
 const SCRIPTS: &[&str] = &[
     "preinstall",
     "install",
@@ -547,15 +547,18 @@ impl Project<'_> {
         }
         let settings = PnpmBuilds::read(self, out);
         let dir_of = |n: &str| dirs.get(n).cloned();
-        match settings.mode(self) {
+        match settings.mode() {
             PnpmMode::RunsAll => self.report_dependencies(&names, "will run", &shown, &dir_of, out),
-            PnpmMode::Unknown => self.report_dependencies(
-                &names,
-                "may run (the pnpm version is not known)",
-                &shown,
-                &dir_of,
-                out,
-            ),
+            PnpmMode::Unknown(problem) => {
+                let why = problem.map_or_else(String::new, |p| format!(": {p}"));
+                self.report_dependencies(
+                    &names,
+                    &format!("may run (the pnpm version is not known{why})"),
+                    &shown,
+                    &dir_of,
+                    out,
+                );
+            }
             PnpmMode::Gated => {
                 let (allowed, blocked): (BTreeSet<_>, BTreeSet<_>) =
                     names.into_iter().partition(|n| settings.allows(n));
@@ -654,11 +657,14 @@ impl Project<'_> {
         ));
         for name in names.iter().take(MAX_MEMBERS) {
             let Some(dir) = dir_of(name) else { continue };
-            let Ok(Some(text)) = read_optional(&dir.join("package.json"), MAX_TEXT_BYTES) else {
-                continue;
-            };
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-                continue;
+            let path = dir.join("package.json");
+            let (json, text) = match manifest_if_present(&path) {
+                Ok(Some(m)) => m,
+                Ok(None) => continue,
+                Err(why) => {
+                    out.push(unchecked(&shown(&path, self.cwd), why));
+                    continue;
+                }
             };
             let mut found = Vec::new();
             self.list_scripts(&dir, &json, &text, false, Some(name), &mut found);
@@ -710,15 +716,17 @@ fn pnpm_key_name(key: &str) -> Option<&str> {
 enum PnpmMode {
     RunsAll,
     Gated,
-    Unknown,
+    Unknown(Option<String>),
 }
 
 /// What pnpm allows to build, from `pnpm-workspace.yaml` and the `pnpm` key of package.json:
-/// `onlyBuiltDependencies` (pnpm 10), `allowBuilds` (pnpm 11) and `dangerouslyAllowAllBuilds`
-/// (pnpm docs, settings/build, read 2026-11-13).
+/// `onlyBuiltDependencies` (pnpm 10), `allowBuilds` (pnpm 11) and `dangerouslyAllowAllBuilds`.
+/// The root package.json is read once: it holds the `pnpm` key and the `packageManager` version.
 struct PnpmBuilds {
     allow_all: bool,
     allowed: Vec<globset::GlobMatcher>,
+    major: Option<u32>,
+    manifest_problem: Option<String>,
 }
 
 impl PnpmBuilds {
@@ -726,16 +734,29 @@ impl PnpmBuilds {
         let mut me = PnpmBuilds {
             allow_all: false,
             allowed: Vec::new(),
+            major: None,
+            manifest_problem: None,
         };
         let mut sources = Vec::new();
         sources.extend(p.yaml("pnpm-workspace.yaml", out));
-        let (path, _) = p.file("package.json");
-        if let Ok(Some(text)) = read_optional(&path, MAX_TEXT_BYTES)
-            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-            && let Some(pnpm) = json.get("pnpm")
-            && let Ok(v) = serde_norway::to_value(pnpm)
-        {
-            sources.push(v);
+        let (path, shown) = p.file("package.json");
+        match manifest_if_present(&path) {
+            Ok(Some((json, _))) => {
+                me.major = json
+                    .get("packageManager")
+                    .and_then(|v| v.as_str())
+                    .and_then(|pm| pm.strip_prefix("pnpm@"))
+                    .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()));
+                if let Some(pnpm) = json.get("pnpm")
+                    && let Ok(v) = serde_norway::to_value(pnpm)
+                {
+                    sources.push(v);
+                }
+            }
+            Ok(None) => {}
+            Err(why) => {
+                me.manifest_problem = Some(format!("{shown} {why}"));
+            }
         }
         for source in sources {
             if source
@@ -787,24 +808,25 @@ impl PnpmBuilds {
         self.allow_all || self.allowed.iter().any(|g| g.is_match(name))
     }
 
-    fn mode(&self, p: &Project) -> PnpmMode {
-        let (path, _) = p.file("package.json");
-        let version = read_optional(&path, MAX_TEXT_BYTES)
-            .ok()
-            .flatten()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|j| {
-                j.get("packageManager")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            })
-            .and_then(|pm| pm.strip_prefix("pnpm@").map(String::from))
-            .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()));
-        match version {
+    /// An unreadable package.json (already reported once by the project scan) leaves the version unknown, which shows more, and says why.
+    fn mode(&self) -> PnpmMode {
+        match self.major {
             Some(major) if major >= 10 => PnpmMode::Gated,
             Some(_) => PnpmMode::RunsAll,
-            None => PnpmMode::Unknown,
+            None => PnpmMode::Unknown(self.manifest_problem.clone()),
         }
+    }
+}
+
+/// A package.json that may legitimately be absent; a file that is there but cannot be read,
+/// is too big or is not JSON is an error naming why, never a silent skip.
+fn manifest_if_present(path: &Path) -> Result<Option<(serde_json::Value, String)>, &'static str> {
+    let Some(text) = read_optional(path, MAX_TEXT_BYTES).map_err(ReadError::describe)? else {
+        return Ok(None);
+    };
+    match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+        Ok(v) => Ok(Some((v, text))),
+        Err(_) => Err("is not valid JSON"),
     }
 }
 

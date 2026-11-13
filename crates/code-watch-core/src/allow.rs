@@ -634,6 +634,26 @@ mod tests {
     }
 
     #[test]
+    fn the_package_narrower_is_a_case_insensitive_glob() {
+        let k = known(&["w"]);
+        let pkg = |p: &str| Finding {
+            package: Some(p.into()),
+            ..finding("w", Severity::Warn)
+        };
+        let allowed = |entry: &str, name: &str| {
+            let user = format!("[[allow]]\nrule = \"w\"\npackage = \"{entry}\"\n");
+            lists(&user, "").apply(vec![pkg(name)], &k).kept.is_empty()
+        };
+        assert!(allowed("Left-Pad", "left-pad"));
+        assert!(allowed("left-pad", "LEFT-PAD"));
+        assert!(allowed("@scope/*", "@scope/x"));
+        assert!(!allowed("@scope/*", "@other/x"));
+        assert!(allowed("lib[ab]", "liba"));
+        assert!(!allowed("lib[ab]", "lib[ab]"));
+        assert!(!allowed("lib[ab]", "libc"));
+    }
+
+    #[test]
     fn the_excerpt_never_satisfies_a_domain_or_package_narrower() {
         let user = "[[allow]]\nrule = \"w\"\ndomain = \"example.org\"\n";
         let f = Finding {

@@ -35,7 +35,7 @@ reason = "internal build step"       # optional, echoed in --json
 All narrowers on an entry must match. `path` uses `*` within one directory (it does not cross `/`; use `**`), and a
 finding with no file never matches a path entry. `domain` and `package` compare against fields the rule itself sets,
 case-insensitively (`package` is a glob, `domain` is exact): `example.org` does not cover `cdn.example.org`, and the finding's excerpt is never
-consulted.
+consulted. The `package` narrower was an exact match before install findings existed: a name with a glob character (`[`, `*`, `?`) now matches as a pattern and differing case now matches, so an existing OSV allow entry with such a name covers more than before.
 
 A finding has a `domain` only when it is about a download and the command is unambiguous: the finding is
 `command/pipe-to-shell` (the host is taken from its URL) or `command/lookalike-download-domain` (the host it flagged).

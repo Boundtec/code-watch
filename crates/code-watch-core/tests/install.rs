@@ -335,6 +335,64 @@ fn an_installed_dependency_whose_script_fetches_and_runs_is_a_block_naming_it() 
     assert_eq!(b.package.as_deref(), Some("esbuild"));
 }
 
+/// The unchecked findings that name `file`.
+fn unchecked_for<'a>(findings: &'a [Finding], file: &str) -> Vec<&'a Finding> {
+    findings
+        .iter()
+        .filter(|f| f.rule_id == "install/unchecked" && f.evidence.file.as_deref() == Some(file))
+        .collect()
+}
+
+fn npm_tree_with_dependency(esbuild: impl FnOnce(&Tree)) -> Tree {
+    let t = Tree::with(&[
+        ("package.json", &manifest(r#""test":"x""#)),
+        ("package-lock.json", NPM_LOCK),
+    ]);
+    esbuild(&t);
+    t
+}
+
+#[test]
+fn an_installed_dependency_manifest_that_cannot_be_read_is_unchecked_not_skipped() {
+    let file = "node_modules/esbuild/package.json";
+    let unreadable = npm_tree_with_dependency(|t| {
+        fs::create_dir_all(t.path().join(file)).unwrap();
+    });
+    let f = run("npm ci", unreadable.path());
+    let u = unchecked_for(&f, file);
+    assert_eq!(u.len(), 1, "{:?}", ids(&f));
+    assert!(u[0].evidence.excerpt.contains("could not be read"));
+
+    let too_big = npm_tree_with_dependency(|t| {
+        t.write(file, &" ".repeat(1024 * 1024 + 1));
+    });
+    let f = run("npm ci", too_big.path());
+    let u = unchecked_for(&f, file);
+    assert_eq!(u.len(), 1, "{:?}", ids(&f));
+    assert!(u[0].evidence.excerpt.contains("size limit"));
+
+    let invalid = npm_tree_with_dependency(|t| t.write(file, "{nope"));
+    let f = run("npm ci", invalid.path());
+    let u = unchecked_for(&f, file);
+    assert_eq!(u.len(), 1, "{:?}", ids(&f));
+    assert!(u[0].evidence.excerpt.contains("not valid JSON"));
+}
+
+#[test]
+fn a_pnpm_root_manifest_that_is_not_json_is_unchecked_and_the_version_is_said_unknown() {
+    let t = pnpm_tree("packages:\n  - \".\"\n", "{nope", true);
+    let f = run("pnpm install", t.path());
+    assert_eq!(unchecked_for(&f, "package.json").len(), 1, "{:?}", ids(&f));
+    let d = one(&f, "install/dependency-scripts");
+    assert!(
+        d.evidence
+            .excerpt
+            .contains("not known: package.json is not valid JSON"),
+        "{}",
+        d.evidence.excerpt
+    );
+}
+
 #[test]
 fn a_broken_lockfile_is_unchecked() {
     let t = Tree::with(&[
