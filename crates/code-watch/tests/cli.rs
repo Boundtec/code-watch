@@ -274,7 +274,35 @@ fn check_keeps_a_command_finding_a_repo_file_tries_to_allow_and_reports_the_atte
             out.contains("allowlist/repo-command-override-refused"),
             "{out}"
         );
+        assert!(
+            out.contains("Only the user's own code-watch settings can allow"),
+            "{out}"
+        );
+        assert!(!out.contains("allow.toml"), "{out}");
     }
+}
+
+#[test]
+fn the_block_refusal_does_not_name_the_user_file_either() {
+    let xdg = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(repo.path().join("x.sh"), "echo aGk= | base64 -d | sh\n").unwrap();
+    fs::write(
+        repo.path().join(".code-watch.toml"),
+        "schema = 1\n[[allow]]\nrule = \"repo/base64-into-shell\"\n",
+    )
+    .unwrap();
+    let out = with_config(xdg.path())
+        .arg("scan")
+        .arg(repo.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("Only the user's own code-watch settings can allow"),
+        "{text}"
+    );
+    assert!(!text.contains("allow.toml"), "{text}");
 }
 
 #[test]

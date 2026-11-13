@@ -60,6 +60,25 @@ fn assert_no_allow_how_to(text: &str) {
     }
 }
 
+/// Every field or stream the model can read after a failure, per agent. Cursor's `user_message`
+/// is for the user and is returned separately.
+fn model_text(agent: &str, run: &Run) -> String {
+    let mut text = run.stderr.clone();
+    if let Some(mut reply) = run.reply() {
+        if agent == "cursor" {
+            reply.as_object_mut().unwrap().remove("user_message");
+        }
+        text.push_str(&reply.to_string());
+    }
+    text
+}
+
+fn assert_nothing_to_dodge_with(text: &str) {
+    for forbidden in ["--fail-open", "allow.toml", "/", "SECRET-EXCERPT"] {
+        assert!(!text.contains(forbidden), "{forbidden:?} in {text}");
+    }
+}
+
 fn decision(reply: &Value) -> (&str, &str) {
     let s = &reply["hookSpecificOutput"];
     assert_eq!(s["hookEventName"], "PreToolUse");
@@ -103,7 +122,8 @@ fn codex_denies_a_warning_without_telling_the_model_how_to_allow_it() {
     let reply = r.reply().unwrap();
     let (d, reason) = decision(&reply);
     assert_eq!(d, "deny");
-    assert!(reason.contains("The user can allow this command"));
+    assert!(reason.contains("Ask the user before trying again."));
+    assert!(!reason.contains("can allow"));
     assert_no_allow_how_to(reason);
 }
 
@@ -196,7 +216,11 @@ fn bad_input_follows_the_fail_mode_for_every_agent() {
             let text = reply.to_string();
             assert!(text.contains("deny"), "{agent} {input:?}: {text}");
             assert!(text.contains("could not check this command"), "{agent}");
-            assert!(text.contains("--fail-open"), "{agent}");
+            assert_nothing_to_dodge_with(&model_text(agent, &closed));
+            if agent == "cursor" {
+                let user = reply["user_message"].as_str().unwrap();
+                assert!(user.contains("--fail-open"), "{user}");
+            }
 
             let open = run(agent, &["--fail-open"], input);
             assert_eq!(open.code, Some(0), "{agent} {input:?}");
@@ -204,9 +228,10 @@ fn bad_input_follows_the_fail_mode_for_every_agent() {
                 open.stderr.contains("could not check this command"),
                 "{agent}"
             );
+            assert_nothing_to_dodge_with(&model_text(agent, &open));
             let allowed = open.reply();
             assert!(
-                allowed.is_none() || allowed == Some(json!({"permission": "ask"})),
+                allowed.is_none() || allowed.as_ref().is_some_and(|a| a["permission"] == "ask"),
                 "{agent} {input:?}: {allowed:?}"
             );
         }
@@ -221,10 +246,17 @@ fn input_over_the_cap_is_refused_not_truncated() {
     );
     let closed = run("claude-code", &[], &big);
     assert_eq!(closed.code, Some(2));
-    assert!(closed.reply().unwrap().to_string().contains("larger than"));
+    assert!(
+        closed
+            .reply()
+            .unwrap()
+            .to_string()
+            .contains("so it was blocked")
+    );
+    assert_nothing_to_dodge_with(&model_text("claude-code", &closed));
     let open = run("claude-code", &["--fail-open"], &big);
     assert_eq!(open.reply(), None);
-    assert!(open.stderr.contains("larger than"));
+    assert_nothing_to_dodge_with(&model_text("claude-code", &open));
 }
 
 #[test]
@@ -366,29 +398,117 @@ fn a_closed_stdout_follows_the_fail_mode() {
 }
 
 #[test]
-fn a_broken_user_allowlist_is_an_error_that_follows_the_fail_mode() {
+fn a_broken_user_allowlist_follows_the_fail_mode_and_leaks_nothing_to_the_model() {
     let cfg = tempfile::tempdir().unwrap();
     fs::create_dir(cfg.path().join("code-watch")).unwrap();
-    fs::write(cfg.path().join("code-watch/allow.toml"), "not toml [").unwrap();
-    let input = fixture("claude-code", "allow");
-    let closed = adapter("claude-code", &[], input.as_bytes(), cfg.path());
-    assert_eq!(closed.code, Some(2));
-    assert!(closed.reply().unwrap().to_string().contains("deny"));
-    let open = adapter(
-        "claude-code",
-        &["--fail-open"],
-        input.as_bytes(),
-        cfg.path(),
+    fs::write(
+        cfg.path().join("code-watch/allow.toml"),
+        "SECRET-EXCERPT not toml [",
+    )
+    .unwrap();
+    for agent in AGENTS {
+        let input = fixture(agent, "allow");
+        let closed = adapter(agent, &[], input.as_bytes(), cfg.path());
+        assert_eq!(closed.code, Some(2), "{agent}");
+        assert!(
+            closed.reply().unwrap().to_string().contains("deny"),
+            "{agent}"
+        );
+        assert_nothing_to_dodge_with(&model_text(agent, &closed));
+        let open = adapter(agent, &["--fail-open"], input.as_bytes(), cfg.path());
+        assert_eq!(open.code, Some(0), "{agent}");
+        assert_nothing_to_dodge_with(&model_text(agent, &open));
+    }
+    let input = fixture("cursor", "allow");
+    let closed = adapter("cursor", &[], input.as_bytes(), cfg.path());
+    let user = closed.reply().unwrap()["user_message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        user.contains("allow.toml") && user.contains("--fail-open"),
+        "{user}"
     );
-    assert_eq!(open.reply(), None);
-    assert!(open.stderr.contains("allowlist"));
 }
 
 #[test]
 fn the_fail_flags_conflict() {
     let r = run("claude-code", &["--fail-open", "--fail-closed"], "");
-    assert_eq!(r.code, Some(3));
+    assert_eq!(r.code, Some(2));
     assert_eq!(r.stdout, "");
+    assert_nothing_to_dodge_with(&r.stderr);
+}
+
+#[test]
+fn a_usage_error_with_a_global_flag_before_adapter_still_blocks() {
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("code-watch"))
+        .args(["--json", "adapter", "claude-code", "--no-such-flag"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_nothing_to_dodge_with(&String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_blocked_usage_error_tells_the_model_nothing_about_flags() {
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("code-watch"))
+        .args(["adapter", "claude-code", "--fail-open", "--fail-closed"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("could not check this command"), "{text}");
+    assert_nothing_to_dodge_with(&text);
+}
+
+/// Runs the adapter with `redirect` applied by the shell to fd 1, which is how a closed or
+/// discarded stdout is produced without unsafe code.
+fn with_stdout(redirect: &str, flags: &[&str], stdin: &str) -> Run {
+    let cfg = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(r#"exec "$@" {redirect}"#))
+        .arg("sh")
+        .arg(assert_cmd::cargo::cargo_bin("code-watch"))
+        .args(["adapter", "claude-code"])
+        .args(flags)
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .env("HOME", cfg.path())
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    Run {
+        code: out.status.code(),
+        stdout: String::new(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn a_stdout_that_cannot_carry_the_reply_follows_the_fail_mode() {
+    for redirect in [">&-", ">/dev/null"] {
+        for (name, input) in [
+            ("block", fixture("claude-code", "block")),
+            ("internal error", "not json".to_string()),
+        ] {
+            let closed = with_stdout(redirect, &[], &input);
+            assert_eq!(closed.code, Some(2), "{redirect} {name}");
+            assert!(
+                closed.stderr.contains("could not write the reply"),
+                "{redirect} {name}"
+            );
+            let open = with_stdout(redirect, &["--fail-open"], &input);
+            assert_eq!(open.code, Some(3), "{redirect} {name}");
+        }
+    }
 }
 
 #[test]

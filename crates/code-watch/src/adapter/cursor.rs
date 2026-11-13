@@ -4,7 +4,7 @@ use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{Adapter, Call, CursorClean, Decision, Policy, Reply};
+use super::{Adapter, Call, CursorClean, Decision, Policy, Reply, UNCHECKED, UNCHECKED_ALLOWED};
 
 pub struct Cursor;
 
@@ -52,7 +52,25 @@ impl Adapter for Cursor {
     /// Cursor has no "no opinion" reply (anything but a valid permission blocks), and an allow
     /// may skip its own approval prompt, so a clean result is an ask unless `--cursor-clean allow`.
     fn reply(&self, decision: Decision, policy: &Policy) -> Reply {
+        let clean = |user: Option<String>| match policy.cursor_clean {
+            CursorClean::Ask => output("ask", user, None),
+            CursorClean::Allow => output("allow", user, None),
+        };
         let stdout = match decision {
+            Decision::Unchecked {
+                detail,
+                closed: true,
+            } => output(
+                "deny",
+                Some(format!(
+                    "{detail}. Use --fail-open to allow commands code-watch cannot check."
+                )),
+                Some(UNCHECKED.into()),
+            ),
+            Decision::Unchecked {
+                detail,
+                closed: false,
+            } => clean(Some(format!("{UNCHECKED_ALLOWED} {detail}."))),
             Decision::Allow => match policy.cursor_clean {
                 CursorClean::Ask => output("ask", None, None),
                 CursorClean::Allow => output("allow", None, None),

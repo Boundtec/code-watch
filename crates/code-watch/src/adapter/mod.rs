@@ -1,7 +1,10 @@
 //! Agent hook adapters: read one agent's pre-command hook JSON on stdin, run the same check as
 //! `code-watch check`, and answer in that agent's format. Stdout carries only that answer.
 
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::fd::AsFd;
+use std::os::unix::fs::MetadataExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -22,6 +25,9 @@ const MAX_STDIN_BYTES: u64 = 1024 * 1024;
 const EXIT_ERROR: u8 = 3;
 /// Agents block only on exit 2; any other non-zero code lets the command run.
 const EXIT_BLOCK: u8 = 2;
+/// The only text about an internal failure that the model may read: no flag, path or detail.
+pub const UNCHECKED: &str = "code-watch could not check this command, so it was blocked. Ask the user to check their code-watch setup.";
+const UNCHECKED_ALLOWED: &str = "code-watch could not check this command, so it was not checked.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 pub enum Agent {
@@ -72,8 +78,16 @@ pub enum Call {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {
     Allow,
-    Ask { reason: String, allow_hint: String },
+    Ask {
+        reason: String,
+        allow_hint: String,
+    },
     Deny(String),
+    /// The command could not be checked; `detail` is for the user only. Closed means blocked.
+    Unchecked {
+        detail: String,
+        closed: bool,
+    },
 }
 
 /// The adapter's answer: the JSON for stdout (none = the agent's "no opinion") and an optional
@@ -110,6 +124,11 @@ fn adapter_for(agent: Agent) -> &'static dyn Adapter {
 }
 
 pub fn run(agent: Agent, policy: Policy, user_dir: Option<&Path>) -> ExitCode {
+    let closed = policy.fail == FailMode::Closed;
+    let Some(mut out) = reply_channel() else {
+        let _ = writeln!(io::stderr(), "code-watch: could not write the reply");
+        return ExitCode::from(if closed { EXIT_BLOCK } else { EXIT_ERROR });
+    };
     let input = read_capped(io::stdin().lock(), MAX_STDIN_BYTES);
     let reply = handle(adapter_for(agent), input, &policy, user_dir);
     if let Some(note) = &reply.stderr {
@@ -119,19 +138,28 @@ pub fn run(agent: Agent, policy: Policy, user_dir: Option<&Path>) -> ExitCode {
     let Some(value) = reply.stdout else {
         return ExitCode::from(ok);
     };
-    let mut out = io::stdout().lock();
     match serde_json::to_writer(&mut out, &value)
         .map_err(io::Error::from)
         .and_then(|()| writeln!(out))
         .and_then(|()| out.flush())
     {
         Ok(()) => ExitCode::from(ok),
-        Err(_) if policy.fail == FailMode::Closed => {
+        Err(_) if closed => {
             let _ = writeln!(io::stderr(), "code-watch: could not write the reply");
             ExitCode::from(EXIT_BLOCK)
         }
         Err(_) => ExitCode::from(EXIT_ERROR),
     }
+}
+
+/// A handle on fd 1 that reports write errors, or None when nothing could read the reply.
+/// Rust's std hides a closed stdout (it reopens fd 1 as /dev/null at startup and ignores EBADF),
+/// so both a closed stdout and /dev/null are refused here.
+fn reply_channel() -> Option<File> {
+    let file = File::from(io::stdout().as_fd().try_clone_to_owned().ok()?);
+    let null = fs::metadata("/dev/null").ok()?;
+    let out = file.metadata().ok()?;
+    (!(out.dev() == null.dev() && out.ino() == null.ino())).then_some(file)
 }
 
 fn read_capped(reader: impl Read, max: u64) -> anyhow::Result<Vec<u8>> {
@@ -161,22 +189,17 @@ fn handle(
 }
 
 fn failed(adapter: &dyn Adapter, why: &str, policy: &Policy) -> Reply {
-    match policy.fail {
-        FailMode::Closed => {
-            let reason = format!(
-                "code-watch could not check this command: {why}. Use --fail-open to allow commands it cannot check."
-            );
-            let mut reply = adapter.reply(Decision::Deny(reason.clone()), policy);
-            reply.stderr = Some(reason);
-            reply.block_exit = true;
-            reply
-        }
-        FailMode::Open => {
-            let mut reply = adapter.reply(Decision::Allow, policy);
-            reply.stderr = Some(format!("could not check this command, allowing it: {why}"));
-            reply
-        }
-    }
+    let closed = policy.fail == FailMode::Closed;
+    let mut reply = adapter.reply(
+        Decision::Unchecked {
+            detail: why.to_string(),
+            closed,
+        },
+        policy,
+    );
+    reply.stderr = Some(if closed { UNCHECKED } else { UNCHECKED_ALLOWED }.to_string());
+    reply.block_exit = closed;
+    reply
 }
 
 fn evaluate(
@@ -305,15 +328,11 @@ mod tests {
         assert!(closed.block_exit);
         let open = handle(&Panics, Ok(vec![]), &policy(FailMode::Open), None);
         let _ = panic::take_hook();
-        assert!(
-            closed
-                .stdout
-                .unwrap()
-                .to_string()
-                .contains("internal error")
-        );
+        let text = closed.stdout.unwrap().to_string();
+        assert!(text.contains(UNCHECKED));
+        assert!(!text.contains("internal error"));
         assert_eq!(open.stdout, None);
         assert!(!open.block_exit);
-        assert!(open.stderr.unwrap().contains("internal error"));
+        assert_eq!(open.stderr.as_deref(), Some(UNCHECKED_ALLOWED));
     }
 }

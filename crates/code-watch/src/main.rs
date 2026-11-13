@@ -84,10 +84,16 @@ fn guarded(failure: u8, f: impl FnOnce() -> ExitCode + UnwindSafe) -> ExitCode {
 }
 
 /// The exit code for a failure before or outside the adapter's own fail handling. Read from the
-/// raw arguments because a usage error means they were never parsed.
-fn failure_code(mut args: impl Iterator<Item = OsString>) -> u8 {
-    let adapter = args.next().is_some_and(|a| a == "adapter");
-    if adapter && !args.any(|a| a == "--fail-open") {
+/// raw arguments because a usage error means they were never parsed. Only `--fail-open` as the
+/// sole fail flag makes it non-blocking.
+fn failure_code(args: impl Iterator<Item = OsString>) -> u8 {
+    let args: Vec<OsString> = args.collect();
+    let adapter = args
+        .iter()
+        .find(|a| !a.to_string_lossy().starts_with('-'))
+        .is_some_and(|a| a == "adapter");
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    if adapter && (!has("--fail-open") || has("--fail-closed")) {
         EXIT_BLOCK
     } else {
         EXIT_ERROR
@@ -100,7 +106,12 @@ fn real_main() -> ExitCode {
         Ok(cli) => cli,
         Err(e) => {
             let ok = matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion);
-            let _ = e.print();
+            // Blocked adapter stderr is read by the model, so a usage error there names no flag.
+            if ok || failure != EXIT_BLOCK {
+                let _ = e.print();
+            } else {
+                let _ = writeln!(io::stderr(), "code-watch: {}", adapter::UNCHECKED);
+            }
             return ExitCode::from(if ok { 0 } else { failure });
         }
     };
@@ -258,6 +269,11 @@ mod tests {
         assert_eq!(code(&["adapter", "codex"]), EXIT_BLOCK);
         assert_eq!(code(&["adapter", "codex", "--fail-closed"]), EXIT_BLOCK);
         assert_eq!(code(&["adapter", "codex", "--fail-open"]), EXIT_ERROR);
+        assert_eq!(code(&["--json", "adapter", "codex"]), EXIT_BLOCK);
+        assert_eq!(
+            code(&["adapter", "codex", "--fail-open", "--fail-closed"]),
+            EXIT_BLOCK
+        );
         assert_eq!(code(&["check", "ls"]), EXIT_ERROR);
         assert_eq!(code(&[]), EXIT_ERROR);
     }

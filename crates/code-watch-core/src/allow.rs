@@ -320,7 +320,7 @@ fn command_refusal(rule_id: &str) -> Finding {
         REPO_COMMAND_REFUSED,
         "The repository's allowlist asked to allow a command rule",
         &format!("{REPO_FILE} tried to allow {rule_id}"),
-        "Command rules can only be allowed in your own allow.toml.",
+        "Only the user's own code-watch settings can allow command rules.",
     )
 }
 
@@ -329,7 +329,7 @@ fn refusal(rule_id: &str) -> Finding {
         REPO_REFUSED,
         "The repository's allowlist asked to allow a block rule the user file does not list",
         &format!("{REPO_FILE} tried to allow {rule_id}"),
-        "Add the rule to your own allow.toml if you trust this repository.",
+        "Only the user's own code-watch settings can allow this rule.",
     )
 }
 
