@@ -45,7 +45,7 @@ enum Cmd {
         /// Do not look up known vulnerabilities (the OSV layer reports "off")
         #[arg(long, conflicts_with = "offline")]
         no_osv: bool,
-        /// Check known vulnerabilities from the fresh local cache only, with no network
+        /// Use no network: known vulnerabilities come from the fresh local cache only and the LLM layer is skipped
         #[arg(long)]
         offline: bool,
         /// Do not ask a model to review the repository (the LLM layer reports "off")

@@ -194,25 +194,33 @@ fn http_errors_become_named_failures() {
 
 #[test]
 fn a_redirect_is_not_followed_so_the_key_never_reaches_another_host() {
-    for provider in ["openai", "anthropic"] {
-        let elsewhere = TcpListener::bind("127.0.0.1:0").unwrap();
-        let redirect = format!(
-            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            elsewhere.local_addr().unwrap()
-        );
-        let (base, _, h) = serve(vec![redirect.into_bytes()]);
-        let result = if provider == "openai" {
-            openai(&base, SHORT).complete(&request())
-        } else {
-            anthropic(&base, SHORT).complete(&request())
-        };
-        h.join().unwrap();
-        assert!(result.is_err(), "{provider}");
-        elsewhere.set_nonblocking(true).unwrap();
-        assert!(
-            elsewhere.accept().is_err(),
-            "{provider} followed the redirect"
-        );
+    for status in [
+        "301 Moved Permanently",
+        "302 Found",
+        "303 See Other",
+        "307 Temporary Redirect",
+        "308 Permanent Redirect",
+    ] {
+        for provider in ["openai", "anthropic"] {
+            let elsewhere = TcpListener::bind("127.0.0.1:0").unwrap();
+            let redirect = format!(
+                "HTTP/1.1 {status}\r\nLocation: http://{}/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                elsewhere.local_addr().unwrap()
+            );
+            let (base, _, h) = serve(vec![redirect.into_bytes()]);
+            let result = if provider == "openai" {
+                openai(&base, SHORT).complete(&request())
+            } else {
+                anthropic(&base, SHORT).complete(&request())
+            };
+            h.join().unwrap();
+            assert!(result.is_err(), "{status} {provider}");
+            elsewhere.set_nonblocking(true).unwrap();
+            assert!(
+                elsewhere.accept().is_err(),
+                "{status} {provider} followed the redirect"
+            );
+        }
     }
 }
 

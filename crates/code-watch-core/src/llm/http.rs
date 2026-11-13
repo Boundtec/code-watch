@@ -13,9 +13,12 @@ pub(crate) const MAX_OUTPUT_TOKENS: u32 = 2048;
 /// process environment.
 pub type KeyFn = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// Redirects are never followed: ureq strips only `Authorization` on a redirect, so an
+/// `x-api-key` header would reach whatever host the endpoint names.
 pub(crate) fn agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
+        .max_redirects(0)
         .user_agent(concat!("code-watch/", env!("CARGO_PKG_VERSION")))
         .build()
         .new_agent()

@@ -279,6 +279,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_field_on_one_finding_alone_is_rejected() {
+        let mut reply = one(json!({}));
+        reply["findings"][0]["extra"] = json!("x");
+        assert!(parse(&reply).is_none());
+    }
+
+    #[test]
+    fn escapes_and_bidi_controls_never_reach_human_or_json_output() {
+        let bad = "a\u{1b}[2Jb\u{202e}c\u{2066}d";
+        let findings = parse(&one(json!({
+            "title": bad, "remediation": bad, "excerpt": format!("postinstall{bad}"),
+        })))
+        .unwrap();
+        let report = crate::report::Report::from_rules(findings.into_findings());
+        let human = crate::render::to_human(&report);
+        let json = crate::render::to_json(&report).unwrap();
+        for out in [&human, &json] {
+            assert!(
+                !out.contains('\u{1b}') && !out.contains('\u{202e}') && !out.contains('\u{2066}')
+            );
+        }
+    }
+
+    #[test]
     fn long_strings_are_cut() {
         let f = &parse(&one(
             json!({"title": "t".repeat(1000), "remediation": "r".repeat(1000)}),

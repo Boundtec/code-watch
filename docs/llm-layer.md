@@ -39,7 +39,9 @@ never leaves the machine.
 Only on `scan`. Never on `check`, the agent hooks or the PATH shims, which must answer without waiting on the network.
 The clone hook (`install-hook`, which runs `scan --user-allow-only`) does **not** run it by default: every checkout would
 wait on the network and could send a private repository to a remote provider you did not pick for that. Set
-`clone_hook = true` to opt in. `scan --no-llm` turns it off for one run and `scan --offline` skips it.
+`clone_hook = true` to opt in. `scan --no-llm` turns it off for one run. `scan --offline` means no network at all, so it covers both network layers
+(OSV and LLM) and the LLM layer reports `skipped (offline)`. `--user-allow-only` is what the clone hook passes, and it
+keeps the LLM layer off unless `clone_hook = true`.
 
 No config means every report says `llm off`. If it is configured but cannot run (no key, unreadable config, provider
 error, timeout, refusal, an answer that does not parse) the report says `llm skipped (reason)`, `--json` shows
