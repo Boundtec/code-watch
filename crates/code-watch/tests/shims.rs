@@ -56,7 +56,8 @@ impl World {
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\nprintf '%s\\0' \"$@\" > '{}'\nexit {code}\n",
+                "#!/bin/sh\nprintf '%s\\0' \"$@\" > '{}'\nprintf '%s' \"$CODE_WATCH_SHIM\" > '{}.env'\nexit {code}\n",
+                log.display(),
                 log.display()
             ),
         )
@@ -282,4 +283,35 @@ fn install_over_a_foreign_file_or_foreign_link_writes_nothing() {
     assert!(stderr(&out).contains("yarn, pip"));
     assert!(fs::symlink_metadata(w.p("shims/git")).is_err());
     assert_eq!(fs::read_to_string(w.p("shims/yarn")).unwrap(), "foreign");
+}
+
+#[test]
+fn the_real_tool_is_started_under_its_own_name_and_marked_as_nested() {
+    let w = World::new();
+    let bin = w.copy_of_binary("cw");
+    w.install_shims(&bin, "shims");
+    w.fake_tool("bin", "git", 0);
+    w.run("shims/git", &[b"status"], &["shims", "bin"], &[]);
+    let env = fs::read_to_string(w.p("bin/git.argv.env")).unwrap();
+    assert_eq!(env, "git");
+
+    fs::remove_file(w.p("bin/git")).unwrap();
+    symlink("/bin/sh", w.p("bin/git")).unwrap();
+    let script = br#"printf %s "$0" > arg0.txt"#;
+    let out = w.run("shims/git", &[b"-c", script], &["shims", "bin"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(w.p("arg0.txt")).unwrap(), "git");
+}
+
+#[test]
+fn a_relative_path_entry_is_never_searched() {
+    let w = World::new();
+    let bin = w.copy_of_binary("cw");
+    w.install_shims(&bin, "shims");
+    w.fake_tool("relbin", "git", 0);
+    let path = w.p("shims");
+    let path = format!("{}:relbin", path.display());
+    let out = w.run("shims/git", &[b"status"], &["shims"], &[("PATH", &path)]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(w.argv_seen("relbin", "git"), None);
 }
