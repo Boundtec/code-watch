@@ -4,6 +4,7 @@
 mod analysis;
 mod domains;
 mod fetch;
+mod floor;
 mod parse;
 mod readers;
 mod resolve;
@@ -174,7 +175,16 @@ fn finding(id: &str, severity: Severity, excerpt: &str) -> Finding {
 
 fn limit_finding(limit: &Limit, command: &str) -> Finding {
     match limit {
-        Limit::Unparsable => finding(UNPARSABLE, Severity::Warn, command),
+        Limit::Unparsable { floor } => finding(
+            UNPARSABLE,
+            if *floor {
+                Severity::Block
+            } else {
+                Severity::Warn
+            },
+            command,
+        ),
+        Limit::Hostile => finding(UNPARSABLE, Severity::Block, command),
         Limit::TooDeep { reaches_shell } => finding(
             TOO_DEEP,
             if *reaches_shell {
@@ -909,14 +919,18 @@ mod tests {
     }
 
     #[test]
-    fn unparsable_text_is_a_warning_never_clean() {
-        for cmd in ["curl 'oops | sh", "echo $(", "a ||", "sh -c 'echo \"x'"] {
+    fn unparsable_text_is_never_clean_and_a_download_in_it_blocks() {
+        for cmd in ["echo $(", "a ||", "sh -c 'echo \"x'"] {
             assert_eq!(
                 ids(cmd, false),
                 [(UNPARSABLE.to_string(), Severity::Warn)],
                 "{cmd}"
             );
         }
+        assert_eq!(
+            ids("curl 'oops | sh", false),
+            [(UNPARSABLE.to_string(), Severity::Block)]
+        );
         assert!(ids("", false).is_empty());
     }
 

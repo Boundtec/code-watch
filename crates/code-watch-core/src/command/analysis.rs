@@ -2,8 +2,16 @@
 //! command's output is run as a script. Variables and `cd` set earlier in the text are
 //! followed (`resolve.rs`) and texts run by a child (`sh -c`, `$(...)`, `ssh`) inherit them.
 
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::mpsc;
+use std::time::Duration;
+
 use super::MAX_DEPTH;
-use super::parse::{self, Assign, Attached, Pipeline, ProcKind, Simple, Stage, Word};
+use super::floor;
+use super::parse::{
+    self, Assign, Attached, MAX_TEXT_BYTES, Pipeline, ProcKind, Simple, Stage, Word,
+};
 use super::readers::{self, EMITTERS, FETCHERS, reads_script_files, runs_text};
 use super::resolve::Env;
 
@@ -23,12 +31,15 @@ pub struct Occurrence {
 
 /// Why the analysis could not look at some text.
 pub enum Limit {
-    Unparsable,
+    /// Part of the text could not be parsed; `floor` says a token-level pass found a download
+    /// reaching a reader in it.
+    Unparsable { floor: bool },
+    /// The text nests deeper than the parser can take, or the analysis did not finish in time:
+    /// input made to stall the check.
+    Hostile,
     /// `MAX_DEPTH` reached; `reaches_shell` says the text left unread holds a script reader or `eval`,
     /// or is itself run as a script.
-    TooDeep {
-        reaches_shell: bool,
-    },
+    TooDeep { reaches_shell: bool },
 }
 
 #[derive(Default)]
@@ -54,6 +65,9 @@ struct Pending {
 struct Files {
     fetched: Vec<(String, usize)>,
     emitted: Vec<(String, String)>,
+    /// Occurrences of a `<(...)` held on a descriptor (`exec 3< <(...)`), for a reader that
+    /// later reads it (`sh <&3`).
+    fd_sources: HashMap<i32, Range<usize>>,
 }
 
 /// Stack for the analysis thread. The parser and the tree are recursive, so a hostile command
@@ -66,68 +80,150 @@ const DECLARERS: &[&str] = &["export", "local", "readonly", "declare", "typeset"
 /// Programs that give their operands a value the text does not show.
 const UNBINDERS: &[&str] = &["read", "unset", "getopts", "mapfile", "readarray"];
 
+/// How long the analysis may run before the text is treated as hostile. Legitimate commands
+/// are read in milliseconds.
+pub const DEADLINE: Duration = Duration::from_secs(2);
+
 pub fn flatten(command: &str) -> Flat {
-    let run = || {
-        let mut flat = Flat::default();
-        text(command, 0, false, &Env::default(), &mut flat);
-        while let Some(at) = flat.pending.iter().position(|p| !p.used) {
-            flat.pending[at].used = true;
-            let (body, depth, env) = {
-                let p = &flat.pending[at];
-                (p.body.clone(), p.depth, p.env.clone())
-            };
-            text(&body, depth, false, &env, &mut flat);
-        }
-        flat
-    };
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(ANALYSIS_STACK_BYTES)
-            .spawn_scoped(scope, run)
-            .ok()
-            .and_then(|handle| handle.join().ok())
-    })
-    .unwrap_or_else(|| Flat {
-        limits: vec![Limit::Unparsable],
-        ..Flat::default()
-    })
+    guarded(command, DEADLINE, analyse)
 }
+
+fn analyse(command: String) -> Flat {
+    let mut flat = Flat::default();
+    text(&command, 0, false, &Env::default(), &mut flat);
+    while let Some(at) = flat.pending.iter().position(|p| !p.used) {
+        flat.pending[at].used = true;
+        let (body, depth, env) = {
+            let p = &flat.pending[at];
+            (p.body.clone(), p.depth, p.env.clone())
+        };
+        text(&body, depth, false, &env, &mut flat);
+    }
+    flat
+}
+
+/// Runs `work` on a thread with a big stack and waits for it at most `deadline`. A thread that
+/// does not answer is left behind (the process is short-lived) and the text is reported as
+/// hostile.
+fn guarded(
+    command: &str,
+    deadline: Duration,
+    work: impl FnOnce(String) -> Flat + Send + 'static,
+) -> Flat {
+    let (send, receive) = mpsc::channel();
+    let owned = command.to_string();
+    let spawned = std::thread::Builder::new()
+        .stack_size(ANALYSIS_STACK_BYTES)
+        .spawn(move || {
+            let _ = send.send(work(owned));
+        });
+    let limit = match spawned.map(|_| receive.recv_timeout(deadline)) {
+        Ok(Ok(flat)) => return flat,
+        Ok(Err(mpsc::RecvTimeoutError::Timeout)) => Limit::Hostile,
+        _ => Limit::Unparsable {
+            floor: floor::reaches_reader(command),
+        },
+    };
+    Flat {
+        limits: vec![limit],
+        ..Flat::default()
+    }
+}
+
+#[cfg(test)]
+pub(super) fn flatten_within(
+    command: &str,
+    deadline: Duration,
+    work: impl FnOnce(String) -> Flat + Send + 'static,
+) -> Flat {
+    guarded(command, deadline, work)
+}
+
+/// Lines tried as separate pieces when the whole text does not parse; more than this and the
+/// rest is left to the token-level floor.
+const MAX_SALVAGE_PARSES: usize = 400;
 
 fn text(source: &str, depth: usize, feeds: bool, env: &Env, flat: &mut Flat) {
-    let parsed = parse::parse(source);
-    if depth >= MAX_DEPTH {
-        let reaches_shell = feeds || parsed.as_ref().is_ok_and(|p| holds_runner(p));
-        flat.limits.push(Limit::TooDeep { reaches_shell });
+    if parse::too_complex(source) {
+        flat.limits.push(Limit::Hostile);
         return;
     }
-    match parsed {
-        Ok(pipelines) => walk(&pipelines, depth, feeds, &mut env.clone(), flat),
-        Err(_) => flat.limits.push(Limit::Unparsable),
+    match parse::parse(source) {
+        Ok(pipelines) => run_parsed(&pipelines, depth, feeds, env, flat),
+        Err(_) => salvage(source, depth, feeds, env, flat),
     }
 }
 
-/// A string literal of code in another language: shell text when it parses, nothing otherwise.
-fn code_text(source: &str, depth: usize, env: &Env, flat: &mut Flat) {
-    if parse::parse(source).is_ok() {
-        text(source, depth, false, env, flat);
-    }
-}
-
-fn code_literals(code: &str, depth: usize, env: &Env, flat: &mut Flat) {
-    for literal in readers::string_literals(code) {
-        if literal.contains(char::is_whitespace) {
-            code_text(&literal, depth + 1, env, flat);
-        }
-    }
-}
-
-fn nested_pipelines(pipelines: &[Pipeline], depth: usize, feeds: bool, env: &Env, flat: &mut Flat) {
+fn run_parsed(pipelines: &[Pipeline], depth: usize, feeds: bool, env: &Env, flat: &mut Flat) {
     if depth >= MAX_DEPTH {
         flat.limits.push(Limit::TooDeep {
             reaches_shell: feeds || holds_runner(pipelines),
         });
-    } else {
-        walk(pipelines, depth, feeds, &mut env.clone(), flat);
+        return;
+    }
+    let mut env = env.clone();
+    collect_functions(pipelines, &mut env.functions);
+    walk(pipelines, depth, feeds, &mut env, flat);
+}
+
+fn collect_functions(pipelines: &[Pipeline], names: &mut std::collections::HashSet<String>) {
+    for stage in pipelines.iter().flat_map(|p| &p.stages) {
+        if let Stage::Group(group) = stage {
+            names.extend(group.function.clone());
+            collect_functions(&group.pipelines, names);
+        }
+    }
+}
+
+/// Text that does not parse as a whole: every run of lines that does is analysed, the rest is
+/// read by the token-level floor, so a bad line never hides a download that runs before it.
+fn salvage(source: &str, depth: usize, feeds: bool, env: &Env, flat: &mut Flat) {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut unread = String::new();
+    let mut attempts = 0;
+    let mut start = 0;
+    while start < lines.len() {
+        let mut parsed = None;
+        for end in start + 1..=lines.len() {
+            attempts += 1;
+            let piece = lines[start..end].concat();
+            if attempts > MAX_SALVAGE_PARSES || piece.len() > MAX_TEXT_BYTES {
+                break;
+            }
+            if let Ok(pipelines) = parse::parse(&piece) {
+                parsed = Some((end, pipelines));
+                break;
+            }
+        }
+        match parsed {
+            Some((end, pipelines)) => {
+                run_parsed(&pipelines, depth, feeds, env, flat);
+                start = end;
+            }
+            None => {
+                unread.push_str(lines[start]);
+                start += 1;
+            }
+        }
+    }
+    if !unread.is_empty() || lines.is_empty() {
+        let reaches = floor::reaches_reader(&unread) || feeds && floor::mentions_fetch(&unread);
+        flat.limits.push(Limit::Unparsable { floor: reaches });
+    }
+}
+
+/// A string literal of code in another language: shell text when it parses, nothing otherwise.
+fn code_text(source: &str, depth: usize, feeds: bool, env: &Env, flat: &mut Flat) {
+    if parse::parse(source).is_ok() {
+        text(source, depth, feeds, env, flat);
+    }
+}
+
+fn code_literals(code: &str, depth: usize, feeds: bool, env: &Env, flat: &mut Flat) {
+    for literal in readers::string_literals(code) {
+        if literal.contains(char::is_whitespace) {
+            code_text(&literal, depth + 1, feeds, env, flat);
+        }
     }
 }
 
@@ -166,7 +262,7 @@ fn walk(pipelines: &[Pipeline], depth: usize, feeds: bool, env: &mut Env, flat: 
         let mut reader_after = vec![false; pipeline.stages.len()];
         for i in (0..pipeline.stages.len().saturating_sub(1)).rev() {
             reader_after[i] =
-                reader_after[i + 1] || readers::stage_reads_script(&pipeline.stages[i + 1]);
+                reader_after[i + 1] || reads_script(&pipeline.stages[i + 1], &env.functions);
         }
         for (i, stage) in pipeline.stages.iter().enumerate() {
             let piped_into_reader = reader_after[i];
@@ -187,12 +283,19 @@ fn walk(pipelines: &[Pipeline], depth: usize, feeds: bool, env: &mut Env, flat: 
     }
 }
 
+/// A reader, or a call of a function the text defines (its body may run anything).
+fn reads_script(stage: &Stage, functions: &std::collections::HashSet<String>) -> bool {
+    readers::stage_reads_script(stage)
+        || matches!(stage, Stage::Simple(simple)
+            if simple.program().is_some_and(|p| functions.contains(p)))
+}
+
 fn attached_children(attached: &Attached, depth: usize, env: &Env, flat: &mut Flat) {
     for sub in &attached.subs {
         text(&sub.body, depth + 1, false, env, flat);
     }
     for proc in &attached.procs {
-        nested_pipelines(&proc.body, depth + 1, false, env, flat);
+        run_parsed(&proc.body, depth + 1, false, env, flat);
     }
 }
 
@@ -207,6 +310,7 @@ fn simple_stage(
     flat: &mut Flat,
 ) {
     let resolved = resolve_simple(simple, env, flat);
+    let feeds = feeds || readers::writes_into_reader(&resolved);
     let mut bound = env.clone();
     for assign in &simple.attached.assigns {
         bind(assign, &mut bound, depth, flat);
@@ -219,7 +323,8 @@ fn simple_stage(
         cwd: env.cwd.clone(),
     });
     track_files(&resolved, at, depth, env, flat);
-    simple_children(&resolved, depth, piped, &bound, flat);
+    feed_descriptors(&resolved, flat);
+    simple_children(&resolved, depth, piped, feeds, &bound, flat);
     let program = resolved.program();
     if resolved.words.is_empty() || program.is_some_and(|p| DECLARERS.contains(&p)) {
         let cwd = env.cwd.clone();
@@ -304,6 +409,21 @@ fn apply_effects(simple: &Simple, env: &mut Env) {
             }
         }
         _ => {}
+    }
+}
+
+/// A reader that takes its script from a descriptor held on a `<(...)` makes what that held
+/// feed a script.
+fn feed_descriptors(simple: &Simple, flat: &mut Flat) {
+    if simple.attached.dup_inputs.is_empty() || !readers::simple_reads_script(simple) {
+        return;
+    }
+    for fd in &simple.attached.dup_inputs {
+        if let Some(range) = flat.files.fd_sources.get(fd).cloned() {
+            for occurrence in &mut flat.occurrences[range] {
+                occurrence.feeds_script = true;
+            }
+        }
     }
 }
 
@@ -405,8 +525,16 @@ fn run_target(simple: &Simple, program: &str) -> Option<String> {
 }
 
 /// Follows what a simple command runs from its words: the `-c` text, the `eval` text, command
-/// substitutions, process substitutions, here-texts and the code of other interpreters.
-fn simple_children(simple: &Simple, depth: usize, piped: bool, env: &Env, flat: &mut Flat) {
+/// substitutions, process substitutions, here-texts and the code of other interpreters. When the
+/// stage's output is run as a script (`stage_feeds`), so is the output of everything it runs.
+fn simple_children(
+    simple: &Simple,
+    depth: usize,
+    piped: bool,
+    stage_feeds: bool,
+    env: &Env,
+    flat: &mut Flat,
+) {
     let program = simple.program();
     let emits = piped && program.is_some_and(|p| EMITTERS.contains(&p));
     let runs = program.is_some_and(runs_text);
@@ -421,57 +549,63 @@ fn simple_children(simple: &Simple, depth: usize, piped: bool, env: &Env, flat: 
             text(
                 &sub.body,
                 depth + 1,
-                is_script && word.whole_substitution,
+                stage_feeds || is_script && word.whole_substitution,
                 env,
                 flat,
             );
         }
     }
     if runs || emits {
-        run_text(&script_words, depth, env, flat);
+        run_text(&script_words, depth, stage_feeds, env, flat);
     }
     if program == Some("git") {
         for script in simple.arg_texts().filter_map(readers::git_alias_script) {
-            text(script, depth + 1, false, env, flat);
+            text(script, depth + 1, stage_feeds, env, flat);
         }
     }
     for code in readers::inline_code(simple) {
-        code_literals(code, depth, env, flat);
+        code_literals(code, depth, stage_feeds, env, flat);
     }
     let reads_files = program.is_some_and(reads_script_files);
     for proc in &simple.attached.procs {
-        let feeds = reads_files && proc.kind == ProcKind::Read;
-        nested_pipelines(&proc.body, depth + 1, feeds, env, flat);
+        let feeds = stage_feeds || reads_files && proc.kind == ProcKind::Read;
+        let first = flat.occurrences.len();
+        run_parsed(&proc.body, depth + 1, feeds, env, flat);
+        if let (Some(fd), ProcKind::Read) = (proc.fd, proc.kind) {
+            flat.files
+                .fd_sources
+                .insert(fd, first..flat.occurrences.len());
+        }
     }
     let is_code = program.is_some_and(readers::runs_code);
     let reads_here_text = piped || readers::simple_reads_script(simple);
     for here in &simple.attached.here_texts {
         let body = &here.body;
-        let spliced = reads_here_text && (here.expands || body.whole_substitution);
+        let spliced = stage_feeds || reads_here_text && (here.expands || body.whole_substitution);
         for sub in &body.subs {
             text(&sub.body, depth + 1, spliced, env, flat);
         }
         if is_code {
-            code_literals(&body.text, depth, env, flat);
-        } else if reads_here_text && !body.whole_substitution {
-            text(&body.text, depth + 1, false, env, flat);
+            code_literals(&body.text, depth, stage_feeds, env, flat);
+        } else if (reads_here_text || stage_feeds) && !body.whole_substitution {
+            text(&body.text, depth + 1, stage_feeds, env, flat);
         }
     }
     for sub in &simple.attached.subs {
-        text(&sub.body, depth + 1, false, env, flat);
+        text(&sub.body, depth + 1, stage_feeds, env, flat);
     }
 }
 
 /// Parses the literal part of the script words again. A word that is only a substitution is
 /// followed through its substitution instead (its output is the script).
-fn run_text(words: &[&Word], depth: usize, env: &Env, flat: &mut Flat) {
+fn run_text(words: &[&Word], depth: usize, feeds: bool, env: &Env, flat: &mut Flat) {
     let literal: Vec<&str> = words
         .iter()
         .filter(|w| !w.whole_substitution)
         .map(|w| w.text.as_str())
         .collect();
     if !literal.is_empty() {
-        text(&literal.join(" "), depth + 1, false, env, flat);
+        text(&literal.join(" "), depth + 1, feeds, env, flat);
     }
 }
 
@@ -519,7 +653,10 @@ mod tests {
         let braces = format!("{}a;{}", "{ ".repeat(5000), " }".repeat(5000));
         assert!(flatten(&braces).limits.is_empty());
         let huge = format!("echo {}", "a".repeat(70_000));
-        assert!(matches!(flatten(&huge).limits[..], [Limit::Unparsable]));
+        assert!(matches!(
+            flatten(&huge).limits[..],
+            [Limit::Unparsable { floor: false }]
+        ));
     }
 
     #[test]

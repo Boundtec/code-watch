@@ -82,7 +82,8 @@ The command is parsed with `brush-parser` and every simple command of every list
 script: a shell (by name or path, also through `sudo`, `doas`, `env`, `busybox`, `nohup`, `exec`, `command`, `xargs`, `time`, `nice`), an
 interpreter (`python*`, `perl`, `ruby`, `node`, `php`, `lua`, `tclsh`, `osascript`) with no script file or with inline code (`-c`, `-e`, `-pe`, `-r`), `awk`
 when its program runs commands, `ssh` and `su -c` when the command they run holds one (`ssh host` alone opens a shell that reads stdin), `source`/`.` of
-`/dev/stdin`, a `tee >(...)` whose body holds one, and a group with one inside. `docker`, `podman`, `kubectl`, `chroot`, `pkexec` and the like are
+`/dev/stdin`, a `tee >(...)` whose body holds one, and a group with one inside. A program word that is a glob, brace pattern or a function the text defines
+counts as a possible reader, as a `$` word does. `docker`, `podman`, `kubectl`, `chroot`, `pkexec` and the like are
 looked through to the program they start. A fetch is `curl`, `wget`, `http`/`https`, `aria2c`, `fetch` or `lwp-download`; a decoder also covers
 `python -m base64 -d`, `basenc` and the decompressors (`gzip -dc`, `zcat`, `xz`, `bzip2`, `zstd`). A download or a base64/`xxd -r` decoder whose output reaches one of these, in the
 same pipeline or because it sits inside the `$(...)` that is the whole text of `sh -c`/`eval`, or inside a `<(...)` or here-string a shell reads,
@@ -99,8 +100,10 @@ everything bound so far is seen by the texts that command runs. A value the text
 - `command/base64-into-shell` (block): a decoder (`base64 -d`, `-D`, `-di`, `--decode`, `xxd -r`) whose output is run the same way, including
   `eval "$(... | base64 -d)"`, `eval $(...)` and `sh -c "$(...)"`.
 - `command/quarantine-removal` (warn): `xattr` with `-c`, or with `-d`/`-w` and the `com.apple.quarantine` word.
-- `command/unparsable` (warn): text the parser rejects (an unterminated quote or `$(`, a dangling `||`), or longer than 64 KiB. Warn, not block:
-  the checker may lack a bash feature, and a shell would reject most of these too. The command is never reported clean.
+- `command/unparsable` (warn, or block): text the parser rejects (an unterminated quote or `$(`, a dangling `||`, a form it lacks), or longer than 64 KiB.
+  Every line or run of lines that does parse is still checked, and the rest is read for a download that reaches a script reader, so a part the parser
+  cannot read never hides one: with such a download in it the finding is a block, otherwise a warn. Text nested so deeply that parsing could take
+  unbounded time, or an analysis that does not finish within two seconds, is a block. The command is never reported clean.
 - `command/nesting-too-deep` (warn; block when the text left at the limit holds a shell, `eval` or script reader): `$(...)`, `<(...)`, `sh -c`
   and `eval` text nested more than three levels.
 - `command/hidden-program-into-shell` (warn) fires when a pipeline ends in a script reader and a command's program word still holds a `$`

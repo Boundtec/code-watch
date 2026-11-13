@@ -4,7 +4,7 @@
 use super::parse::{self, ProcKind, Simple, Stage, Word, basename};
 
 pub const SHELLS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "ash",
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "ash", "mksh", "rbash",
 ];
 pub const FETCHERS: &[&str] = &[
     "curl",
@@ -32,6 +32,9 @@ const INTERPRETERS: &[(&str, &str)] = &[
 /// Interpreters whose program is an argument and runs commands only through `system(...)` or a
 /// pipe to a command.
 const AWKS: &[&str] = &["awk", "gawk", "mawk", "nawk"];
+
+/// Flags of an interpreter that consume the following word, which is then not its script.
+const INTERPRETER_VALUE_FLAGS: &[(&str, &[&str])] = &[("osascript", &["-l"])];
 
 /// Programs that print their arguments: piped into a reader they are the script.
 pub const EMITTERS: &[&str] = &["echo", "printf"];
@@ -83,6 +86,10 @@ pub const LAUNCHERS: &[Launcher] = &[
     Launcher {
         name: "lxc",
         subcommands: &["exec"],
+    },
+    Launcher {
+        name: "find",
+        subcommands: &["-exec", "-execdir", "-ok", "-okdir"],
     },
 ];
 
@@ -136,20 +143,42 @@ pub fn stage_reads_script(stage: &Stage) -> bool {
 }
 
 pub fn simple_reads_script(simple: &Simple) -> bool {
-    let feeds_a_reader = simple.attached.procs.iter().any(|p| {
+    writes_into_reader(simple) || program_reads_script(simple)
+}
+
+/// The command's own output goes to a `>(...)` that holds a reader: `tee >(sh)`, `curl > >(sh)`.
+pub fn writes_into_reader(simple: &Simple) -> bool {
+    simple.attached.procs.iter().any(|p| {
         p.kind == ProcKind::Write
             && p.body
                 .iter()
                 .any(|pl| pl.stages.iter().any(stage_reads_script))
-    });
-    feeds_a_reader || program_reads_script(simple)
+    })
+}
+
+/// Names of the programs that decode or decompress, for the token-level check.
+pub fn decoder_programs() -> impl Iterator<Item = &'static str> {
+    DECODERS.iter().map(|d| d.program)
+}
+
+/// The shell and interpreter names, for the token-level check.
+pub fn reader_programs() -> impl Iterator<Item = &'static str> {
+    SHELLS
+        .iter()
+        .copied()
+        .chain(INTERPRETERS.iter().map(|(name, _)| *name))
+        .chain(AWKS.iter().copied())
+        .chain(["su", "ssh", "eval", "source"])
 }
 
 fn program_reads_script(simple: &Simple) -> bool {
     let Some(index) = simple.program_index() else {
-        return false;
+        return starts_login_shell(simple);
     };
-    if simple.words[index].text.contains(['$', '`']) {
+    if simple.words[index]
+        .text
+        .contains(['$', '`', '*', '?', '[', '{'])
+    {
         return true;
     }
     let program = basename(&simple.words[index].text);
@@ -162,22 +191,52 @@ fn program_reads_script(simple: &Simple) -> bool {
             .next()
             .is_some_and(|a| STDIN_FILES.contains(&a));
     }
-    if program == "ssh" {
-        return ssh_reads_script(simple, index);
-    }
-    if program == "su" {
-        return text_holds_reader(&script_words(simple, Some(program)));
+    match program {
+        "ssh" => return ssh_reads_script(simple, index),
+        "su" => {
+            let command = script_words(simple, Some(program));
+            return command.is_empty() || text_holds_reader(&command);
+        }
+        _ => {}
     }
     if AWKS.contains(&program) {
         return simple.arg_texts().any(awk_runs_commands);
     }
     interpreter_flags(program).is_some_and(|code_flags| {
-        simple.arg_texts().all(|a| a.starts_with('-'))
-            || simple.arg_texts().next().is_some_and(|a| a == "-")
-            || simple
-                .arg_texts()
-                .any(|a| is_inline_code_flag(a, code_flags))
+        let operands = interpreter_operands(simple, program);
+        operands.iter().all(|a| a.starts_with('-'))
+            || operands.iter().any(|a| STDIN_FILES.contains(a))
+            || operands.iter().any(|a| is_inline_code_flag(a, code_flags))
     })
+}
+
+/// The arguments of an interpreter that are not the value of one of its flags.
+fn interpreter_operands<'a>(simple: &'a Simple, program: &str) -> Vec<&'a str> {
+    let value_flags = INTERPRETER_VALUE_FLAGS
+        .iter()
+        .find(|(name, _)| *name == program)
+        .map_or(&[][..], |(_, flags)| *flags);
+    let mut operands = Vec::new();
+    let mut args = simple.arg_texts();
+    while let Some(arg) = args.next() {
+        if value_flags.contains(&arg) {
+            args.next();
+        } else {
+            operands.push(arg);
+        }
+    }
+    operands
+}
+
+/// `sudo -i` and `sudo -s` start the user's shell, which reads stdin.
+fn starts_login_shell(simple: &Simple) -> bool {
+    let Some((first, rest)) = simple.words.split_first() else {
+        return false;
+    };
+    matches!(basename(&first.text), "sudo" | "doas")
+        && rest
+            .iter()
+            .any(|w| matches!(w.text.as_str(), "-i" | "-s" | "--login" | "--shell"))
 }
 
 /// `ssh host` with no command opens a login shell that reads stdin; with a command, the remote
@@ -235,7 +294,7 @@ pub fn git_alias_script(arg: &str) -> Option<&str> {
 
 /// A program that runs text it is given as a shell command line.
 pub fn runs_text(program: &str) -> bool {
-    is_shell(program) || matches!(program, "eval" | "su" | "ssh")
+    is_shell(program) || matches!(program, "eval" | "su" | "ssh" | "watch")
 }
 
 /// A program that runs the script file named by its first operand.
@@ -260,16 +319,30 @@ pub fn script_words<'a>(simple: &'a Simple, program: Option<&str>) -> Vec<&'a Wo
         let Some(at) = args.iter().position(|w| is_flag(&w.text)) else {
             return Vec::new();
         };
-        let rest = &args[at + 1..];
-        let rest = match rest.first() {
-            Some(w) if w.text == "--" => &rest[1..],
-            _ => rest,
-        };
-        rest.first().into_iter().collect()
+        let mut rest = args[at + 1..].iter().peekable();
+        while rest
+            .next_if(|w| w.text.starts_with('-') && w.text.len() > 1 && w.text != "--")
+            .is_some()
+        {}
+        rest.next_if(|w| w.text == "--");
+        rest.next().into_iter().collect()
     };
     match program {
         Some("eval") => args.iter().collect(),
         Some("su") => after_dash_c(|a| a == "-c" || a == "--command"),
+        Some("watch") => {
+            let mut rest = args.iter();
+            while let Some(word) = rest.next() {
+                if word.text.starts_with('-') {
+                    if matches!(word.text.as_str(), "-n" | "--interval") {
+                        rest.next();
+                    }
+                } else {
+                    return std::iter::once(word).chain(rest).collect();
+                }
+            }
+            Vec::new()
+        }
         Some("ssh") => {
             let at = simple.program_index().unwrap_or(0);
             ssh_command_start(&simple.words, at)
@@ -662,15 +735,13 @@ mod tests {
             "ssh host 'sh -s'",
             "ssh host 'a; sh'",
             "su -c sh",
+            "su",
+            "su -",
+            "su root",
         ] {
             assert!(stage_reads_script(&first_stage(cmd)), "{cmd}");
         }
-        for cmd in [
-            "ssh host ls",
-            "ssh host 'cd /app && git pull'",
-            "su -c ls",
-            "su",
-        ] {
+        for cmd in ["ssh host ls", "ssh host 'cd /app && git pull'", "su -c ls"] {
             assert!(!stage_reads_script(&first_stage(cmd)), "{cmd}");
         }
     }

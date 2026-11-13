@@ -3,7 +3,7 @@
 //! environment, `read`, arithmetic) leaves the name unbound and a use of it unresolved, so an
 //! unknown value is never guessed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::parse::{Sub, Word};
 
@@ -11,6 +11,8 @@ use super::parse::{Sub, Word};
 pub struct Env {
     vars: HashMap<String, Var>,
     pub cwd: Option<String>,
+    /// Names the text defines as functions: a call may run anything, a reader included.
+    pub functions: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]

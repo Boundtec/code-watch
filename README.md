@@ -37,7 +37,7 @@ commands are matched, not run.
 | `repo/base64-into-shell` | block | base64 decoded straight into a shell in scripts and manifests |
 | `command/base64-into-shell` | block | the same in a command |
 | `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell or an interpreter that runs stdin or inline code, or run through `$(...)` or `<(...)` |
-| `command/unparsable` | warn | command text the parser rejects (unterminated quote or `$(`, dangling `\|\|`) or over 64 KiB, so it was not checked |
+| `command/unparsable` | warn / block | command text the parser rejects (unterminated quote or `$(`, dangling `\|\|`) or over 64 KiB; the readable parts are still checked, and block when a download reaching a shell is in the part that is not, or the text is built to stall the parser |
 | `command/nesting-too-deep` | warn / block | shells or substitutions nested past three levels; block when the text at the limit holds a shell |
 | `command/quarantine-removal` | warn | `xattr` removing or rewriting the macOS quarantine flag |
 | `command/lookalike-download-domain` | block / warn | `curl` or `wget` fetching from a domain that imitates a well-known one; block when piped into a shell, warn otherwise |

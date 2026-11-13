@@ -37,6 +37,8 @@ pub struct Simple {
 pub struct Group {
     pub pipelines: Vec<Pipeline>,
     pub attached: Attached,
+    /// The name this group is defined under when it is a function body.
+    pub function: Option<String>,
 }
 
 /// What hangs off a command besides its words.
@@ -52,6 +54,8 @@ pub struct Attached {
     pub procs: Vec<Proc>,
     /// Variable assignments in the order written, including `for NAME in`.
     pub assigns: Vec<Assign>,
+    /// Descriptors this command reads from (`<&3`).
+    pub dup_inputs: Vec<i32>,
 }
 
 /// An assignment to a scalar variable. `value` is `None` when the name is set to something the
@@ -97,15 +101,66 @@ pub enum ProcKind {
 pub struct Proc {
     pub kind: ProcKind,
     pub body: Vec<Pipeline>,
+    /// The descriptor it is attached to: `exec 3< <(...)`.
+    pub fd: Option<i32>,
 }
 
-/// Longest text parsed. The parser is quadratic on deeply nested substitutions, so a bigger
-/// text is reported as not checked instead of being left to run for minutes.
-const MAX_TEXT_BYTES: usize = 64 * 1024;
+/// Longest text parsed in one piece. The parser slows down with size when text nests deeply, so a
+/// bigger text is parsed line by line and only the part that cannot be is read as plain tokens.
+pub const MAX_TEXT_BYTES: usize = 64 * 1024;
+
+/// Deepest nesting handed to the parser. Its time grows exponentially with nested `case` and
+/// quickly with nested parentheses and `${`, so text nested deeper is refused before parsing;
+/// real commands nest a few levels.
+const MAX_PAREN_DEPTH: usize = 64;
+const MAX_CASE_DEPTH: usize = 8;
+const MAX_EXPANSION_DEPTH: usize = 32;
+
+/// Whether the text nests parentheses, `case` or `${` deeper than the parser can take in bounded
+/// time. One linear pass; quotes are not honoured, so it errs towards refusing.
+pub fn too_complex(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let (mut parens, mut cases, mut expansions) = (0usize, 0usize, 0usize);
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                parens += 1;
+                if parens > MAX_PAREN_DEPTH {
+                    return true;
+                }
+            }
+            b')' => parens = parens.saturating_sub(1),
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                expansions += 1;
+                if expansions > MAX_EXPANSION_DEPTH {
+                    return true;
+                }
+            }
+            b'}' => expansions = expansions.saturating_sub(1),
+            b'c' | b'e' if i == 0 || !is_word(bytes[i - 1]) => {
+                let rest = &bytes[i..];
+                let word_ends = |len: usize| rest.get(len).is_none_or(|b| !is_word(*b));
+                if rest.starts_with(b"case") && word_ends(4) {
+                    cases += 1;
+                    if cases > MAX_CASE_DEPTH {
+                        return true;
+                    }
+                } else if rest.starts_with(b"esac") && word_ends(4) {
+                    cases = cases.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
 
 /// Parses `text` into its pipelines, every list, group and compound command included.
 pub fn parse(text: &str) -> Result<Vec<Pipeline>, ParseFailure> {
-    if text.len() > MAX_TEXT_BYTES {
+    if text.len() > MAX_TEXT_BYTES || too_complex(text) {
         return Err(ParseFailure);
     }
     let options = ParserOptions {
@@ -154,7 +209,11 @@ fn stage(command: &Command) -> Parsed<Stage> {
             }
             Ok(Stage::Group(group))
         }
-        Command::Function(def) => compound_command(&def.body.0).map(Stage::Group),
+        Command::Function(def) => {
+            let mut group = compound_command(&def.body.0)?;
+            group.function = Some(convert_word(&def.fname)?.text);
+            Ok(Stage::Group(group))
+        }
         Command::ExtendedTest(test, redirects) => {
             let mut attached = Attached::default();
             test_words(&test.expr, &mut attached)?;
@@ -164,6 +223,7 @@ fn stage(command: &Command) -> Parsed<Stage> {
             Ok(Stage::Group(Group {
                 pipelines: Vec::new(),
                 attached,
+                function: None,
             }))
         }
     }
@@ -229,6 +289,7 @@ fn compound_command(compound: &CompoundCommand) -> Parsed<Group> {
     Ok(Group {
         pipelines,
         attached,
+        function: None,
     })
 }
 
@@ -344,7 +405,7 @@ fn assignment_into(assignment: &ast::Assignment, attached: &mut Attached) -> Par
 
 fn redirect(r: &IoRedirect, attached: &mut Attached) -> Parsed {
     match r {
-        IoRedirect::File(_, kind, target) => match target {
+        IoRedirect::File(fd, kind, target) => match target {
             ast::IoFileRedirectTarget::Filename(w) => {
                 let w = convert_word(w)?;
                 attached.subs.extend(w.subs);
@@ -359,9 +420,22 @@ fn redirect(r: &IoRedirect, attached: &mut Attached) -> Parsed {
                 }
             }
             ast::IoFileRedirectTarget::ProcessSubstitution(kind, sub) => {
-                attached.procs.push(proc_substitution(kind, sub)?);
+                let mut proc = proc_substitution(kind, sub)?;
+                proc.fd = *fd;
+                attached.procs.push(proc);
             }
-            ast::IoFileRedirectTarget::Fd(_) | ast::IoFileRedirectTarget::Duplicate(_) => {}
+            ast::IoFileRedirectTarget::Fd(n) => {
+                if matches!(kind, ast::IoFileRedirectKind::DuplicateInput) {
+                    attached.dup_inputs.push(*n);
+                }
+            }
+            ast::IoFileRedirectTarget::Duplicate(w) => {
+                if let (ast::IoFileRedirectKind::DuplicateInput, Ok(n)) =
+                    (kind, w.value.parse::<i32>())
+                {
+                    attached.dup_inputs.push(n);
+                }
+            }
         },
         IoRedirect::OutputAndError(w, _) => {
             let w = convert_word(w)?;
@@ -401,7 +475,11 @@ fn proc_substitution(
         ast::ProcessSubstitutionKind::Read => ProcKind::Read,
         ast::ProcessSubstitutionKind::Write => ProcKind::Write,
     };
-    Ok(Proc { kind, body })
+    Ok(Proc {
+        kind,
+        body,
+        fd: None,
+    })
 }
 
 fn convert_word(w: &ast::Word) -> Parsed<Word> {
@@ -665,6 +743,8 @@ struct Wrapper {
     value_flags: &'static [&'static str],
     /// Operands before the program (a duration, a lock file).
     operands: usize,
+    /// Flags that stand in for those operands (`taskset -c LIST cmd` has no mask operand).
+    replaces_operands: &'static [&'static str],
 }
 
 const fn wrapper(
@@ -676,6 +756,7 @@ const fn wrapper(
         name,
         value_flags,
         operands,
+        replaces_operands: &[],
     }
 }
 
@@ -711,6 +792,21 @@ const WRAPPERS: &[Wrapper] = &[
     wrapper("arch", &[], 0),
     wrapper("caffeinate", &["-t", "-w"], 0),
     wrapper("pkexec", &["--user"], 0),
+    Wrapper {
+        replaces_operands: &["-c", "--cpu-list"],
+        ..wrapper("taskset", &["-c", "--cpu-list"], 1)
+    },
+    wrapper(
+        "strace",
+        &["-o", "-e", "-p", "-s", "-u", "-E", "-P", "-a", "-I", "-O"],
+        0,
+    ),
+    wrapper("ltrace", &["-o", "-e", "-p", "-s", "-u", "-a"], 0),
+    wrapper(
+        "parallel",
+        &["-j", "-n", "-N", "-S", "-a", "-P", "--jobs"],
+        0,
+    ),
     wrapper("chroot", &["--userspec", "--groups"], 1),
 ];
 
@@ -751,6 +847,9 @@ impl Simple {
         while i < self.words.len() {
             let word = self.words[i].text.as_str();
             if let Some(w) = current.filter(|_| word.starts_with('-')) {
+                if w.replaces_operands.contains(&word) {
+                    operands_left = 0;
+                }
                 i += if w.value_flags.contains(&word) { 2 } else { 1 };
             } else if current.is_some() && is_assignment(word) {
                 i += 1;
