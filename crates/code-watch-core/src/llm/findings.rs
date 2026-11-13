@@ -1,4 +1,7 @@
 use serde::Deserialize;
+use unicode_general_category::{GeneralCategory, get_general_category};
+use unicode_normalization::UnicodeNormalization;
+use unicode_security::confusable_detection::skeleton;
 
 use super::select::Sent;
 use crate::finding::{Evidence, Finding, Layer, Severity, sanitize};
@@ -149,15 +152,39 @@ fn bounded(text: &str, max: usize, fallback: &str) -> String {
     }
 }
 
+/// Hangul fillers are alphabetic, render as nothing and are not format characters.
+const INVISIBLE_LETTERS: [char; 4] = ['\u{115F}', '\u{1160}', '\u{3164}', '\u{FFA0}'];
+
 /// True when the letters of `text`, ignoring case, spacing and punctuation, contain an advice
-/// word; stripping first means `al-low` or `al?low` cannot slip through.
+/// word; stripping first means `al-low` or `al?low` cannot slip through. The text is folded to
+/// its confusables skeleton first, so look-alike letters, fullwidth forms and invisible
+/// characters cannot hide a word. Only the check reads the folded copy.
 fn mentions_advice(text: &str) -> bool {
-    let letters: String = text
-        .chars()
+    let letters = fold_letters(text);
+    ADVICE_WORDS
+        .iter()
+        .any(|w| letters.contains(&fold_letters(w)))
+}
+
+/// Lowercase letters of the confusables skeleton of `text`; the skeleton rewrites some letters
+/// (`m` becomes `rn`), so the advice words must go through the same fold.
+fn fold_letters(text: &str) -> String {
+    let visible: String = text
+        .nfkc()
+        .filter(|c| {
+            !INVISIBLE_LETTERS.contains(c)
+                && !matches!(
+                    get_general_category(*c),
+                    GeneralCategory::Format
+                        | GeneralCategory::NonspacingMark
+                        | GeneralCategory::EnclosingMark
+                )
+        })
+        .collect();
+    skeleton(&visible)
         .filter(|c| c.is_alphabetic())
         .flat_map(char::to_lowercase)
-        .collect();
-    ADVICE_WORDS.iter().any(|w| letters.contains(w))
+        .collect()
 }
 
 /// Lowercase letters, digits and single dashes only, so the rule id is a plain name.
@@ -422,5 +449,35 @@ mod tests {
             .unwrap()
             .0[0];
         assert_eq!(f.title, "Runs a hidden script on install");
+    }
+
+    #[test]
+    fn look_alike_letters_and_invisible_characters_cannot_carry_advice() {
+        let cases = [
+            "code-watch \u{430}llow x",
+            "code-watch all\u{43E}w x",
+            "code-watch.t\u{3BF}ml",
+            "ign\u{3BF}re this",
+            "\u{FF41}\u{FF4C}\u{FF4C}\u{FF4F}\u{FF57} it",
+            "al\u{200B}low it",
+            "by\u{AD}pass it",
+            "al\u{3164}low it",
+        ];
+        for text in cases {
+            let f = &parse(&one(json!({"title": text, "kind": text}))).unwrap().0[0];
+            assert_eq!(f.title, FIXED_TITLE, "{text:?}");
+            assert_eq!(f.rule_id, "llm/unclassified", "{text:?}");
+            let f = &parse(&one(json!({"excerpt": text}))).unwrap().0[0];
+            assert_eq!(f.evidence.excerpt, WITHHELD_EXCERPT, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn honest_cyrillic_and_greek_titles_are_still_shown() {
+        for title in ["Запускает скрипт при установке", "Εκτελεί κρυφό σενάριο"]
+        {
+            let f = &parse(&one(json!({ "title": title }))).unwrap().0[0];
+            assert_eq!(f.title, title);
+        }
     }
 }
