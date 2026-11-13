@@ -11,6 +11,7 @@ use code_watch_core::{Allowlists, Engine, Report, render};
 
 mod adapter;
 mod hook;
+mod shim;
 
 /// Exit code for errors and bad usage. Verdicts use 0, 1 and 2, so 2 always means "block".
 const EXIT_ERROR: u8 = 3;
@@ -50,16 +51,51 @@ enum Cmd {
         #[arg(long, conflicts_with = "fail_open")]
         fail_closed: bool,
         /// Codex cannot ask: answer a warning with a deny (default) or let it run and say so on stderr
-        #[arg(long, value_enum, default_value_t = adapter::CodexWarn::Deny)]
-        codex_warn: adapter::CodexWarn,
+        #[arg(long, value_enum, default_value_t = adapter::WarnAnswer::Deny)]
+        codex_warn: adapter::WarnAnswer,
         /// Cursor cannot stay silent: answer a clean command with an ask (default, Cursor's prompt decides) or an allow
         #[arg(long, value_enum, default_value_t = adapter::CursorClean::Ask)]
         cursor_clean: adapter::CursorClean,
+        /// Gemini CLI cannot ask: answer a warning with a deny (default) or let it run and say so on stderr
+        #[arg(long, value_enum, default_value_t = adapter::WarnAnswer::Deny)]
+        gemini_warn: adapter::WarnAnswer,
+        /// OpenCode cannot ask: answer a warning with a deny (default) or let it run and say so on stderr
+        #[arg(long, value_enum, default_value_t = adapter::WarnAnswer::Deny)]
+        opencode_warn: adapter::WarnAnswer,
     },
-    /// Print the settings snippet that connects an agent to `adapter` (edits nothing)
-    InstallAdapter { agent: adapter::Agent },
+    /// Print the settings snippet that connects an agent to `adapter` (edits nothing); for opencode,
+    /// write the plugin to <PATH> or print it with --print
+    InstallAdapter {
+        agent: adapter::Agent,
+        /// opencode only: where to write the plugin (replaced only if code-watch wrote it)
+        path: Option<PathBuf>,
+        /// opencode only: print the plugin instead of writing it
+        #[arg(long, conflicts_with = "path")]
+        print: bool,
+        /// opencode only: let commands through when the plugin cannot run the check
+        #[arg(long)]
+        fail_open: bool,
+        /// opencode only: let a warning run and say so on stderr (default: deny it)
+        #[arg(long, value_enum)]
+        opencode_warn: Option<adapter::WarnAnswer>,
+    },
+    /// Guard git, npm, pnpm, yarn, pip, brew and curl through PATH shims
+    Shims {
+        #[command(subcommand)]
+        action: ShimsCmd,
+    },
     /// Remove what install-hook added, leaving your git config as it was
     UninstallHook,
+}
+
+#[derive(Subcommand)]
+enum ShimsCmd {
+    /// Write the shims into <DIR>; put it first on PATH
+    Install { dir: PathBuf },
+    /// Remove the shims code-watch wrote in <DIR> and nothing else
+    Uninstall { dir: PathBuf },
+    /// Show whether each shim in <DIR> points at this binary (exit 1 if any does not)
+    Status { dir: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -76,6 +112,10 @@ fn guarded(f: impl FnOnce() -> ExitCode + UnwindSafe) -> ExitCode {
 }
 
 fn real_main() -> ExitCode {
+    let mut argv = std::env::args_os();
+    if let Some(name) = argv.next().as_deref().and_then(shim::invoked_as) {
+        return shim::run(name, argv.collect());
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
@@ -90,6 +130,8 @@ fn real_main() -> ExitCode {
             fail_open,
             codex_warn,
             cursor_clean,
+            gemini_warn,
+            opencode_warn,
             ..
         } => {
             let policy = adapter::Policy {
@@ -100,10 +142,21 @@ fn real_main() -> ExitCode {
                 },
                 codex_warn: *codex_warn,
                 cursor_clean: *cursor_clean,
+                gemini_warn: *gemini_warn,
+                opencode_warn: *opencode_warn,
             };
             return adapter::run(*agent, policy, user_dir().as_deref());
         }
-        Cmd::InstallAdapter { agent } => return install_adapter(*agent),
+        Cmd::InstallAdapter {
+            agent,
+            path,
+            print,
+            fail_open,
+            opencode_warn,
+        } => {
+            return install_adapter(*agent, path.as_deref(), *print, *fail_open, *opencode_warn);
+        }
+        Cmd::Shims { action } => return shims(action),
         _ => {}
     }
     let report = match run(&cli) {
@@ -161,7 +214,9 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
                 user_dir.as_deref(),
             )?)
         }
-        Cmd::Adapter { .. } | Cmd::InstallAdapter { .. } => unreachable!("handled before run"),
+        Cmd::Adapter { .. } | Cmd::InstallAdapter { .. } | Cmd::Shims { .. } => {
+            unreachable!("handled before run")
+        }
         Cmd::InstallHook => Outcome::Message(hook::install(&std::env::current_exe()?)?),
         Cmd::UninstallHook => Outcome::Message(hook::uninstall()?),
     })
@@ -183,7 +238,70 @@ fn check_command(
     Ok(Engine::embedded()?.check_command_with(command, &allow))
 }
 
-fn install_adapter(agent: adapter::Agent) -> ExitCode {
+fn shims(action: &ShimsCmd) -> ExitCode {
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(anyhow::Error::from);
+    let done = match action {
+        ShimsCmd::Install { dir } => exe.and_then(|exe| shim::install(dir, &exe)),
+        ShimsCmd::Uninstall { dir } => shim::uninstall(dir),
+        ShimsCmd::Status { dir } => {
+            return match exe {
+                Ok(exe) => {
+                    let (text, all_ok) = shim::status(dir, &exe);
+                    println!("{text}");
+                    ExitCode::from(if all_ok { 0 } else { 1 })
+                }
+                Err(e) => fail(&format!("{e:#}")),
+            };
+        }
+    };
+    match done {
+        Ok(message) => {
+            println!("code-watch: {message}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&format!("{e:#}")),
+    }
+}
+
+/// OpenCode has no settings file for hooks: the plugin itself is written or printed.
+fn install_opencode(
+    path: Option<&Path>,
+    print: bool,
+    fail_open: bool,
+    warn: adapter::WarnAnswer,
+) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let text = adapter::opencode::render(&exe, fail_open, warn)?;
+    match (path, print) {
+        (Some(path), _) => {
+            let done = adapter::opencode::install(path, &text)?;
+            println!("code-watch: {done} {}", path.display());
+        }
+        (None, true) => print!("{text}"),
+        (None, false) => anyhow::bail!("name the file to write the plugin to, or use --print"),
+    }
+    Ok(())
+}
+
+fn install_adapter(
+    agent: adapter::Agent,
+    path: Option<&Path>,
+    print: bool,
+    fail_open: bool,
+    opencode_warn: Option<adapter::WarnAnswer>,
+) -> ExitCode {
+    if agent == adapter::Agent::Opencode {
+        let warn = opencode_warn.unwrap_or(adapter::WarnAnswer::Deny);
+        return match install_opencode(path, print, fail_open, warn) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&format!("{e:#}")),
+        };
+    }
+    if path.is_some() || print || fail_open || opencode_warn.is_some() {
+        return fail("only opencode takes a path, --print, --fail-open or --opencode-warn");
+    }
     let printed = std::env::current_exe()
         .map_err(anyhow::Error::from)
         .and_then(|exe| adapter::install::snippet(agent, &exe))

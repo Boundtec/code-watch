@@ -94,7 +94,31 @@ deny and a warning is an ask. `code-watch install-adapter <agent>` prints the se
 - **Cursor**: `beforeShellExecution` in `~/.cursor/hooks.json`; Cursor has no "no opinion" reply, so a clean command is an `ask` (Cursor's own prompt decides; `--cursor-clean allow` for auto-run mode).
 - **Codex CLI**: `PreToolUse` on `Bash` in `~/.codex/hooks.json`; Codex cannot ask, so a warning is denied with the allowlist entry that lets it through (`--codex-warn allow` to only report it).
 
+- **Gemini CLI**: `BeforeTool` on `run_shell_command` in `~/.gemini/settings.json`; Gemini cannot ask either, so a warning is denied like Codex (`--gemini-warn allow` to only report it).
+- **OpenCode**: `code-watch install-adapter opencode <path>` writes a small plugin (`--print` shows it); it never overwrites a file it did not write or follows a symbolic link. OpenCode cannot ask either: a warning is denied (`--opencode-warn allow` on `install-adapter` to only report it). Not yet tested against a live OpenCode.
+
 Commands the adapter cannot check are denied (`--fail-open` to allow them). Details in [docs/adapters.md](docs/adapters.md).
+
+## PATH shims
+
+For agents without a hook, and for commands run outside any agent: `code-watch shims install <dir>` links `git`, `npm`,
+`pnpm`, `yarn`, `pip`, `brew` and `curl` in `<dir>` to the code-watch binary. Put `<dir>` first on your `PATH`; each shim
+runs `code-watch check` on its own arguments and then runs the real tool found further down `PATH`, with the arguments
+unchanged. `<dir>` must be yours and not writable by anyone else. A block stops the command (exit 2), a warning prints the
+report on stderr and runs it. `code-watch shims uninstall <dir>` removes only the links code-watch wrote.
+
+A shim is a smaller guard than a hook. It sees the argv of one tool, not the shell line around it, so pipeline rules
+(`curl ... | sh`) never fire there and a warning only prints and runs the tool. Every check adds about 8 ms to a call
+(`git --version`, release build: 17.7 ms through a shim against 9.6 ms direct).
+
+- If the check itself fails (a broken `allow.toml`, for example) every shimmed tool stops with exit 3 and the reason on
+  stderr; run `code-watch check git status` to see the same error. `CODE_WATCH_FAIL_OPEN=1` runs commands it cannot check.
+- The links point at the binary's path: after an upgrade or a move run `code-watch shims install <dir>` again.
+  `code-watch shims status <dir>` lists each shim as ok, dangling, points elsewhere, missing or not a shim, and exits 1 if
+  any is not ok.
+
+Limits, ways around a shim: calling the tool by absolute path, `command -p`, `env PATH=... tool`, `env -i tool`, and
+sandboxes or launchers that reset `PATH`.
 
 ## Layers
 

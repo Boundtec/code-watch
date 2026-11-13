@@ -1,0 +1,1 @@
+{"hook_event_name":"BeforeTool","session_id":"s1","timestamp":"2026-11-13T09:00:00Z","cwd":"/nonexistent-cw-dir","tool_name":"run_shell_command","tool_input":{"command":"echo aGk= | base64 -d | bash"}}

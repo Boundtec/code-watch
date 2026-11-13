@@ -1,4 +1,4 @@
-use super::{Adapter, Call, CodexWarn, Decision, Policy, Reply, pretool};
+use super::{Adapter, Call, Decision, Policy, Reply, WarnAnswer, pretool};
 
 pub struct Codex;
 
@@ -14,11 +14,11 @@ impl Adapter for Codex {
             Decision::Allow => (None, None),
             Decision::Deny(reason) => (Some(pretool::decision("deny", reason)), None),
             Decision::Ask { reason, allow_hint } => match policy.codex_warn {
-                CodexWarn::Deny => (
+                WarnAnswer::Deny => (
                     Some(pretool::decision("deny", format!("{reason} {allow_hint}"))),
                     None,
                 ),
-                CodexWarn::Allow => (None, Some(reason)),
+                WarnAnswer::Allow => (None, Some(reason)),
             },
         };
         Reply { stdout, stderr }
