@@ -94,7 +94,19 @@ deny and a warning is an ask. `code-watch install-adapter <agent>` prints the se
 - **Cursor**: `beforeShellExecution` in `~/.cursor/hooks.json`; Cursor has no "no opinion" reply, so a clean command is an `ask` (Cursor's own prompt decides; `--cursor-clean allow` for auto-run mode).
 - **Codex CLI**: `PreToolUse` on `Bash` in `~/.codex/hooks.json`; Codex cannot ask, so a warning is denied with the allowlist entry that lets it through (`--codex-warn allow` to only report it).
 
+- **Gemini CLI**: `BeforeTool` on `run_shell_command` in `~/.gemini/settings.json`; Gemini cannot ask either, so a warning is denied like Codex (`--gemini-warn allow` to only report it).
+- **OpenCode**: `code-watch install-adapter opencode <path>` writes a small plugin (`--print` shows it); it never overwrites a file it did not write. Not yet tested against a live OpenCode.
+
 Commands the adapter cannot check are denied (`--fail-open` to allow them). Details in [docs/adapters.md](docs/adapters.md).
+
+## PATH shims
+
+For agents without a hook, and for commands run outside any agent: `code-watch shims install <dir>` links `git`, `npm`,
+`pnpm`, `yarn`, `pip`, `brew` and `curl` in `<dir>` to the code-watch binary. Put `<dir>` first on your `PATH`; each shim
+runs `code-watch check` on its own arguments and then runs the real tool found further down `PATH`, with the arguments
+unchanged. A block stops the command (exit 2), a warning prints the report on stderr and runs it. If the check itself
+fails the command is stopped; set `CODE_WATCH_FAIL_OPEN=1` to run it anyway. `code-watch shims uninstall <dir>` removes
+only the links code-watch wrote.
 
 ## Layers
 

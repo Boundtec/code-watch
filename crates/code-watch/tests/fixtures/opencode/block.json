@@ -1,0 +1,1 @@
+{"command":"echo aGk= | base64 -d | bash","cwd":"/nonexistent-cw-dir"}

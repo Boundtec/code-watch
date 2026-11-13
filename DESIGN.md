@@ -92,7 +92,7 @@ and exits. Adapters and shims contain no rules.
 |---|---|
 | git hook | `code-watch install-hook` sets a global `init.templateDir` with `post-checkout` that runs `code-watch scan .` |
 | agent adapters | each one is a tiny `code-watch adapter <agent>` subcommand that reads that agent's hook JSON on stdin, calls `check`, and prints that agent's response format |
-| PATH shims | generated scripts in `~/.local/share/code-watch/shims/` for `git`, `npm`, `pnpm`, `yarn`, `pip`, `brew`, `curl`; each runs `code-watch check <name> "$@"` then execs the real binary found past the shim dir |
+| PATH shims | `code-watch shims install <dir>` links `git`, `npm`, `pnpm`, `yarn`, `pip`, `brew`, `curl` to the binary, which dispatches on argv[0]: it checks its own argv, then execs the first real tool on `PATH` that is not a code-watch binary |
 
 Adding an agent = one new adapter module implementing `trait Adapter { fn parse(stdin) -> Command; fn render(Report) -> Output; }`.
 
@@ -142,7 +142,10 @@ No async runtime anywhere. `cargo-deny` runs in CI to keep the license list hone
 
 ## 3. Agent hook APIs (read 2026-11-12, re-read 2026-11-13)
 
-Update 2026-11-13: Codex CLI parses `ask` for `PreToolUse` but does not support it yet, so its adapter answers a warning
+Update 2026-11-13 (slice 11): Gemini CLI `BeforeTool` is as listed below, with no `ask` decision (only `allow`,
+`deny`, `block`), so a warning is a deny that says how to allow it; the OpenCode docs now describe a different plugin
+API (`Plugin.define`) without hook details, so the plugin follows the older `tool.execute.before` shape that
+third-party plugins use and is untested against a live OpenCode. Codex CLI parses `ask` for `PreToolUse` but does not support it yet, so its adapter answers a warning
 with a deny (`--codex-warn allow` reports it instead); Claude Code hooks accept `onFailure: "block"` (v2.1.295+) and a
 `defer` decision; Cursor has no "no opinion" reply, so a clean command is an `ask` unless `--cursor-clean allow`.
 
@@ -180,8 +183,8 @@ Each slice is about one worker-day, one reviewable PR, with its tests and its RE
 | 8 | Downloads layer | `.dmg` / `.pkg` quarantine, `codesign` / `spctl` shell-out behind a trait with a fake, macOS only |
 | 9 | LLM layer | provider trait, openai_compat + anthropic + local, `LlmFindings` newtype, the "only adds" property test, prompt-injection fixtures, `docs/llm-layer.md` |
 | 10 | Adapters 1 | `adapter` subcommand, Claude Code, Cursor, Codex CLI, with fixtures of each agent's stdin JSON |
-| 11 | Adapters 2 + shims | Gemini CLI, OpenCode plugin, PATH shims generator, `docs/adding-an-adapter.md` |
-| 12 | Release | install script and Homebrew tap, `cargo-deny`, release workflow (static binaries macOS arm64/x86_64, Linux musl), SECURITY.md, final README |
+| 11 | Adapters 2 + shims | Gemini CLI, OpenCode plugin, PATH shims (symlinks to the binary that dispatch on argv[0]), `docs/adding-an-adapter.md` |
+| 12 | Release | install script and Homebrew tap, `cargo-deny`, release workflow (static binaries macOS arm64/x86_64, Linux musl), SECURITY.md, final README; check the OpenCode plugin against a real OpenCode |
 
 Slices 2 to 4 and 5 to 6 are independent once slice 1 lands, so two workers can run in parallel.
 
