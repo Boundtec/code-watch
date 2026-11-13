@@ -36,7 +36,7 @@ commands are matched, not run.
 | `repo/vscode-folderopen-task` | block | a VS Code task that runs when the folder opens |
 | `repo/base64-into-shell` | block | base64 decoded straight into a shell in scripts and manifests |
 | `command/base64-into-shell` | block | the same in a command |
-| `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell |
+| `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell or a stdin-reading interpreter, or run through `$(...)` or `<(...)` |
 | `command/quarantine-removal` | warn | `xattr` removing or rewriting the macOS quarantine flag |
 | `command/lookalike-download-domain` | block / warn | `curl` or `wget` fetching from a domain that imitates a well-known one; block when piped into a shell, warn otherwise |
 | `command/hidden-program-into-shell` | warn | a pipeline into a shell whose program name is hidden behind `$` or a backtick (`$c x \| sh`), or `eval` of a variable |

@@ -300,6 +300,11 @@ impl Rule {
         }
     }
 
+    /// The finding of this command rule for a command that a parsed check, not the pattern, caught.
+    pub fn command_finding(&self, command: &str) -> Finding {
+        self.finding(Evidence::new(None, None, command))
+    }
+
     fn finding(&self, evidence: Evidence) -> Finding {
         Finding {
             rule_id: self.id.clone(),
