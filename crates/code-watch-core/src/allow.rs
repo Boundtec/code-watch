@@ -1,4 +1,4 @@
-//! Allowlists: a user file that decides and a per-repo file that can only ask. An entry hides a
+//! Allowlists: a user file that decides and a per-repo file that can only allow warnings. An entry hides a
 //! rules or OSV finding from the verdict; it never turns a layer off, and the hidden findings
 //! stay in the report.
 
@@ -19,6 +19,7 @@ const REPO_FILE: &str = ".code-watch.toml";
 const MAX_REPO_FILE_BYTES: u64 = 64 * 1024;
 const REPO_INVALID: &str = "allowlist/repo-file-invalid";
 const REPO_REFUSED: &str = "allowlist/repo-block-override-refused";
+const REPO_COMMAND_REFUSED: &str = "allowlist/repo-command-override-refused";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AllowError {
@@ -129,11 +130,16 @@ impl Allowlists {
         let mut kept = Vec::new();
         let mut suppressed = Vec::new();
         let mut refused = BTreeSet::new();
+        let mut command_refused = BTreeSet::new();
         for f in findings {
             match self.decide(&f) {
                 Decision::Keep => kept.push(f),
                 Decision::Refuse => {
                     refused.insert(f.rule_id.clone());
+                    kept.push(f);
+                }
+                Decision::RefuseCommand => {
+                    command_refused.insert(f.rule_id.clone());
                     kept.push(f);
                 }
                 Decision::Suppress(source, reason) => suppressed.push(Suppressed {
@@ -144,6 +150,7 @@ impl Allowlists {
             }
         }
         kept.extend(refused.iter().map(|id| refusal(id)));
+        kept.extend(command_refused.iter().map(|id| command_refusal(id)));
         kept.extend(self.repo_problem.iter().map(|p| repo_invalid(p)));
         let mut warnings = Vec::new();
         for (entries, file) in [
@@ -171,8 +178,10 @@ impl Allowlists {
         let Some(e) = self.repo.iter().find(|e| e.matches(f)) else {
             return Decision::Keep;
         };
-        let user_lists_rule = self.user.iter().any(|u| u.rule == f.rule_id);
-        if f.severity < Severity::Block || user_lists_rule {
+        // A repo file is writable by the agent being guarded, so it never allows a command rule.
+        if f.rule_id.starts_with("command/") {
+            Decision::RefuseCommand
+        } else if f.severity < Severity::Block {
             Decision::Suppress(Source::Repo, e.reason.clone())
         } else {
             Decision::Refuse
@@ -183,6 +192,7 @@ impl Allowlists {
 enum Decision {
     Keep,
     Refuse,
+    RefuseCommand,
     Suppress(Source, Option<String>),
 }
 
@@ -307,12 +317,21 @@ fn repo_invalid(problem: &str) -> Finding {
     )
 }
 
+fn command_refusal(rule_id: &str) -> Finding {
+    own_finding(
+        REPO_COMMAND_REFUSED,
+        "The repository's allowlist asked to allow a command rule",
+        &format!("{REPO_FILE} tried to allow {rule_id}"),
+        "Only the user's own code-watch settings can allow command rules.",
+    )
+}
+
 fn refusal(rule_id: &str) -> Finding {
     own_finding(
         REPO_REFUSED,
         "The repository's allowlist asked to allow a block rule the user file does not list",
         &format!("{REPO_FILE} tried to allow {rule_id}"),
-        "Add the rule to your own allow.toml if you trust this repository.",
+        "Only the user's own code-watch settings can allow this rule.",
     )
 }
 
@@ -468,17 +487,52 @@ mod tests {
     }
 
     #[test]
-    fn the_repo_file_may_allow_a_block_rule_the_user_file_lists() {
+    fn a_user_entry_that_matches_the_finding_lifts_a_block_whatever_the_repo_says() {
         let a = lists(ALLOW_B, ALLOW_B).apply(vec![finding("b", Severity::Block)], &known(&["b"]));
+        assert!(a.kept.is_empty());
+        assert_eq!(a.suppressed[0].source, Source::User);
+    }
+
+    #[test]
+    fn a_user_entry_narrowed_to_another_domain_does_not_back_a_repo_entry() {
+        let user = "[[allow]]\nrule = \"b\"\ndomain = \"githuh.com\"\n";
+        let mut f = finding("b", Severity::Block);
+        f.domain = Some("evil.io".into());
+        let a = lists(user, ALLOW_B).apply(vec![f], &known(&["b"]));
+        assert_eq!(ids(&a.kept), ["b", REPO_REFUSED]);
+        assert!(a.suppressed.is_empty());
+    }
+
+    const ALLOW_CMD: &str = "[[allow]]\nrule = \"command/x\"\n";
+
+    #[test]
+    fn a_repo_entry_never_allows_a_command_rule_and_the_attempt_is_reported() {
+        for severity in [Severity::Warn, Severity::Block] {
+            let a = lists("", ALLOW_CMD)
+                .apply(vec![finding("command/x", severity)], &known(&["command/x"]));
+            assert_eq!(
+                ids(&a.kept),
+                ["command/x", REPO_COMMAND_REFUSED],
+                "{severity:?}"
+            );
+            assert!(a.suppressed.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_repo_file_listing_a_command_rule_adds_nothing_when_no_finding_matches() {
+        let a = lists("", ALLOW_CMD).apply(vec![], &known(&["command/x"]));
         assert!(a.kept.is_empty());
     }
 
     #[test]
-    fn a_user_entry_for_another_narrower_still_backs_the_repo_entry() {
-        let user = "[[allow]]\nrule = \"b\"\npath = \"other/**\"\n";
-        let a = lists(user, ALLOW_B).apply(vec![finding("b", Severity::Block)], &known(&["b"]));
+    fn the_user_file_still_allows_a_command_rule() {
+        let a = lists(ALLOW_CMD, ALLOW_CMD).apply(
+            vec![finding("command/x", Severity::Warn)],
+            &known(&["command/x"]),
+        );
         assert!(a.kept.is_empty());
-        assert_eq!(a.suppressed[0].source, Source::Repo);
+        assert_eq!(a.suppressed[0].source, Source::User);
     }
 
     #[test]

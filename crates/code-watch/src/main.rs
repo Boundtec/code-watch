@@ -17,6 +17,8 @@ mod shim;
 
 /// Exit code for errors and bad usage. Verdicts use 0, 1 and 2, so 2 always means "block".
 const EXIT_ERROR: u8 = 3;
+/// What a fail-closed adapter exits with when it cannot even start: agents treat only 2 as a block.
+const EXIT_BLOCK: u8 = 2;
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +39,9 @@ enum Cmd {
     /// Scan a directory (for example a freshly cloned repository) without running anything in it
     Scan {
         dir: PathBuf,
+        /// Ignore the directory's own .code-watch.toml (the clone hook uses this: a fresh clone is untrusted)
+        #[arg(long)]
+        user_allow_only: bool,
         /// Do not look up known vulnerabilities (the OSV layer reports "off")
         #[arg(long, conflicts_with = "offline")]
         no_osv: bool,
@@ -114,13 +119,31 @@ fn main() -> ExitCode {
     panic::set_hook(Box::new(|info| {
         let _ = writeln!(io::stderr(), "code-watch: internal error: {info}");
     }));
-    guarded(real_main)
+    let failure = failure_code(std::env::args_os().skip(1));
+    guarded(failure, real_main)
 }
 
-/// Runs `f` and turns a panic into the error exit code: the default 101 would be read as a
-/// verdict-less crash by hooks that only know 0, 1, 2 and 3.
-fn guarded(f: impl FnOnce() -> ExitCode + UnwindSafe) -> ExitCode {
-    panic::catch_unwind(f).unwrap_or(ExitCode::from(EXIT_ERROR))
+/// Runs `f` and turns a panic into `failure`: the default 101 would be read as a verdict-less
+/// crash by hooks that only know 0, 1, 2 and 3.
+fn guarded(failure: u8, f: impl FnOnce() -> ExitCode + UnwindSafe) -> ExitCode {
+    panic::catch_unwind(f).unwrap_or(ExitCode::from(failure))
+}
+
+/// The exit code for a failure before or outside the adapter's own fail handling. Read from the
+/// raw arguments because a usage error means they were never parsed. Only `--fail-open` as the
+/// sole fail flag makes it non-blocking.
+fn failure_code(args: impl Iterator<Item = OsString>) -> u8 {
+    let args: Vec<OsString> = args.collect();
+    let adapter = args
+        .iter()
+        .find(|a| !a.to_string_lossy().starts_with('-'))
+        .is_some_and(|a| a == "adapter");
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    if adapter && (!has("--fail-open") || has("--fail-closed")) {
+        EXIT_BLOCK
+    } else {
+        EXIT_ERROR
+    }
 }
 
 fn real_main() -> ExitCode {
@@ -128,12 +151,18 @@ fn real_main() -> ExitCode {
     if let Some(name) = argv.next().as_deref().and_then(shim::invoked_as) {
         return shim::run(name, argv.collect());
     }
+    let failure = failure_code(std::env::args_os().skip(1));
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
             let ok = matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion);
-            let _ = e.print();
-            return ExitCode::from(if ok { 0 } else { EXIT_ERROR });
+            // Blocked adapter stderr is read by the model, so a usage error there names no flag.
+            if ok || failure != EXIT_BLOCK {
+                let _ = e.print();
+            } else {
+                let _ = writeln!(io::stderr(), "code-watch: {}", adapter::UNCHECKED);
+            }
+            return ExitCode::from(if ok { 0 } else { failure });
         }
     };
     match &cli.command {
@@ -215,10 +244,12 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
     Ok(match &cli.command {
         Cmd::Scan {
             dir,
+            user_allow_only,
             no_osv,
             offline,
         } => {
-            let allow = Allowlists::load(user_dir.as_deref(), Some(dir))?;
+            let repo = (!user_allow_only).then_some(dir.as_path());
+            let allow = Allowlists::load(user_dir.as_deref(), repo)?;
             let engine = Engine::embedded()?;
             if *no_osv {
                 return Ok(Outcome::Report(engine.scan_dir_with(dir, &allow)?));
@@ -257,6 +288,7 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
                 cwd.as_deref(),
                 &command,
                 user_dir.as_deref(),
+                true,
             )?)
         }
         Cmd::Adapter { .. } | Cmd::InstallAdapter { .. } | Cmd::Shims { .. } => {
@@ -271,14 +303,19 @@ fn user_dir() -> Option<PathBuf> {
     user_config_dir(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir())
 }
 
-/// The check shared by `check` and the adapters. A repo allowlist applies only when `cwd` is a
-/// directory inside a git work tree; any other `cwd` is treated as outside a repo.
+/// The check shared by `check` and the adapters. The repo file is read only when `use_repo` is
+/// set and `cwd` is a directory inside a git work tree; it can never allow a command rule, but
+/// reading it lets `check` report the attempt. Adapters pass `false`: the agent being guarded can
+/// write that file, so what it says must not change the reply.
 fn check_command(
     cwd: Option<&Path>,
     command: &str,
     user_dir: Option<&Path>,
+    use_repo: bool,
 ) -> anyhow::Result<Report> {
-    let repo = cwd.filter(|d| d.is_dir()).and_then(find_repo_root);
+    let repo = cwd
+        .filter(|d| use_repo && d.is_dir())
+        .and_then(find_repo_root);
     let allow = Allowlists::load(user_dir, repo.as_deref())?;
     Ok(Engine::embedded()?.check_command_with(command, &allow))
 }
@@ -412,9 +449,24 @@ mod tests {
     }
 
     #[test]
+    fn an_adapter_fails_closed_unless_told_otherwise() {
+        let code = |args: &[&str]| failure_code(args.iter().map(OsString::from));
+        assert_eq!(code(&["adapter", "codex"]), EXIT_BLOCK);
+        assert_eq!(code(&["adapter", "codex", "--fail-closed"]), EXIT_BLOCK);
+        assert_eq!(code(&["adapter", "codex", "--fail-open"]), EXIT_ERROR);
+        assert_eq!(code(&["--json", "adapter", "codex"]), EXIT_BLOCK);
+        assert_eq!(
+            code(&["adapter", "codex", "--fail-open", "--fail-closed"]),
+            EXIT_BLOCK
+        );
+        assert_eq!(code(&["check", "ls"]), EXIT_ERROR);
+        assert_eq!(code(&[]), EXIT_ERROR);
+    }
+
+    #[test]
     fn a_panic_exits_with_the_error_code() {
         panic::set_hook(Box::new(|_| {}));
-        let code = guarded(|| panic!("boom"));
+        let code = guarded(EXIT_ERROR, || panic!("boom"));
         let _ = panic::take_hook();
         assert_eq!(code, ExitCode::from(EXIT_ERROR));
     }
