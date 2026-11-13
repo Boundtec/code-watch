@@ -4,7 +4,7 @@ A local guard that checks your machine **before** risky code runs: a repository 
 agent is about to execute, an install, a download. Open source (Apache-2.0), written in Rust, one binary for macOS and
 Linux. Windows is not supported.
 
-> Status: early. The skeleton ships the engine, the CLI and the first repo and command rules. See
+> Status: early. It ships the engine, the CLI, the repo and command rules, allowlists and the OSV layer. See
 > [DESIGN.md](DESIGN.md) for the plan.
 
 ## Try it
@@ -85,6 +85,13 @@ rule cannot see it. The macOS-only rules run only on macOS; elsewhere `check` li
 leaves your git config as it was. It refuses rather than overwrite a template directory of your own. Details in
 [docs/git-hook.md](docs/git-hook.md).
 
+## Known vulnerabilities
+
+`scan` also reads the lockfiles (npm, pnpm, yarn, `requirements*.txt` and `requirements/*.txt`, poetry, uv, cargo, go) and asks [OSV](https://osv.dev) about
+the public-registry packages they pin. Only package names, versions and ecosystems are sent. Answers are cached for 24
+hours in `~/.cache/code-watch/osv/`; `scan --offline` uses only that cache and `scan --no-osv` turns the layer off.
+A lookup that fails is reported, never treated as clean. Details in [docs/osv.md](docs/osv.md).
+
 ## Agent hooks
 
 `code-watch adapter <agent>` answers an agent's pre-command hook with the same check as `code-watch check`; a block is a
@@ -122,8 +129,8 @@ sandboxes or launchers that reset `PATH`.
 
 ## Layers
 
-Rules always run and need no key. The CVE layer and the optional LLM layer are not built yet; every report says which
-layers ran and which are off.
+Rules and the OSV layer need no key. The optional LLM layer is not built yet; every report says which layers ran,
+which were skipped (and why) and which are off.
 
 ## License
 

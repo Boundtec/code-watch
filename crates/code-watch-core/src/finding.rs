@@ -64,6 +64,13 @@ fn is_invisible(c: char) -> bool {
     c.is_control() || get_general_category(c) == GeneralCategory::Format
 }
 
+/// One vulnerability a finding reports, with the other ids the databases know it by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Advisory {
+    pub id: String,
+    pub aliases: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Finding {
     pub rule_id: String,
@@ -79,6 +86,9 @@ pub struct Finding {
     /// The package the finding is about, set by the layer that knows it (the OSV layer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
+    /// Every vulnerability a grouped OSV finding covers; the other layers leave it empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<Advisory>,
 }
 
 #[cfg(test)]

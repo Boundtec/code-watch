@@ -126,17 +126,19 @@ Licenses are all Apache-2.0-compatible. Downloads are all-time / last 90 days. L
 | npm / pnpm / yarn | `serde_json` (npm); `serde_norway` (pnpm, yarn berry YAML; 0.9.42, 2024-12-21, 20 M, MIT OR Apache-2.0); `yarn-lock-parser` (yarn v1; 0.14.0, 2026-02-08, 341 k, MIT) | | | | | `serde_yaml` is archived (`0.9.34+deprecated`), so `serde_norway` is the maintained fork; `serde_yml` (0.0.13, 2026-05-27) is avoided, run `cargo audit` on it before ever choosing it |
 | pip / poetry / uv | `toml` for `poetry.lock` / `uv.lock`; `pep508_rs` (0.9.2, 2025-01-02, 16.8 M, Apache-2.0 OR BSD-2-Clause) for `requirements.txt` lines | | | | | `pep508_rs` is stale but a complete PEP 508 parser; fallback is a small line regex (`name==version`), which is all OSV needs. `uv-lock` (0.0.100) is an internal uv crate: not used |
 | cargo | `cargo-lock` | 11.1.0 | 2026-07-24 | 43 M / 8.3 M | Apache-2.0 OR MIT | RustSec's own parser |
-| go | `gomod-parser` (go.mod; 0.6.0, 2026-10-01, 1.26 M, Apache-2.0); `go.sum` is `module version hash` lines | | | | | small, recent |
+| go | `gomod-parser` (go.mod; 0.6.0, 2026-10-01, 1.26 M, Apache-2.0); `go.sum` is not a source: it keeps versions the build does not use and would raise false findings | | | | | small, recent |
 | Shell command parsing | `shlex` | 2.0.1 | 2026-05-17 | 1.08 B / 355 M | MIT OR Apache-2.0 | tokenise `check <command>` without a hand-rolled parser; pipelines are split on `\|` `;` `&&` after tokenising. `brush-parser` (0.4.0, MIT, 926 k) and `tree-sitter-bash` (0.25.1, 2025-12-02, MIT) are real bash parsers: held back for later if `shlex` misses cases |
 | Lookalike domains | `idna` (1.1.0, 2025-08-21, 1.15 B) for punycode/IDNA; `psl` (2.1.252, 2026-11-12, 39 M) for the registrable domain; `unicode-security` (0.1.3, 2026-11-02, 18.7 M) for confusable skeletons; `strsim` (0.11.1, 1.27 B) for edit distance against an embedded list of known domains (`brew.sh`, `github.com`, ...) | | | | | all MIT / Apache-2.0, all well used |
 | File walking, globs | `ignore` + `globset` | 0.4.34 / 0.4.21 | 2026-10-27 | 212 M / 291 M | Unlicense OR MIT | ripgrep's own; respects `.gitignore` but we also scan ignored files where it matters (opt-out per rule) |
 | Regex | `regex` | 1.13.1 | 2026-07-15 | 1.38 B | MIT OR Apache-2.0 | linear-time, safe against ReDoS on hostile input |
 | Base64 detection | `base64` | 0.23.1 | current | huge | MIT OR Apache-2.0 | decode candidate blobs |
-| Hash | `sha2` | 0.11.1 | current | huge | MIT OR Apache-2.0 | allowlist pins, cache keys |
+| Hash | `sha2` | 0.11.1 | current | huge | MIT OR Apache-2.0 (RustCrypto) | allowlist pins, hashed file names of the OSV cache |
 | XDG dirs | `dirs` | 7.0.0 | 2026-09-05 | 407 M | MIT OR Apache-2.0 | |
 | macOS signature / notarization | shell out to `codesign --verify --deep --strict`, `spctl --assess --type open --context context:primary-signature` and `xattr` | | | | | present on every Mac (`/usr/bin/codesign`, `/usr/sbin/spctl` confirmed here); `apple-codesign` (0.29.0, 2024-11-29, MPL-2.0) is a signing tool, stale, and MPL is a weaker fit for Apache-2.0; `security-framework` (3.7.0, MIT OR Apache-2.0) has no notarization check |
 | HTTP client for OSV + LLM | `ureq` | 3.5.2 | 2026-11-12 | 265 M / 86 M | MIT OR Apache-2.0 | blocking, small, no async runtime in a CLI that exits in milliseconds; `reqwest` (0.13.5, 2026-09-08, 905 M) works but pulls `tokio`. TLS via rustls |
 | Tests | `assert_cmd` 2.2.2, `insta` 1.49.0 (Apache-2.0), `tempfile` 3.27.0, `rstest` 0.28.0 | | | | | all current |
+
+Two transitive crates are not plain MIT/Apache-2.0: `version-ranges` 0.1.3 (MPL-2.0, file-level copyleft, via `pep508_rs`) and `webpki-roots` 1.0.12 (CDLA-Permissive-2.0, the bundled TLS roots, via `ureq`). Both are usable from an Apache-2.0 binary; the MPL one is the weaker fit and is the reason to replace `pep508_rs` with the small line parser if it ever gets in the way. They are named in `NOTICE`; the `cargo-deny` licence exceptions come with the CI slice.
 
 No async runtime anywhere. `cargo-deny` runs in CI to keep the license list honest.
 
