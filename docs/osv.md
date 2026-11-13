@@ -31,14 +31,21 @@ Requests time out after 10 seconds.
 
 | Rule | Severity | Meaning |
 |---|---|---|
-| `osv/malicious-package` | block | an advisory whose id starts with `MAL-` |
+| `osv/malicious-package` | block | an advisory whose id or any alias starts with `MAL-`, or whose record lists CWE-506 (embedded malicious code), the field GitHub uses for backdoored packages such as `event-stream` 3.3.6; the summary text is never read |
 | `osv/known-vulnerability` | warn, or info | the severity label of the advisory: CRITICAL and HIGH warn, MODERATE and LOW inform; an advisory with no label (only a CVSS vector) warns, because unknown is not downgraded |
 | `osv/unchecked-packages` | warn | packages that could not be looked up (OSV unreachable, an error status, a partial answer, or offline with no fresh cache); it names a few |
 | `osv/unparsed-lockfile` | warn | a lockfile that could not be read |
 
-A finding carries the advisory id, the fixed versions OSV lists (at most three), the lockfile and line when the format
-has one, and the package name, so `package = "..."` in an allowlist entry matches it. The same package in two lockfiles
-is queried once and reported in both. The two warnings about unchecked and unparsed input can never be allowed.
+There is one finding per package per lockfile, with the highest severity of its advisories. Advisories that are one
+vulnerability under several ids (a Go advisory and its GitHub alias) are merged when their ids and aliases overlap. The
+human output names the first three ids and counts the rest; `--json` lists every one under `advisories`
+(`{"id", "aliases"}`), an additive key. Malicious advisories get a separate finding, so allowing a package's ordinary
+advisories never hides them. The finding says which version fixes all of them: per advisory the first fixed version
+above the installed one, then the highest of those (it assumes a version past a fix stays fixed). When one advisory has
+no fix above the installed version it says "no single version fixes all", and when a fixed version cannot be compared
+it says so rather than guess. The finding also carries the lockfile and line when the format has one, and the package
+name, so `package = "..."` in an allowlist entry matches the whole group. The same package in two lockfiles is queried
+once and reported in both. The two warnings about unchecked and unparsed input can never be allowed.
 
 A failed lookup is never a clean result. When nothing could be looked up at all, `layers.osv` is `skipped` and
 `skipped_layers.osv` in `--json` (and the footer) says why; when only some packages failed it is `ran` and the

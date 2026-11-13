@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use super::advisory::Vuln;
 use super::package::Package;
 
-const CACHE_SCHEMA: u32 = 1;
+const CACHE_SCHEMA: u32 = 2;
 const MAX_CACHE_FILE_BYTES: u64 = 1024 * 1024;
 pub const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 

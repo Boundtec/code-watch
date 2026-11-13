@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::advisory::{MALICIOUS_PREFIX, OsvRecord, Vuln};
+use super::advisory::{OsvRecord, Vuln};
 use super::cache::Cache;
 use super::client::{MAX_BATCH, OsvClient, OsvError, Query};
 use super::discover::{Discovered, Unparsed};
+use super::group;
 use super::package::{Ecosystem, Package};
-use crate::finding::{Evidence, Finding, Layer, Severity, clean_text};
+use crate::finding::{Evidence, Finding, Layer, Severity};
 
 /// Follow-up requests per batch when OSV pages a package's advisory list.
 const MAX_PAGES: usize = 5;
@@ -72,7 +73,7 @@ pub fn run(found: Discovered, mode: OsvMode, client: &dyn OsvClient, cache: &Cac
     }
     for (key, vulns) in &resolved {
         for pkg in &groups[key] {
-            findings.extend(vulns.iter().map(|v| vuln_finding(pkg, v)));
+            findings.extend(group::findings(pkg, vulns));
         }
     }
     let unchecked: Vec<&Key> = groups
@@ -188,6 +189,7 @@ fn unparsed_finding(u: &Unparsed) -> Finding {
         remediation: "Read the lockfile by hand before installing from it.".into(),
         domain: None,
         package: None,
+        advisories: Vec::new(),
     }
 }
 
@@ -221,44 +223,6 @@ fn unchecked_finding(keys: &[&Key], why: &str) -> Finding {
             .into(),
         domain: None,
         package: None,
-    }
-}
-
-fn vuln_finding(pkg: &Package, v: &Vuln) -> Finding {
-    let name = clean_text(&pkg.name);
-    let version = clean_text(&pkg.version);
-    let id = clean_text(&v.id);
-    let malicious = v.id.starts_with(MALICIOUS_PREFIX);
-    let remediation = if malicious {
-        format!("Remove {name} and anything that installed it; treat this machine as exposed.")
-    } else if v.fixed.is_empty() {
-        format!(
-            "No fixed version is listed. Replace {name} or read the advisory at https://osv.dev/{id}."
-        )
-    } else {
-        let fixed: Vec<String> = v.fixed.iter().map(|f| clean_text(f)).collect();
-        format!(
-            "Upgrade {name} to a fixed version ({}) and re-lock.",
-            fixed.join(", ")
-        )
-    };
-    Finding {
-        rule_id: if malicious {
-            RULE_MALICIOUS
-        } else {
-            RULE_KNOWN
-        }
-        .into(),
-        severity: v.severity,
-        layer: Layer::Osv,
-        title: format!("{name} {version} is affected by {id}"),
-        evidence: Evidence::new(
-            Some(pkg.file.clone()),
-            pkg.line,
-            &format!("{name}@{version}: {id}: {}", v.summary),
-        ),
-        remediation,
-        domain: None,
-        package: Some(pkg.name.clone()),
+        advisories: Vec::new(),
     }
 }

@@ -136,6 +136,7 @@ mod tests {
             remediation: String::new(),
             domain: Some("example.org".into()),
             package: None,
+            advisories: Vec::new(),
         };
         let s = Suppressed {
             finding: f,

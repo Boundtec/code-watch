@@ -441,7 +441,8 @@ fn a_paged_answer_is_followed_and_merged() {
         &client,
         &cache(dir.path(), &FakeClock::new()),
     );
-    assert_eq!(out.findings.len(), 2);
+    assert_eq!(out.findings.len(), 1);
+    assert_eq!(out.findings[0].advisories.len(), 2);
     assert_eq!(client.batches.borrow().len(), 2);
 }
 
@@ -838,4 +839,352 @@ fn ecosystem_names_in_queries_are_the_osv_spellings() {
         .map(|q| q.ecosystem.osv_name())
         .collect();
     assert_eq!(names, ["npm", "PyPI", "crates.io", "Go"]);
+}
+
+fn rec(json: serde_json::Value) -> OsvRecord {
+    serde_json::from_value(json).unwrap()
+}
+
+fn semver_record(
+    id: &str,
+    aliases: &[&str],
+    severity: &str,
+    name: &str,
+    fixed: &[&str],
+) -> OsvRecord {
+    let events: Vec<_> = fixed
+        .iter()
+        .map(|f| serde_json::json!({ "fixed": f }))
+        .collect();
+    rec(serde_json::json!({
+        "id": id,
+        "aliases": aliases,
+        "summary": format!("summary of {id}"),
+        "database_specific": { "severity": severity },
+        "affected": [{
+            "package": { "ecosystem": "npm", "name": name },
+            "ranges": [{ "type": "SEMVER", "events": events }],
+        }],
+    }))
+}
+
+fn run_one(client: &FakeOsv, list: Vec<Package>) -> Vec<Finding> {
+    let dir = tempfile::tempdir().unwrap();
+    run(
+        packages(list),
+        OsvMode::Live,
+        client,
+        &cache(dir.path(), &FakeClock::new()),
+    )
+    .findings
+}
+
+fn event_stream_record() -> serde_json::Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/osv-records/GHSA-mh6f-8j2x-4483.json");
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn event_stream_3_3_6_is_malicious_because_its_record_carries_the_malicious_code_cwe() {
+    let client =
+        FakeOsv::answering(&["GHSA-mh6f-8j2x-4483"]).with_record(rec(event_stream_record()));
+    let findings = run_one(
+        &client,
+        vec![pkg("event-stream", "3.3.6", "package-lock.json", None)],
+    );
+    assert_eq!(ids(&findings), ["osv/malicious-package"]);
+    assert_eq!(findings[0].severity, Severity::Block);
+    assert!(findings[0].remediation.contains("Remove event-stream"));
+}
+
+#[test]
+fn the_same_record_without_the_cwe_is_an_ordinary_vulnerability() {
+    let mut json = event_stream_record();
+    json["database_specific"]["cwe_ids"] = serde_json::json!(["CWE-200"]);
+    let client = FakeOsv::answering(&["GHSA-mh6f-8j2x-4483"]).with_record(rec(json));
+    let findings = run_one(&client, vec![pkg("event-stream", "3.3.6", "f", None)]);
+    assert_eq!(
+        (ids(&findings), findings[0].severity),
+        (vec!["osv/known-vulnerability"], Severity::Warn)
+    );
+}
+
+#[test]
+fn an_advisory_whose_alias_is_a_mal_id_is_malicious() {
+    let client = FakeOsv::answering(&["GHSA-x"]).with_record(semver_record(
+        "GHSA-x",
+        &["MAL-2024-9"],
+        "LOW",
+        "x",
+        &[],
+    ));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    assert_eq!(
+        (ids(&findings), findings[0].severity),
+        (vec!["osv/malicious-package"], Severity::Block)
+    );
+}
+
+#[test]
+fn a_summary_that_says_malicious_does_not_make_an_advisory_malicious() {
+    let mut r = semver_record("GHSA-x", &[], "LOW", "x", &[]);
+    r.summary = "Malicious code in x".into();
+    let client = FakeOsv::answering(&["GHSA-x"]).with_record(r);
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    assert_eq!(ids(&findings), ["osv/known-vulnerability"]);
+}
+
+#[test]
+fn one_vulnerability_under_two_ids_is_one_finding_listing_both() {
+    let client = FakeOsv::new(Box::new(|qs| {
+        Ok(qs
+            .iter()
+            .map(|_| QueryAnswer {
+                ids: vec!["GO-2024-1".into(), "GHSA-aaaa".into()],
+                next_page_token: None,
+            })
+            .collect())
+    }))
+    .with_record(semver_record(
+        "GO-2024-1",
+        &["GHSA-aaaa", "CVE-2024-1"],
+        "LOW",
+        "x",
+        &["1.2.0"],
+    ))
+    .with_record(semver_record(
+        "GHSA-aaaa",
+        &["GO-2024-1"],
+        "CRITICAL",
+        "x",
+        &["1.2.0"],
+    ));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    assert_eq!(findings.len(), 1);
+    let f = &findings[0];
+    assert_eq!(f.advisories.len(), 1);
+    assert_eq!(f.advisories[0].id, "CVE-2024-1");
+    assert_eq!(f.advisories[0].aliases, ["GHSA-aaaa", "GO-2024-1"]);
+    assert!(
+        f.evidence.excerpt.contains("also GHSA-aaaa, GO-2024-1"),
+        "{}",
+        f.evidence.excerpt
+    );
+    assert_eq!(f.severity, Severity::Warn);
+}
+
+#[test]
+fn advisories_that_share_no_id_stay_separate() {
+    let client = FakeOsv::answering(&["A-1", "B-1"])
+        .with_record(semver_record("A-1", &["CVE-1"], "HIGH", "x", &["2.0.0"]))
+        .with_record(semver_record("B-1", &["CVE-2"], "HIGH", "x", &["2.0.0"]));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    assert_eq!(findings[0].advisories.len(), 2);
+}
+
+#[test]
+fn aliases_chain_into_one_group() {
+    let client = FakeOsv::answering(&["A-1", "B-1", "C-1"])
+        .with_record(semver_record("A-1", &["B-1"], "LOW", "x", &[]))
+        .with_record(semver_record("C-1", &["CVE-9"], "LOW", "x", &[]))
+        .with_record(semver_record("B-1", &["CVE-9"], "LOW", "x", &[]));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    assert_eq!(findings[0].advisories.len(), 1);
+}
+
+fn many(n: usize, fixed: &dyn Fn(usize) -> Vec<&'static str>) -> FakeOsv {
+    let all: Vec<String> = (0..n).map(|i| format!("GHSA-{i:04}")).collect();
+    let mut client = FakeOsv::new(Box::new(move |qs| {
+        Ok(qs
+            .iter()
+            .map(|_| QueryAnswer {
+                ids: all.clone(),
+                next_page_token: None,
+            })
+            .collect())
+    }));
+    for i in 0..n {
+        let sev = if i == 7 { "HIGH" } else { "LOW" };
+        client = client.with_record(semver_record(
+            &format!("GHSA-{i:04}"),
+            &[],
+            sev,
+            "x",
+            &fixed(i),
+        ));
+    }
+    client
+}
+
+#[test]
+fn many_advisories_are_one_finding_per_package_with_the_highest_severity_and_every_id_in_json() {
+    let client = many(49, &|_| vec!["9.0.0"]);
+    let findings = run_one(
+        &client,
+        vec![pkg("x", "1.0.0", "package-lock.json", Some(3))],
+    );
+    assert_eq!(findings.len(), 1);
+    let f = &findings[0];
+    assert_eq!(f.severity, Severity::Warn, "one HIGH among LOW ones");
+    assert_eq!(f.title, "x 1.0.0 has 49 known vulnerabilities");
+    assert_eq!(
+        f.evidence.excerpt,
+        "x@1.0.0: GHSA-0000, GHSA-0001, GHSA-0002 and 46 more"
+    );
+    assert_eq!(f.advisories.len(), 49);
+    let json = serde_json::to_value(f).unwrap();
+    assert_eq!(json["advisories"].as_array().unwrap().len(), 49);
+    assert_eq!(f.evidence.line, Some(3));
+}
+
+#[test]
+fn a_package_in_two_lockfiles_gets_one_grouped_finding_in_each() {
+    let client = many(5, &|_| vec!["9.0.0"]);
+    let findings = run_one(
+        &client,
+        vec![
+            pkg("x", "1.0.0", "a/package-lock.json", None),
+            pkg("x", "1.0.0", "b/yarn.lock", None),
+        ],
+    );
+    assert_eq!(findings.len(), 2);
+    assert!(findings.iter().all(|f| f.advisories.len() == 5));
+}
+
+#[test]
+fn the_fix_is_the_lowest_version_that_fixes_every_advisory() {
+    // Installed 1.0.0. A is fixed in 1.2.0 or 2.0.0, B in 1.5.0, C in 0.9.0 (already past) and 1.1.0.
+    let client = FakeOsv::answering(&["A", "B", "C"])
+        .with_record(semver_record("A", &[], "LOW", "x", &["1.2.0", "2.0.0"]))
+        .with_record(semver_record("B", &[], "LOW", "x", &["1.5.0"]))
+        .with_record(semver_record("C", &[], "LOW", "x", &["0.9.0", "1.1.0"]));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    assert!(
+        findings[0]
+            .remediation
+            .contains("Upgrade x to 1.5.0, the lowest version that fixes all 3"),
+        "{}",
+        findings[0].remediation
+    );
+}
+
+#[test]
+fn compares_versions_numerically_not_as_text() {
+    let client = FakeOsv::answering(&["A", "B"])
+        .with_record(semver_record("A", &[], "LOW", "x", &["1.9.0"]))
+        .with_record(semver_record("B", &[], "LOW", "x", &["1.10.0"]));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    assert!(
+        findings[0].remediation.contains("to 1.10.0"),
+        "{}",
+        findings[0].remediation
+    );
+}
+
+#[test]
+fn when_one_advisory_has_no_fix_above_the_installed_version_there_is_no_single_fixed_version() {
+    let client = FakeOsv::answering(&["A", "B"])
+        .with_record(semver_record("A", &[], "LOW", "x", &["2.0.0"]))
+        .with_record(semver_record("B", &[], "LOW", "x", &[]));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    assert!(
+        findings[0]
+            .remediation
+            .contains("No single version fixes all 2"),
+        "{}",
+        findings[0].remediation
+    );
+}
+
+#[test]
+fn a_fixed_version_that_does_not_parse_is_said_not_guessed() {
+    let client = FakeOsv::answering(&["A"]).with_record(semver_record(
+        "A",
+        &[],
+        "LOW",
+        "x",
+        &["release-2024"],
+    ));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    assert!(
+        findings[0].remediation.contains("could not be compared"),
+        "{}",
+        findings[0].remediation
+    );
+}
+
+#[test]
+fn malicious_advisories_get_their_own_finding_next_to_the_ordinary_ones() {
+    let client = FakeOsv::answering(&["MAL-1", "GHSA-1", "GHSA-2"])
+        .with_record(semver_record("MAL-1", &[], "LOW", "x", &[]))
+        .with_record(semver_record("GHSA-1", &[], "LOW", "x", &["2.0.0"]))
+        .with_record(semver_record("GHSA-2", &[], "LOW", "x", &["2.0.0"]));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    let mut got: Vec<_> = findings
+        .iter()
+        .map(|f| (f.rule_id.as_str(), f.advisories.len()))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [("osv/known-vulnerability", 2), ("osv/malicious-package", 1)]
+    );
+}
+
+#[test]
+fn an_allowlist_package_entry_hides_the_whole_grouped_finding() {
+    let repo = lockfile_repo();
+    let user = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let allow = write_user_allow(
+        user.path(),
+        "[[allow]]\nrule = \"osv/known-vulnerability\"\npackage = \"lodash\"\n",
+    );
+    let all: Vec<String> = (0..30).map(|i| format!("GHSA-{i:04}")).collect();
+    let mut client = FakeOsv::new(Box::new(move |qs| {
+        Ok(qs
+            .iter()
+            .map(|_| QueryAnswer {
+                ids: all.clone(),
+                next_page_token: None,
+            })
+            .collect())
+    }));
+    for i in 0..30 {
+        client = client.with_record(semver_record(
+            &format!("GHSA-{i:04}"),
+            &[],
+            "LOW",
+            "lodash",
+            &[],
+        ));
+    }
+    let report = scan(
+        repo.path(),
+        &allow,
+        OsvMode::Live,
+        &client,
+        &cache(cache_dir.path(), &FakeClock::new()),
+    );
+    assert!(report.findings().is_empty());
+    assert_eq!(report.suppressed().len(), 1);
+    assert_eq!(report.suppressed()[0].finding.advisories.len(), 30);
+}
+
+#[test]
+fn a_fix_below_the_installed_version_is_not_a_target() {
+    let client = FakeOsv::answering(&["A"]).with_record(semver_record(
+        "A",
+        &[],
+        "LOW",
+        "x",
+        &["0.9.0", "2.0.0"],
+    ));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", None)]);
+    assert!(
+        findings[0].remediation.contains("Upgrade x to 2.0.0 "),
+        "{}",
+        findings[0].remediation
+    );
 }

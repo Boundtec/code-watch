@@ -297,6 +297,7 @@ fn finding(id: &str, severity: Severity, excerpt: &str) -> Finding {
         remediation: rule.remediation.into(),
         domain: None,
         package: None,
+        advisories: Vec::new(),
     }
 }
 

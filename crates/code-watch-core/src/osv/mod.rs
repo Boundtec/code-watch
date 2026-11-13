@@ -7,11 +7,13 @@ mod cargo;
 mod client;
 mod discover;
 mod go;
+mod group;
 mod layer;
 mod npm;
 mod package;
 mod pnpm;
 mod python;
+mod version;
 mod yarn;
 
 pub use advisory::{OsvRecord, Vuln};

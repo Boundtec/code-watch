@@ -180,6 +180,7 @@ fn unscanned_finding(s: &Skipped) -> Finding {
         remediation: "Read the file by hand before running anything in this repository.".into(),
         domain: None,
         package: None,
+        advisories: Vec::new(),
     }
 }
 
@@ -198,6 +199,7 @@ mod tests {
             remediation: String::new(),
             domain: None,
             package: None,
+            advisories: Vec::new(),
         }
     }
 

@@ -326,6 +326,7 @@ fn own_finding(id: &str, title: &str, excerpt: &str, remediation: &str) -> Findi
         remediation: remediation.into(),
         domain: None,
         package: None,
+        advisories: Vec::new(),
     }
 }
 
@@ -352,6 +353,7 @@ mod tests {
             remediation: String::new(),
             domain: None,
             package: None,
+            advisories: Vec::new(),
         }
     }
 
