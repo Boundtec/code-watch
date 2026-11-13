@@ -3,7 +3,7 @@ use std::fmt::Write;
 use serde::Serialize;
 
 use crate::allow::Suppressed;
-use crate::finding::{Finding, Layer};
+use crate::finding::{Finding, Layer, clean_text, sanitize};
 use crate::report::{LayerStatus, Report, Skipped, Verdict};
 
 /// Version of the `--json` shape; bump it on any breaking change to the output.
@@ -37,23 +37,32 @@ pub fn to_json(report: &Report) -> serde_json::Result<String> {
     serde_json::to_string_pretty(&view)
 }
 
+/// Text for a terminal that may carry repo-controlled characters (a path, a package name):
+/// escape sequences and bidi controls become `?`.
+pub fn terminal_safe(text: &str) -> String {
+    sanitize(text)
+}
+
+/// Renders the report for a terminal. Every string is cleaned here, at the boundary, because
+/// titles, paths and excerpts can all carry text from the scanned repository; the JSON output
+/// keeps the raw values.
 pub fn to_human(report: &Report) -> String {
     let mut out = String::new();
     for f in report.findings() {
         let place = match (&f.evidence.file, f.evidence.line) {
-            (Some(file), Some(line)) => format!(" {file}:{line}"),
-            (Some(file), None) => format!(" {file}"),
+            (Some(file), Some(line)) => format!(" {}:{line}", clean_text(file)),
+            (Some(file), None) => format!(" {}", clean_text(file)),
             _ => String::new(),
         };
         let _ = writeln!(
             out,
             "{:<5} {}{place}: {}",
             f.severity.to_string().to_uppercase(),
-            f.rule_id,
-            f.title
+            sanitize(&f.rule_id),
+            sanitize(&f.title)
         );
-        let _ = writeln!(out, "      evidence: {}", f.evidence.excerpt);
-        let _ = writeln!(out, "      fix: {}", f.remediation);
+        let _ = writeln!(out, "      evidence: {}", clean_text(&f.evidence.excerpt));
+        let _ = writeln!(out, "      fix: {}", sanitize(&f.remediation));
     }
     let layers: Vec<String> = report
         .layers()
@@ -68,11 +77,11 @@ pub fn to_human(report: &Report) -> String {
         let _ = writeln!(
             out,
             "rules skipped on this platform: {}",
-            report.skipped_rules().join(", ")
+            sanitize(&report.skipped_rules().join(", "))
         );
     }
     for w in report.allowlist_warnings() {
-        let _ = writeln!(out, "allowlist: {w}");
+        let _ = writeln!(out, "allowlist: {}", sanitize(w));
     }
     let hidden = report.suppressed().len();
     if hidden > 0 {
@@ -112,6 +121,46 @@ mod tests {
         assert!(text.contains("1 file not scanned\n"));
         assert!(text.contains("WARN  repo/unscanned-target package.json"));
         assert!(text.contains("verdict: warn"));
+    }
+
+    fn hostile_finding(title: &str, file: &str) -> Finding {
+        Finding {
+            rule_id: "r/x".into(),
+            severity: crate::finding::Severity::Warn,
+            layer: Layer::Rules,
+            title: title.into(),
+            evidence: crate::finding::Evidence::new(Some(file.into()), None, "e"),
+            remediation: "fix \u{1b}[2J".into(),
+            domain: None,
+            package: None,
+            advisories: vec![],
+        }
+    }
+
+    #[test]
+    fn human_output_cleans_every_repo_controlled_string_and_json_keeps_them() {
+        let esc = "\u{1b}]0;pwned\u{7}";
+        let skipped = vec![Skipped {
+            path: format!("dir{esc}/package.json"),
+            reason: crate::report::SkipReason::TooLarge,
+        }];
+        let finding = hostile_finding(&format!("pkg{esc}"), &format!("a{esc}/b"));
+        let report = Report::from_scan(vec![finding], skipped)
+            .with_allowlist(vec![], vec![format!("bad {esc}")]);
+        let text = to_human(&report);
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert!(text.contains("dir?]0;pwned?/package.json"));
+        assert!(text.contains("pkg?]0;pwned?"));
+        let json = to_json(&report).unwrap();
+        assert!(json.contains("\\u001b]0;pwned\\u0007"));
+    }
+
+    #[test]
+    fn terminal_safe_keeps_length_and_replaces_controls() {
+        assert_eq!(terminal_safe("a\u{1b}[0mb\n"), "a?[0mb?");
     }
 
     #[test]

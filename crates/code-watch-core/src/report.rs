@@ -29,7 +29,7 @@ pub enum Verdict {
 pub enum SkipReason {
     TooLarge,
     Unreadable,
-    NotUtf8,
+    SymlinkOutsideRepo,
     WalkError,
 }
 

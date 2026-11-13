@@ -5,7 +5,7 @@ id = "repo/npm-lifecycle-script"
 severity = "warn"
 title = "package.json runs a script automatically on install"
 remediation = "Read the script before running npm, pnpm or yarn install here, or install with --ignore-scripts."
-match = { kind = "json_pointer", files = ["**/package.json"], pointers = ["/scripts/preinstall", "/scripts/install", "/scripts/postinstall"] }
+match = { kind = "json_pointer", files = ["**/package.json"], pointers = ["/scripts/preinstall", "/scripts/install", "/scripts/postinstall", "/scripts/prepare", "/scripts/preprepare", "/scripts/postprepare"] }
 
 [[rule]]
 id = "repo/vscode-folderopen-task"
