@@ -120,6 +120,10 @@ impl Env {
         {
             std::os::unix::fs::symlink(find_tool(tool), bin.join(tool)).unwrap();
         }
+        // GNU tar runs gzip from PATH; bsdtar links it in.
+        if find_tool_opt("gzip") {
+            std::os::unix::fs::symlink(find_tool("gzip"), bin.join("gzip")).unwrap();
+        }
         bin.display().to_string()
     }
 

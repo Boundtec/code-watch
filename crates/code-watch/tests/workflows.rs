@@ -75,6 +75,30 @@ fn publish_runs_only_for_tags_and_needs_every_build() {
 }
 
 #[test]
+fn a_tag_off_main_is_refused_before_anything_is_built() {
+    let wf = load("release.yaml");
+    let build = steps(&wf["jobs"]["build"]);
+    let gate = build
+        .iter()
+        .position(|s| {
+            s["run"]
+                .as_str()
+                .is_some_and(|r| r.contains("merge-base --is-ancestor \"$GITHUB_SHA\" origin/main"))
+        })
+        .expect("release build has no ancestry check");
+    let first_build = build
+        .iter()
+        .position(|s| s["run"].as_str().is_some_and(|r| r.contains("cargo build")))
+        .unwrap();
+    assert!(
+        gate < first_build,
+        "ancestry check must run before the build"
+    );
+    assert_eq!(build[gate]["if"].as_str(), Some("github.ref_type == 'tag'"));
+    assert_eq!(build[0]["with"]["fetch-depth"].as_i64(), Some(0));
+}
+
+#[test]
 fn every_checkout_drops_credentials() {
     let mut seen = 0;
     for (name, wf) in workflows() {

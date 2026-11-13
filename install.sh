@@ -6,9 +6,16 @@
 # CODE_WATCH_INSTALL_DIR  where to put the binary (default: $HOME/.local/bin)
 # CODE_WATCH_BASE_URL     releases root, for tests and mirrors only
 #                         (default: https://github.com/Boundtec/code-watch/releases)
+#                         The default URL is fetched over HTTPS only (TLS 1.2+); an override may use any scheme.
 set -eu
 
-base_url=${CODE_WATCH_BASE_URL:-https://github.com/Boundtec/code-watch/releases}
+if [ -n "${CODE_WATCH_BASE_URL:-}" ]; then
+    base_url=$CODE_WATCH_BASE_URL
+    secure_only=
+else
+    base_url=https://github.com/Boundtec/code-watch/releases
+    secure_only=1
+fi
 install_dir=${CODE_WATCH_INSTALL_DIR:-${HOME:?HOME is not set}/.local/bin}
 
 fail() {
@@ -52,7 +59,11 @@ trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
 download() {
-    curl -fsSL --connect-timeout 15 --max-time 120 -o "$2" "$1" || fail "download failed: $1"
+    if [ -n "$secure_only" ]; then
+        curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 120 -o "$2" "$1" || fail "download failed: $1"
+    else
+        curl -fsSL --connect-timeout 15 --max-time 120 -o "$2" "$1" || fail "download failed: $1"
+    fi
 }
 
 download "$release_url/SHA256SUMS" "$tmp/SHA256SUMS"
