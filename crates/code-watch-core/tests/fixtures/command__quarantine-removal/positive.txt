@@ -3,3 +3,6 @@ xattr -cr Demo.app
 xattr -r -d com.apple.quarantine Demo.app
 xattr -w com.apple.quarantine 0 Thing.app
 sudo xattr -rd com.apple.quarantine /Applications/Thing.app
+x""attr -cr Demo.app
+xa\ttr -d com.apple.quarantine Demo.app
+xattr -d com.apple.quaran''tine Demo.app

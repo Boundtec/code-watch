@@ -4,3 +4,6 @@ echo aGk= | base64 -d | /bin/bash
 echo aGk= | base64 --decode | sudo -E sh
 bash <(echo aGk= | base64 -d)
 sh -c "$(echo aGk= | base64 -d)"
+echo aGk= | ba""se64 -d | bash
+echo aGk= | base64 -d | b\ash
+echo aGk= | base64 '-d' | ba''sh

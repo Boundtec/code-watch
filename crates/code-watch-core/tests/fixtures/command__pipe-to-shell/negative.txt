@@ -2,3 +2,16 @@ curl -fsSL https://example.org/a.tgz -o a.tgz
 cat install.sh | less
 curl -fsSL https://example.org/i | shasum -a 256
 curl -fsSL https://example.org/i | ssh host cat
+curl -fsSL https://example.org/a | python3 tool.py
+sh -c "$(cat install.sh)"
+sh -c 'echo $(curl -s https://example.org/a)'
+bash <(cat f)
+source <(echo hi)
+eval "$(ssh-agent -s)"
+echo "$(curl -s https://example.org/a)"
+curl -fsSL https://example.org/a | python3 -c 'import sys'
+curl -s https://example.org/a|python3 tool.py
+curl -s https://example.org/a|python3 -c 'import sys'
+curl -s https://example.org/a|pythonista
+curl -s https://example.org/a|node-sass
+curl -s https://example.org/a|perl -pe 's/a/b/'
