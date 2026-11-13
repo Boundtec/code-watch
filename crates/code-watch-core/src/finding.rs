@@ -19,6 +19,7 @@ pub enum Layer {
     Rules,
     Osv,
     Llm,
+    Download,
 }
 
 display_as_wire_name!(Severity, Layer);

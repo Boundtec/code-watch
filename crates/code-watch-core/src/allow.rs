@@ -197,7 +197,7 @@ enum Decision {
 }
 
 fn suppressible(f: &Finding) -> bool {
-    matches!(f.layer, Layer::Rules | Layer::Osv)
+    matches!(f.layer, Layer::Rules | Layer::Osv | Layer::Download)
         && !f.rule_id.starts_with("allowlist/")
         && f.rule_id != "repo/unscanned-target"
         && f.rule_id != crate::osv::RULE_UNPARSED
@@ -677,6 +677,16 @@ mod tests {
         );
         assert_eq!(a.kept.len(), 3);
         assert!(a.suppressed.is_empty());
+    }
+
+    #[test]
+    fn a_download_finding_can_be_allowed() {
+        let mut d = finding("download/x", Severity::Block);
+        d.layer = Layer::Download;
+        let a =
+            lists("[[allow]]\nrule = \"download/x\"\n", "").apply(vec![d], &known(&["download/x"]));
+        assert!(a.kept.is_empty());
+        assert_eq!(a.suppressed.len(), 1);
     }
 
     #[test]
