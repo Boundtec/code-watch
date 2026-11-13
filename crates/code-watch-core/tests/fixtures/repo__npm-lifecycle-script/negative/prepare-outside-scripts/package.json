@@ -1,0 +1,1 @@
+{"name":"demo","prepare":"echo hello","scripts":{"test":"echo ok"}}

