@@ -1,7 +1,7 @@
 //! What counts as a script reader and a decoder: the one table the download rule and the
 //! base64 rule both use.
 
-use super::parse::{ProcKind, Simple, Stage};
+use super::parse::{ProcKind, Simple, Stage, basename};
 
 pub const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "ash",
@@ -48,9 +48,13 @@ pub fn simple_reads_script(simple: &Simple) -> bool {
 }
 
 fn program_reads_script(simple: &Simple) -> bool {
-    let Some(program) = simple.program() else {
+    let Some(index) = simple.program_index() else {
         return false;
     };
+    if simple.words[index].text.contains(['$', '`']) {
+        return true;
+    }
+    let program = basename(&simple.words[index].text);
     if is_shell(program) {
         return true;
     }
@@ -92,6 +96,17 @@ fn is_inline_code_flag(arg: &str, code_flags: &str) -> bool {
         || arg == "--eval"
 }
 
+/// The shell text of a git alias definition: `!cmd` as the value of `git config alias.x` or
+/// the part after `=` in `git -c alias.x=!cmd`.
+pub fn git_alias_script(arg: &str) -> Option<&str> {
+    arg.strip_prefix('!').or_else(|| {
+        let (name, value) = arg.split_once('=')?;
+        name.starts_with("alias.")
+            .then_some(value)?
+            .strip_prefix('!')
+    })
+}
+
 /// A program that runs text it is given: a shell with `-c`, or `eval`.
 pub fn runs_text(program: &str) -> bool {
     is_shell(program) || program == "eval"
@@ -106,21 +121,82 @@ pub fn is_dash_c(arg: &str) -> bool {
     arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c')
 }
 
-/// A command that turns an encoded payload back into bytes: `base64 -d`/`-D`/`--decode`
-/// (also in a cluster such as `-di`) and `xxd -r`.
+/// A command that turns an encoded payload back into bytes.
+struct Decoder {
+    program: &'static str,
+    /// The first argument that selects the mode (`openssl enc`).
+    subcommand: Option<&'static str>,
+    /// The short flags may be clustered (`base64 -di`).
+    clustered: bool,
+    /// Every group needs one of its flags.
+    flags: &'static [&'static [&'static str]],
+}
+
+const DECODERS: &[Decoder] = &[
+    Decoder {
+        program: "base64",
+        subcommand: None,
+        clustered: true,
+        flags: &[&["-d", "-D", "--decode"]],
+    },
+    Decoder {
+        program: "base32",
+        subcommand: None,
+        clustered: true,
+        flags: &[&["-d", "--decode"]],
+    },
+    Decoder {
+        program: "b64decode",
+        subcommand: None,
+        clustered: true,
+        flags: &[&["-r"]],
+    },
+    Decoder {
+        program: "xxd",
+        subcommand: None,
+        clustered: true,
+        flags: &[&["-r", "-revert"]],
+    },
+    Decoder {
+        program: "openssl",
+        subcommand: Some("base64"),
+        clustered: false,
+        flags: &[&["-d", "-decode"]],
+    },
+    Decoder {
+        program: "openssl",
+        subcommand: Some("enc"),
+        clustered: false,
+        flags: &[&["-d", "-decode"], &["-base64", "-a", "-A"]],
+    },
+];
+
 pub fn is_decoder(simple: &Simple) -> bool {
-    let flag_letters = |letters: &str| {
-        simple.arg_texts().any(|a| {
-            a.strip_prefix('-')
-                .filter(|c| !c.starts_with('-'))
-                .is_some_and(|cluster| cluster.chars().any(|c| letters.contains(c)))
-        })
+    let Some(program) = simple.program() else {
+        return false;
     };
-    match simple.program() {
-        Some("base64") => flag_letters("dD") || simple.arg_texts().any(|a| a == "--decode"),
-        Some("xxd") => flag_letters("r") || simple.arg_texts().any(|a| a == "-revert"),
-        _ => false,
-    }
+    let args: Vec<&str> = simple.arg_texts().collect();
+    DECODERS
+        .iter()
+        .filter(|d| d.program == program)
+        .filter(|d| d.subcommand.is_none_or(|sub| args.first() == Some(&sub)))
+        .any(|d| {
+            d.flags
+                .iter()
+                .all(|group| args.iter().any(|a| matches_flag(a, group, d.clustered)))
+        })
+}
+
+fn matches_flag(arg: &str, group: &[&str], clustered: bool) -> bool {
+    group.iter().any(|flag| {
+        arg == *flag
+            || clustered
+                && flag.len() == 2
+                && arg
+                    .strip_prefix('-')
+                    .filter(|cluster| !cluster.starts_with('-'))
+                    .is_some_and(|cluster| cluster.contains(&flag[1..]))
+    })
 }
 
 #[cfg(test)]
@@ -182,6 +258,15 @@ mod tests {
     }
 
     #[test]
+    fn git_alias_values_starting_with_a_bang_are_shell_text() {
+        assert_eq!(git_alias_script("!sh -c x"), Some("sh -c x"));
+        assert_eq!(git_alias_script("alias.x=!sh"), Some("sh"));
+        assert_eq!(git_alias_script("alias.x=status"), None);
+        assert_eq!(git_alias_script("core.pager=!x"), None);
+        assert_eq!(git_alias_script("status"), None);
+    }
+
+    #[test]
     fn decoders_are_found_by_their_flags() {
         for cmd in [
             "base64 -d",
@@ -190,13 +275,28 @@ mod tests {
             "base64 --decode",
             "xxd -r -p",
             "xxd -r",
+            "base32 -d",
+            "b64decode -r",
+            "openssl base64 -d",
+            "openssl enc -d -base64",
+            "openssl enc -a -d -aes-256-cbc",
+            "openssl enc -base64 -d",
         ] {
             let Stage::Simple(s) = first_stage(cmd) else {
                 panic!("{cmd}")
             };
             assert!(is_decoder(&s), "{cmd}");
         }
-        for cmd in ["base64", "base64 file", "xxd -p", "echo -d"] {
+        for cmd in [
+            "base64",
+            "base64 file",
+            "xxd -p",
+            "echo -d",
+            "openssl enc -aes-256-cbc -pbkdf2",
+            "openssl enc -d -aes-256-cbc",
+            "openssl base64",
+            "openssl dgst -sha256 -d",
+        ] {
             let Stage::Simple(s) = first_stage(cmd) else {
                 panic!("{cmd}")
             };

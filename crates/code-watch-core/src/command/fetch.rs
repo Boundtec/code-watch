@@ -56,9 +56,7 @@ fn fetch_domain(command: &str) -> Option<String> {
 }
 
 struct Flags {
-    /// Single letters that take no value.
     short_plain: &'static str,
-    /// Single letters whose value is the rest of the word or the next word; never a URL.
     short_value: &'static str,
     long_plain: &'static [&'static str],
     long_value: &'static [&'static str],

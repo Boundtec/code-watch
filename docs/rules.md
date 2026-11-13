@@ -95,11 +95,10 @@ is judged as running.
 - `command/nesting-too-deep` (warn; block when the text left at the limit holds a shell, `eval` or script reader): `$(...)`, `<(...)`, `sh -c`
   and `eval` text nested more than three levels.
 - `command/hidden-program-into-shell` (warn) fires when a pipeline ends in a script reader and a command's program word still holds a `$`
-  or a backtick after unquoting (`$'\x63url'`, `$c`, `$(echo curl)`, also a `$HOME/bin/tool` prefix), and when `eval` gets a variable
+  or a backtick after unquoting (`$c`, `$(echo curl)`, also a `$HOME/bin/tool` prefix), and when `eval` gets a variable
   (`eval "$x"`). `eval "$(...)"` does not fire: the substitution is analysed as its own text.
 - `command/launchagent-write` matches `Library/LaunchAgents` and `Library/LaunchDaemons` as path components, not as a substring.
 
-What they do not see, by design: variables (`$c x`), command substitutions inside `${...}` defaults and `[[ ]]` tests, fetchers other than `curl` and `wget`, and the script an `osascript` reads from a file or
-standard input. A lookalike is one edit away (or the same name under another suffix, or the same Unicode skeleton) from
+What they do not see: values only known at run time, such as variables, are not followed, and other layers and your own review still apply. A lookalike is one edit away (or the same name under another suffix, or the same Unicode skeleton) from
 the known list; `SIBLINGS` in `domains.rs` lists real sites that must never be flagged, so a new known domain that
 collides with a real one gets a negative fixture and a sibling entry.

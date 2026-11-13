@@ -8,7 +8,6 @@ use ignore::WalkBuilder;
 
 use crate::allow::Allowlists;
 use crate::command;
-use crate::finding::Finding;
 use crate::osv::{self, Cache, OsvClient, OsvMode, RULE_IDS};
 use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{HEAD_BYTES, RuleError, RuleSet, Target};

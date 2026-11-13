@@ -19,7 +19,8 @@ pub struct Occurrence {
 /// Why the analysis could not look at some text.
 pub enum Limit {
     Unparsable,
-    /// `MAX_DEPTH` reached; `reaches_shell` says the text left unread holds a script reader or `eval`.
+    /// `MAX_DEPTH` reached; `reaches_shell` says the text left unread holds a script reader or `eval`,
+    /// or is itself run as a script.
     TooDeep {
         reaches_shell: bool,
     },
@@ -58,7 +59,7 @@ pub fn flatten(command: &str) -> Flat {
 fn text(source: &str, depth: usize, feeds: bool, flat: &mut Flat) {
     let parsed = parse::parse(source);
     if depth >= MAX_DEPTH {
-        let reaches_shell = parsed.as_ref().is_ok_and(|p| holds_runner(p));
+        let reaches_shell = feeds || parsed.as_ref().is_ok_and(|p| holds_runner(p));
         flat.limits.push(Limit::TooDeep { reaches_shell });
         return;
     }
@@ -71,7 +72,7 @@ fn text(source: &str, depth: usize, feeds: bool, flat: &mut Flat) {
 fn nested_pipelines(pipelines: &[Pipeline], depth: usize, feeds: bool, flat: &mut Flat) {
     if depth >= MAX_DEPTH {
         flat.limits.push(Limit::TooDeep {
-            reaches_shell: holds_runner(pipelines),
+            reaches_shell: feeds || holds_runner(pipelines),
         });
     } else {
         walk(pipelines, depth, feeds, flat);
@@ -159,6 +160,11 @@ fn simple_children(simple: &Simple, depth: usize, flat: &mut Flat) {
     if runs {
         run_text(&script_words, depth, flat);
     }
+    if program == Some("git") {
+        for script in simple.arg_texts().filter_map(readers::git_alias_script) {
+            text(script, depth + 1, false, flat);
+        }
+    }
     let reads_files = program.is_some_and(reads_script_files);
     for proc in &simple.attached.procs {
         let feeds = reads_files && proc.kind == ProcKind::Read;
@@ -166,16 +172,13 @@ fn simple_children(simple: &Simple, depth: usize, flat: &mut Flat) {
     }
     let reads_here_text = program.is_some_and(readers::is_shell);
     for here in &simple.attached.here_texts {
-        for sub in &here.subs {
-            text(
-                &sub.body,
-                depth + 1,
-                reads_here_text && here.whole_substitution,
-                flat,
-            );
+        let body = &here.body;
+        let spliced = reads_here_text && (here.expands || body.whole_substitution);
+        for sub in &body.subs {
+            text(&sub.body, depth + 1, spliced, flat);
         }
-        if reads_here_text && !here.whole_substitution {
-            text(&here.text, depth + 1, false, flat);
+        if reads_here_text && !body.whole_substitution {
+            text(&body.text, depth + 1, false, flat);
         }
     }
     for sub in &simple.attached.subs {

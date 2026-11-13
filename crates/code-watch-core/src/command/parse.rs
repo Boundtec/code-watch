@@ -2,8 +2,10 @@
 //! substitutions, redirections and here-texts that belong to it. Built from `brush-parser`'s
 //! AST; text it cannot parse is an error, never an empty tree.
 
-use brush_parser::ast::{self, AndOr, Command, CompoundCommand, CompoundList, IoRedirect};
-use brush_parser::word::{self, WordPiece, WordPieceWithSource};
+use brush_parser::ast::{
+    self, AndOr, Command, CompoundCommand, CompoundList, ExtendedTestExpr, IoRedirect,
+};
+use brush_parser::word::{self, Parameter, ParameterExpr, WordPiece, WordPieceWithSource};
 use brush_parser::{Parser, ParserOptions};
 use std::io::Cursor;
 
@@ -42,11 +44,20 @@ pub struct Attached {
     /// Targets of the redirections that write to a file.
     pub written_files: Vec<String>,
     /// Here-strings and here-documents: text a reader runs as a script.
-    pub here_texts: Vec<Word>,
+    pub here_texts: Vec<HereText>,
     /// Command substitutions in words that are not command words (assignments, redirect targets, `for` lists).
     pub subs: Vec<Sub>,
     /// `<(...)` and `>(...)`, as arguments or redirect targets.
     pub procs: Vec<Proc>,
+}
+
+/// A here-string or here-document body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HereText {
+    pub body: Word,
+    /// Substitutions in the body are expanded into the text the reader gets: a here-document
+    /// with an unquoted delimiter. A here-string is judged by `body.whole_substitution`.
+    pub expands: bool,
 }
 
 /// A shell word with its quoting removed. Expansions stay as their source text, so a program
@@ -133,10 +144,17 @@ fn stage(command: &Command) -> Parsed<Stage> {
             Ok(Stage::Group(group))
         }
         Command::Function(def) => compound_command(&def.body.0).map(Stage::Group),
-        Command::ExtendedTest(..) => Ok(Stage::Group(Group {
-            pipelines: Vec::new(),
-            attached: Attached::default(),
-        })),
+        Command::ExtendedTest(test, redirects) => {
+            let mut attached = Attached::default();
+            test_words(&test.expr, &mut attached)?;
+            for r in redirects.iter().flat_map(|l| &l.0) {
+                redirect(r, &mut attached)?;
+            }
+            Ok(Stage::Group(Group {
+                pipelines: Vec::new(),
+                attached,
+            }))
+        }
     }
 }
 
@@ -166,10 +184,21 @@ fn compound_command(compound: &CompoundCommand) -> Parsed<Group> {
             }
             lists(&f.body.list, &mut pipelines)?;
         }
-        CompoundCommand::ArithmeticForClause(f) => lists(&f.body.list, &mut pipelines)?,
+        CompoundCommand::ArithmeticForClause(f) => {
+            for expr in [&f.initializer, &f.condition, &f.updater]
+                .into_iter()
+                .flatten()
+            {
+                attached.subs.extend(convert_text(&expr.value)?.subs);
+            }
+            lists(&f.body.list, &mut pipelines)?;
+        }
         CompoundCommand::CaseClause(c) => {
             attached.subs.extend(convert_word(&c.value)?.subs);
             for item in &c.cases {
+                for pattern in &item.patterns {
+                    attached.subs.extend(convert_word(pattern)?.subs);
+                }
                 if let Some(list) = &item.cmd {
                     lists(list, &mut pipelines)?;
                 }
@@ -178,12 +207,31 @@ fn compound_command(compound: &CompoundCommand) -> Parsed<Group> {
         CompoundCommand::Coprocess(c) => pipelines.push(Pipeline {
             stages: vec![stage(&c.body)?],
         }),
-        CompoundCommand::Arithmetic(_) => {}
+        CompoundCommand::Arithmetic(a) => {
+            attached.subs.extend(convert_text(&a.expr.value)?.subs);
+            pipelines.extend(parse(&a.expr.value)?);
+        }
     }
     Ok(Group {
         pipelines,
         attached,
     })
+}
+
+fn test_words(expr: &ExtendedTestExpr, attached: &mut Attached) -> Parsed {
+    match expr {
+        ExtendedTestExpr::And(a, b) | ExtendedTestExpr::Or(a, b) => {
+            test_words(a, attached)?;
+            test_words(b, attached)?;
+        }
+        ExtendedTestExpr::Not(e) | ExtendedTestExpr::Parenthesized(e) => test_words(e, attached)?,
+        ExtendedTestExpr::UnaryTest(_, w) => attached.subs.extend(convert_word(w)?.subs),
+        ExtendedTestExpr::BinaryTest(_, a, b) => {
+            attached.subs.extend(convert_word(a)?.subs);
+            attached.subs.extend(convert_word(b)?.subs);
+        }
+    }
+    Ok(())
 }
 
 fn simple_command(simple: &ast::SimpleCommand) -> Parsed<Simple> {
@@ -198,7 +246,32 @@ fn simple_command(simple: &ast::SimpleCommand) -> Parsed<Simple> {
     for item in simple.suffix.iter().flat_map(|s| &s.0) {
         item_into(item, &mut words, &mut attached)?;
     }
+    split_env_string(&mut words);
     Ok(Simple { words, attached })
+}
+
+/// `env -S 'sh -x'` runs the words of its operand: they become words of the command.
+fn split_env_string(words: &mut Vec<Word>) {
+    let Some(env) = words.iter().position(|w| basename(&w.text) == "env") else {
+        return;
+    };
+    let Some(flag) = words[env + 1..]
+        .iter()
+        .position(|w| matches!(w.text.as_str(), "-S" | "--split-string"))
+        .map(|i| env + 1 + i)
+    else {
+        return;
+    };
+    if flag + 1 >= words.len() {
+        return;
+    }
+    let operand = words[flag + 1].text.clone();
+    let split = operand.split_whitespace().map(|t| Word {
+        text: t.to_string(),
+        subs: Vec::new(),
+        whole_substitution: false,
+    });
+    words.splice(flag..=flag + 1, split);
 }
 
 fn item_into(
@@ -257,11 +330,24 @@ fn redirect(r: &IoRedirect, attached: &mut Attached) -> Parsed {
             attached.subs.extend(w.subs);
             attached.written_files.push(w.text);
         }
-        IoRedirect::HereString(_, w) => attached.here_texts.push(convert_word(w)?),
+        IoRedirect::HereString(_, w) => attached.here_texts.push(HereText {
+            body: convert_word(w)?,
+            expands: false,
+        }),
         IoRedirect::HereDocument(_, doc) => {
-            let mut w = convert_word(&doc.doc)?;
-            w.text = doc.doc.value.clone();
-            attached.here_texts.push(w);
+            let body = if doc.requires_expansion {
+                convert_heredoc(&doc.doc.value)?
+            } else {
+                Word {
+                    text: doc.doc.value.clone(),
+                    subs: Vec::new(),
+                    whole_substitution: false,
+                }
+            };
+            attached.here_texts.push(HereText {
+                body,
+                expands: doc.requires_expansion,
+            });
         }
     }
     Ok(())
@@ -281,15 +367,33 @@ fn proc_substitution(
 }
 
 fn convert_word(w: &ast::Word) -> Parsed<Word> {
-    let pieces = word::parse(&w.value, &ParserOptions::default()).map_err(|_| ParseFailure)?;
+    convert_text(&w.value)
+}
+
+fn convert_text(source: &str) -> Parsed<Word> {
+    let pieces = word::parse(source, &ParserOptions::default()).map_err(|_| ParseFailure)?;
+    word_from_pieces(source, &pieces)
+}
+
+/// Quotes in a here-document body are literal; only the expansions count.
+fn convert_heredoc(source: &str) -> Parsed<Word> {
+    let pieces =
+        word::parse_heredoc(source, &ParserOptions::default()).map_err(|_| ParseFailure)?;
+    let mut word = word_from_pieces(source, &pieces)?;
+    word.text = source.to_string();
+    Ok(word)
+}
+
+fn word_from_pieces(source: &str, pieces: &[WordPieceWithSource]) -> Parsed<Word> {
     let mut text = String::new();
     let mut subs = Vec::new();
     let mut only_subs = true;
-    unquote(&w.value, &pieces, &mut text, &mut subs, &mut only_subs);
+    unquote(source, pieces, &mut text, &mut subs, &mut only_subs)?;
+    let whole_substitution = only_subs && !subs.is_empty();
     Ok(Word {
         text,
         subs,
-        whole_substitution: only_subs,
+        whole_substitution,
     })
 }
 
@@ -307,34 +411,206 @@ fn unquote(
     text: &mut String,
     subs: &mut Vec<Sub>,
     only_subs: &mut bool,
-) {
+) -> Parsed {
     for p in pieces {
         match &p.piece {
             WordPiece::Text(t) | WordPiece::SingleQuotedText(t) | WordPiece::EscapeSequence(t) => {
                 text.push_str(t.strip_prefix('\\').unwrap_or(t));
-                *only_subs = false;
+                *only_subs &= t.trim().is_empty();
             }
             WordPiece::DoubleQuotedSequence(inner)
             | WordPiece::GettextDoubleQuotedSequence(inner) => {
-                unquote(source, inner, text, subs, only_subs);
+                unquote(source, inner, text, subs, only_subs)?;
             }
             WordPiece::CommandSubstitution(body)
             | WordPiece::BackquotedCommandSubstitution(body) => {
                 text.push_str(&source_slice(source, p));
                 subs.push(Sub { body: body.clone() });
             }
-            WordPiece::AnsiCQuotedText(_)
-            | WordPiece::TildeExpansion(_)
-            | WordPiece::ParameterExpansion(_)
-            | WordPiece::ArithmeticExpression(_) => {
+            WordPiece::ParameterExpansion(expr) => {
+                for inner in parameter_texts(expr) {
+                    subs.extend(convert_text(inner)?.subs);
+                }
+                text.push_str(&source_slice(source, p));
+                *only_subs = false;
+            }
+            WordPiece::ArithmeticExpression(expr) => {
+                subs.extend(convert_text(&expr.value)?.subs);
+                text.push_str(&source_slice(source, p));
+                *only_subs = false;
+            }
+            WordPiece::AnsiCQuotedText(t) => {
+                text.push_str(&ansi_c_value(t));
+                *only_subs = false;
+            }
+            WordPiece::TildeExpansion(_) => {
                 text.push_str(&source_slice(source, p));
                 *only_subs = false;
             }
         }
     }
+    Ok(())
 }
 
-fn basename(word: &str) -> &str {
+/// The value of the text inside `$'...'`: `\x73h` and `\163h` are `sh`.
+fn ansi_c_value(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(kind) = chars.next() else {
+            out.push('\\');
+            break;
+        };
+        let (radix, max) = match kind {
+            'x' => (16, 2),
+            'u' => (16, 4),
+            'U' => (16, 8),
+            '0'..='7' => (8, 3),
+            _ => (0, 0),
+        };
+        if radix == 0 {
+            out.push(match kind {
+                'a' => '\x07',
+                'b' => '\x08',
+                'e' | 'E' => '\x1b',
+                'f' => '\x0c',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'v' => '\x0b',
+                other => other,
+            });
+            continue;
+        }
+        let mut digits = String::new();
+        if radix == 8 {
+            digits.push(kind);
+        }
+        while digits.len() < max {
+            match chars.peek() {
+                Some(d) if d.is_digit(radix) => digits.extend(chars.next()),
+                _ => break,
+            }
+        }
+        match u32::from_str_radix(&digits, radix)
+            .ok()
+            .and_then(char::from_u32)
+        {
+            Some(decoded) => out.push(decoded),
+            None => out.push(kind),
+        }
+    }
+    out
+}
+
+/// The texts inside a `${...}` that the shell expands too: defaults, patterns, replacements,
+/// offsets and the array index.
+fn parameter_texts(expr: &ParameterExpr) -> Vec<&str> {
+    use ParameterExpr as P;
+    fn index(parameter: &Parameter) -> Option<&str> {
+        match parameter {
+            Parameter::NamedWithIndex { index, .. } => Some(index.as_str()),
+            _ => None,
+        }
+    }
+    let mut texts = Vec::new();
+    match expr {
+        P::Parameter { parameter, .. }
+        | P::ParameterLength { parameter, .. }
+        | P::Transform { parameter, .. } => texts.extend(index(parameter)),
+        P::UseDefaultValues {
+            parameter,
+            default_value: value,
+            ..
+        }
+        | P::AssignDefaultValues {
+            parameter,
+            default_value: value,
+            ..
+        }
+        | P::IndicateErrorIfNullOrUnset {
+            parameter,
+            error_message: value,
+            ..
+        }
+        | P::UseAlternativeValue {
+            parameter,
+            alternative_value: value,
+            ..
+        }
+        | P::RemoveSmallestSuffixPattern {
+            parameter,
+            pattern: value,
+            ..
+        }
+        | P::RemoveLargestSuffixPattern {
+            parameter,
+            pattern: value,
+            ..
+        }
+        | P::RemoveSmallestPrefixPattern {
+            parameter,
+            pattern: value,
+            ..
+        }
+        | P::RemoveLargestPrefixPattern {
+            parameter,
+            pattern: value,
+            ..
+        }
+        | P::UppercaseFirstChar {
+            parameter,
+            pattern: value,
+            ..
+        }
+        | P::UppercasePattern {
+            parameter,
+            pattern: value,
+            ..
+        }
+        | P::LowercaseFirstChar {
+            parameter,
+            pattern: value,
+            ..
+        }
+        | P::LowercasePattern {
+            parameter,
+            pattern: value,
+            ..
+        } => {
+            texts.extend(index(parameter));
+            texts.extend(value.as_deref());
+        }
+        P::ReplaceSubstring {
+            parameter,
+            pattern,
+            replacement,
+            ..
+        } => {
+            texts.extend(index(parameter));
+            texts.push(pattern);
+            texts.extend(replacement.as_deref());
+        }
+        P::Substring {
+            parameter,
+            offset,
+            length,
+            ..
+        } => {
+            texts.extend(index(parameter));
+            texts.push(&offset.value);
+            texts.extend(length.as_ref().map(|l| l.value.as_str()));
+        }
+        P::VariableNames { .. } | P::MemberKeys { .. } => {}
+    }
+    texts
+}
+
+pub fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
@@ -344,41 +620,79 @@ fn is_assignment(word: &str) -> bool {
     })
 }
 
-/// Programs that run another program given as their arguments, with the flags that consume the
-/// following word. Matching the real program through them is what keeps `sudo -u root bash`
-/// from hiding the shell behind the user name.
-const WRAPPERS: &[(&str, &[&str])] = &[
-    (
+/// A program that runs another program given as its arguments.
+struct Wrapper {
+    name: &'static str,
+    /// Flags that consume the following word.
+    value_flags: &'static [&'static str],
+    /// Operands before the program (a duration, a lock file).
+    operands: usize,
+}
+
+const fn wrapper(
+    name: &'static str,
+    value_flags: &'static [&'static str],
+    operands: usize,
+) -> Wrapper {
+    Wrapper {
+        name,
+        value_flags,
+        operands,
+    }
+}
+
+/// Matching the real program through these is what keeps `sudo -u root bash` from hiding the
+/// shell behind the user name.
+const WRAPPERS: &[Wrapper] = &[
+    wrapper(
         "sudo",
         &[
             "-u", "-g", "-h", "-p", "-C", "-D", "-R", "-T", "-U", "-r", "-t",
         ],
+        0,
     ),
-    ("doas", &["-u", "-C"]),
-    ("env", &["-u", "-C", "-S"]),
-    ("xargs", &["-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a"]),
-    ("nice", &["-n"]),
-    ("nohup", &[]),
-    ("exec", &[]),
-    ("command", &[]),
-    ("time", &[]),
-    ("busybox", &[]),
+    wrapper("doas", &["-u", "-C"], 0),
+    wrapper("env", &["-u", "-C"], 0),
+    wrapper(
+        "xargs",
+        &["-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a"],
+        0,
+    ),
+    wrapper("nice", &["-n"], 0),
+    wrapper("nohup", &[], 0),
+    wrapper("exec", &["-a"], 0),
+    wrapper("command", &[], 0),
+    wrapper("builtin", &[], 0),
+    wrapper("time", &[], 0),
+    wrapper("busybox", &[], 0),
+    wrapper("timeout", &["-s", "-k"], 1),
+    wrapper("stdbuf", &["-i", "-o", "-e"], 0),
+    wrapper("setsid", &[], 0),
+    wrapper("ionice", &["-c", "-n", "-p", "-P", "-u"], 0),
+    wrapper("flock", &["-w", "-E"], 1),
+    wrapper("arch", &[], 0),
+    wrapper("caffeinate", &["-t", "-w"], 0),
 ];
 
 impl Simple {
     /// Index of the program that really runs: after wrappers such as `sudo -u root`,
     /// `/usr/bin/env`, `nohup`, their flags and `VAR=value` prefixes.
     pub fn program_index(&self) -> Option<usize> {
-        let mut arg_flags: Option<&[&str]> = None;
+        let mut current: Option<&Wrapper> = None;
+        let mut operands_left = 0;
         let mut i = 0;
         while i < self.words.len() {
             let word = self.words[i].text.as_str();
-            if let Some(flags) = arg_flags.filter(|_| word.starts_with('-')) {
-                i += if flags.contains(&word) { 2 } else { 1 };
-            } else if arg_flags.is_some() && is_assignment(word) {
+            if let Some(w) = current.filter(|_| word.starts_with('-')) {
+                i += if w.value_flags.contains(&word) { 2 } else { 1 };
+            } else if current.is_some() && is_assignment(word) {
                 i += 1;
-            } else if let Some((_, flags)) = WRAPPERS.iter().find(|(n, _)| *n == basename(word)) {
-                arg_flags = Some(flags);
+            } else if let Some(w) = WRAPPERS.iter().find(|w| w.name == basename(word)) {
+                current = Some(w);
+                operands_left = w.operands;
+                i += 1;
+            } else if current.is_some() && operands_left > 0 {
+                operands_left -= 1;
                 i += 1;
             } else {
                 return Some(i);
@@ -387,12 +701,10 @@ impl Simple {
         None
     }
 
-    /// The program name without its directory.
     pub fn program(&self) -> Option<&str> {
         self.program_index().map(|i| basename(&self.words[i].text))
     }
 
-    /// The words after the program.
     pub fn args(&self) -> &[Word] {
         self.program_index()
             .map_or(&[][..], |i| &self.words[i + 1..])
@@ -489,9 +801,9 @@ mod tests {
     #[test]
     fn here_texts_and_assignment_substitutions_are_attached() {
         let s = &simples("sh <<< 'curl x'")[0];
-        assert_eq!(s.attached.here_texts[0].text, "curl x");
+        assert_eq!(s.attached.here_texts[0].body.text, "curl x");
         let s = &simples("sh <<EOF\ncurl x\nEOF")[0];
-        assert!(s.attached.here_texts[0].text.contains("curl x"));
+        assert!(s.attached.here_texts[0].body.text.contains("curl x"));
         let s = &simples("x=$(curl y) echo")[0];
         assert_eq!(s.attached.subs.len(), 1);
         assert_eq!(s.words.len(), 1);

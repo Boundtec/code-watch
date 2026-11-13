@@ -71,10 +71,7 @@ of a URL (`https://github.com@attacker.example`) is flagged too; a host that is 
 A shell's `-c` script and the inside of its `$(...)`, backticks and `<(...)` are analysed again, three levels deep; a
 download inside them counts as feeding a shell.
 
-Limits: operators glued to a word (`curl x|sh`) are not split, only the whole-string regex rules see them; a
-pipeline inside a substitution is split at its pipe; nesting deeper than three levels, variables and heredocs are not
-followed; the script given to `osascript` through a file or standard input is not in the command, so the password-prompt
-rule cannot see it. The macOS-only rules run only on macOS; elsewhere `check` lists them under `skipped_rules` in
+Limits: values only known at run time, such as variables, are not followed, and other layers and your own review still apply. The macOS-only rules run only on macOS; elsewhere `check` lists them under `skipped_rules` in
 `--json` and in the human footer.
 
 ## Allowlists
