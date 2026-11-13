@@ -451,10 +451,17 @@ fn requirements_files_are_matched_by_one_glob_table() {
         "requirements/prod.txt",
         "svc/requirements.txt",
     ];
-    let ignored = ["requirements.md", "notes.txt", "other/base.txt", "req.txt"];
+    let ignored = [
+        "requirements.md",
+        "notes.txt",
+        "other/base.txt",
+        "req.txt",
+        "requirements/deeper/x.txt",
+    ];
     fs::create_dir_all(dir.path().join("requirements")).unwrap();
     fs::create_dir_all(dir.path().join("svc")).unwrap();
     fs::create_dir_all(dir.path().join("other")).unwrap();
+    fs::create_dir_all(dir.path().join("requirements/deeper")).unwrap();
     for (i, f) in read.iter().chain(&ignored).enumerate() {
         fs::write(dir.path().join(f), format!("pkg{i}==1.0\n")).unwrap();
     }

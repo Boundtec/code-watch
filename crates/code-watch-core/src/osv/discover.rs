@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 
 use super::cargo::CargoLock;
@@ -84,7 +84,11 @@ fn glob_table(sources: &[Box<dyn PackageSource>]) -> Vec<GlobSet> {
         .map(|s| {
             let mut builder = GlobSetBuilder::new();
             for pattern in s.globs() {
-                builder.add(Glob::new(pattern).expect("the built-in lockfile globs are valid"));
+                let glob = GlobBuilder::new(pattern)
+                    .literal_separator(true)
+                    .build()
+                    .expect("the built-in lockfile globs are valid");
+                builder.add(glob);
             }
             builder
                 .build()
