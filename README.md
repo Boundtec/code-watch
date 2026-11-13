@@ -4,7 +4,7 @@ A local guard that checks your machine **before** risky code runs: a repository 
 agent is about to execute, an install, a download. Open source (Apache-2.0), written in Rust, one binary for macOS and
 Linux. Windows is not supported.
 
-> Status: early. It ships the engine, the CLI, the repo and command rules, allowlists and the OSV layer. See
+> Status: early. It ships the engine, the CLI, the repo and command rules, allowlists, the OSV layer, agent adapters and PATH shims. See
 > [DESIGN.md](DESIGN.md) for the plan.
 
 ## Try it
@@ -36,7 +36,9 @@ commands are matched, not run.
 | `repo/vscode-folderopen-task` | block | a VS Code task that runs when the folder opens |
 | `repo/base64-into-shell` | block | base64 decoded straight into a shell in scripts and manifests |
 | `command/base64-into-shell` | block | the same in a command |
-| `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell or a stdin-reading interpreter, or run through `$(...)` or `<(...)` |
+| `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell or an interpreter that runs stdin or inline code, or run through `$(...)` or `<(...)` |
+| `command/unparsable` | warn / block | command text the parser rejects (unterminated quote or `$(`, dangling `\|\|`) or over 64 KiB; the readable parts are still checked, and block when a download reaching a shell is in the part that is not, or the text is built to stall the parser |
+| `command/nesting-too-deep` | warn / block | shells or substitutions nested past three levels; block when the text at the limit holds a shell |
 | `command/quarantine-removal` | warn | `xattr` removing or rewriting the macOS quarantine flag |
 | `command/lookalike-download-domain` | block / warn | `curl` or `wget` fetching from a domain that imitates a well-known one; block when piped into a shell, warn otherwise |
 | `command/hidden-program-into-shell` | warn | a pipeline into a shell whose program name is hidden behind `$` or a backtick (`$c x \| sh`), or `eval` of a variable |
@@ -55,11 +57,13 @@ Rules live in `crates/code-watch-core/rules/` and ship inside the binary. More i
 
 ## Before a command
 
-`check <command>` splits the command into words with `shlex`, then into pipeline segments on `|`, `;`, `&&`, `||` and
-`&`, so a rule can say "this download reaches that shell": a shell (or an interpreter such as `python3` run without a
-script file) anywhere downstream in the same pipeline counts, and wrappers such as `sudo -u root`, `env`, `nohup`,
-`exec`, `command`, `xargs`, `time` and `nice` are skipped to find the real program. The lookalike check reads the host
-of every argument of `curl` and `wget` (with or without `https://`, `--url=` included), decodes punycode, takes the
+`check <command>` parses the command with a real shell parser (`brush-parser`) and looks at every simple command of every
+list, pipeline, subshell, group, compound command, `$(...)`, backtick and `<(...)`, so a rule can say "this download
+reaches that shell": a shell, an interpreter such as `python3` run without a script file or with inline code (`-c`, `-e`),
+or `source /dev/stdin` anywhere downstream in the same pipeline counts, and wrappers such as `sudo -u root`, `doas`,
+`env`, `busybox`, `nohup`, `exec`, `command`, `xargs`, `time` and `nice` are skipped to find the real program. Text that
+cannot be parsed, a command over 64 KiB, or nesting deeper than three levels is a finding too, never a clean pass. The lookalike check reads the host
+of every argument of a fetch such as `curl`, `wget`, `http` or `aria2c` (with or without `https://`, `--url=` included), decodes punycode, takes the
 registrable domain from the public suffix list and compares it with a list of well-known domains by Unicode skeleton,
 a single edit, and the same name under another suffix. Real sibling sites (`gitlab.com`, `docker.io`) are never
 flagged. A known domain used as the leftmost labels of another one (`github.com.attacker.example`) or as the userinfo
@@ -67,10 +71,7 @@ of a URL (`https://github.com@attacker.example`) is flagged too; a host that is 
 A shell's `-c` script and the inside of its `$(...)`, backticks and `<(...)` are analysed again, three levels deep; a
 download inside them counts as feeding a shell.
 
-Limits: operators glued to a word (`curl x|sh`) are not split, only the whole-string regex rules see them; a
-pipeline inside a substitution is split at its pipe; nesting deeper than three levels, variables and heredocs are not
-followed; the script given to `osascript` through a file or standard input is not in the command, so the password-prompt
-rule cannot see it. The macOS-only rules run only on macOS; elsewhere `check` lists them under `skipped_rules` in
+Variables and `cd` that the command text sets itself are followed, and so are programs that run text or code (`ssh`, `docker run ... sh -c`, `python3 -c`, a file a download wrote and a later command runs). Limits: values only known at run time are not followed, and other layers and your own review still apply. The macOS-only rules run only on macOS; elsewhere `check` lists them under `skipped_rules` in
 `--json` and in the human footer.
 
 ## Allowlists

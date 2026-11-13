@@ -157,8 +157,30 @@ fn classify(raw: &str, ascii: &str) -> Verdict {
             || same_name(&unicode, known)
             || (unicode.len() >= MIN_FUZZY_LEN && strsim::damerau_levenshtein(&unicode, known) == 1)
             || label_imitates(&unicode, known)
+            || joined_imitates(ascii, &unicode, known)
     });
     found.map_or(Verdict::Clean, Verdict::Imitates)
+}
+
+/// Known domains whose label is at least this long are imitated by a longer label that holds
+/// the label whole (`rawgithubusercontent.com`); shorter ones would match unrelated words.
+const MIN_CONTAINED_LABEL_LEN: usize = 10;
+
+fn squash(text: &str) -> String {
+    text.chars().filter(|c| !matches!(c, '.' | '-')).collect()
+}
+
+/// The imitations that ignore dots and hyphens: a label that spells the whole known name with
+/// the suffix glued on or hyphenated (`github-com.io`), or a registrable label that holds a
+/// long known label (`raw-githubusercontent.com`).
+fn joined_imitates(ascii: &str, registrable: &str, known: &str) -> bool {
+    let whole = squash(known);
+    let known_label = squash(label_of(known));
+    let label = squash(label_of(registrable));
+    ascii.split('.').any(|l| squash(l) == whole)
+        || (known_label.chars().count() >= MIN_CONTAINED_LABEL_LEN
+            && label.len() > known_label.len()
+            && label.contains(&known_label))
 }
 
 fn same_name(a: &str, b: &str) -> bool {
@@ -335,5 +357,62 @@ mod tests {
     #[test]
     fn a_port_is_not_part_of_the_host() {
         assert_eq!(host("https://brew.sh:443/x").as_deref(), Some("brew.sh"));
+    }
+
+    #[test]
+    fn hyphen_and_concatenation_lookalikes_of_every_known_host_are_imitations() {
+        for known in KNOWN {
+            let (label, suffix) = known.split_once('.').unwrap();
+            let mut spellings = vec![
+                format!("{label}-{suffix}.io"),
+                format!("{label}{suffix}.io"),
+                format!("{label}-{suffix}.com.example.net"),
+            ];
+            if label.len() >= MIN_CONTAINED_LABEL_LEN {
+                spellings.push(format!("raw-{label}.{suffix}"));
+                spellings.push(format!("raw{label}.{suffix}"));
+            }
+            for host in spellings {
+                assert_eq!(imitated(&host), Some(*known), "{host}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_named_hyphen_lookalikes_are_imitations() {
+        assert_eq!(
+            imitated("raw-githubusercontent.com"),
+            Some("githubusercontent.com")
+        );
+        assert_eq!(
+            imitated("rawgithubusercontent.com"),
+            Some("githubusercontent.com")
+        );
+        assert_eq!(imitated("github-com.io"), Some("github.com"));
+    }
+
+    #[test]
+    fn real_hosts_stay_clean_next_to_the_hyphen_rules() {
+        for host in [
+            "github.com",
+            "raw.githubusercontent.com",
+            "gist.githubusercontent.com",
+            "objects.githubusercontent.com",
+            "pypi.org",
+            "files.pythonhosted.org",
+            "deb.nodesource.com",
+            "gitlab.com",
+            "github.io",
+            "foo.github.io",
+            "docker.io",
+            "get.docker.com",
+            "python.org",
+            "pypi.python.org",
+            "my-github-tools.dev",
+            "a-brew.dev",
+            "node-sass.dev",
+        ] {
+            assert_eq!(imitates(host), Verdict::Clean, "{host}");
+        }
     }
 }

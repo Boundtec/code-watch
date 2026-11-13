@@ -3,3 +3,4 @@ xattr -p com.apple.quarantine Demo.app
 xattr -d com.example.foo file
 xattr -l Thing.app
 xattr -p com.apple.quarantine Thing.app
+echo "xattr -cr Demo.app"
