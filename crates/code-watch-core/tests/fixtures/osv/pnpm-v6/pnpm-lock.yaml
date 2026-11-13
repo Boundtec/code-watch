@@ -1,0 +1,12 @@
+lockfileVersion: '6.0'
+packages:
+  /left-pad@1.3.0:
+    resolution: {integrity: sha512-x}
+    dev: false
+  /@scope/pkg@2.0.0(react@18.2.0)(react-dom@18.2.0):
+    resolution: {integrity: sha512-y}
+  /gitdep@1.0.0:
+    resolution: {tarball: https://codeload.github.com/x/gitdep/tar.gz/abc}
+    name: gitdep
+  /dirdep@file:../dirdep:
+    resolution: {directory: ../dirdep, type: directory}

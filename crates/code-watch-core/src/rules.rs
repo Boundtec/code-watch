@@ -307,6 +307,7 @@ impl Rule {
             remediation: self.remediation.clone(),
             domain: None,
             package: None,
+            advisories: Vec::new(),
         }
     }
 }

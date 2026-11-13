@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use anyhow::bail;
 use serde_json::{Value, json};
 
 use super::Agent;
@@ -29,6 +30,16 @@ pub fn snippet(agent: Agent, exe: &Path) -> anyhow::Result<(Value, &'static str)
             }]}}),
             "~/.cursor/hooks.json",
         ),
+        Agent::Gemini => (
+            json!({"hooks": {"BeforeTool": [{
+                "matcher": "run_shell_command",
+                "hooks": [{"type": "command", "name": "code-watch", "command": line("gemini")?}],
+            }]}}),
+            "~/.gemini/settings.json",
+        ),
+        Agent::Opencode => bail!(
+            "opencode has no settings snippet: use `code-watch install-adapter opencode <path>` or --print"
+        ),
         Agent::Codex => (
             json!({"hooks": {"PreToolUse": [{
                 "matcher": "^Bash$",
@@ -50,6 +61,7 @@ mod tests {
             (Agent::ClaudeCode, "claude-code"),
             (Agent::Cursor, "cursor"),
             (Agent::Codex, "codex"),
+            (Agent::Gemini, "gemini"),
         ] {
             let (value, file) = snippet(agent, exe).unwrap();
             let text = value.to_string();
@@ -67,6 +79,7 @@ mod tests {
             let (value, _) = snippet(agent, exe).unwrap();
             let node = match agent {
                 Agent::Cursor => &value["hooks"]["beforeShellExecution"][0],
+                Agent::Gemini => &value["hooks"]["BeforeTool"][0]["hooks"][0],
                 _ => &value["hooks"]["PreToolUse"][0]["hooks"][0],
             };
             (
@@ -78,6 +91,7 @@ mod tests {
             (Agent::ClaudeCode, "claude-code"),
             (Agent::Cursor, "cursor"),
             (Agent::Codex, "codex"),
+            (Agent::Gemini, "gemini"),
         ] {
             let (words, name) = command(agent, name);
             assert_eq!(

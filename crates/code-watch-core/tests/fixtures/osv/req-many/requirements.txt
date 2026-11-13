@@ -1,0 +1,15 @@
+# pinned
+requests==2.31.0
+Django_REST.framework==3.14.0  # normalised name
+numpy>=1.20
+flask==2.*
+-r other.txt
+-e ./local
+--index-url https://example.invalid/simple
+pkg @ https://example.invalid/pkg.tar.gz
+urllib3==2.0.7 \
+    --hash=sha256:aa \
+    --hash=sha256:bb
+two==1.0,<2.0
+pandas \
+    ==2.0.0

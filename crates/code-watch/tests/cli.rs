@@ -303,6 +303,83 @@ fn hostile_allowlist_text_never_puts_control_bytes_in_the_output() {
     }
 }
 
+fn cache_isolated(cache: &std::path::Path) -> Command {
+    let mut cmd = code_watch();
+    cmd.env("XDG_CACHE_HOME", cache)
+        .env("XDG_CONFIG_HOME", cache.join("config"));
+    cmd
+}
+
+fn cargo_lock_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.229\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n",
+    )
+    .unwrap();
+    repo
+}
+
+#[test]
+fn offline_scan_with_no_cache_skips_the_osv_layer_and_says_why() {
+    let cache = tempfile::tempdir().unwrap();
+    let repo = cargo_lock_repo();
+    let out = cache_isolated(cache.path())
+        .args(["--json", "scan", "--offline"])
+        .arg(repo.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["layers"]["osv"], "skipped");
+    assert_eq!(v["skipped_layers"]["osv"], "offline and no fresh cache");
+    assert_eq!(v["findings"][0]["rule_id"], "osv/unchecked-packages");
+    assert_eq!(v["findings"][0]["layer"], "osv");
+    assert_eq!(v["schema"], 1);
+}
+
+#[test]
+fn offline_scan_of_a_repo_without_lockfiles_ran_and_is_clean() {
+    let cache = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let out = cache_isolated(cache.path())
+        .args(["scan", "--offline"])
+        .arg(repo.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("osv ran"));
+}
+
+#[test]
+fn no_osv_turns_the_layer_off_and_never_reads_the_lockfiles() {
+    let cache = tempfile::tempdir().unwrap();
+    let repo = cargo_lock_repo();
+    let out = cache_isolated(cache.path())
+        .args(["scan", "--no-osv"])
+        .arg(repo.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("osv off"));
+}
+
+#[test]
+fn offline_and_no_osv_together_are_a_usage_error() {
+    let cache = tempfile::tempdir().unwrap();
+    let out = cache_isolated(cache.path())
+        .args(["scan", "--offline", "--no-osv", "."])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn check_leaves_the_osv_layer_off() {
+    let out = code_watch().args(["check", "ls"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("osv off"));
+}
+
 #[cfg(unix)]
 #[test]
 fn an_escape_sequence_in_a_directory_name_never_reaches_the_terminal() {

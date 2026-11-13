@@ -92,9 +92,9 @@ and exits. Adapters and shims contain no rules.
 |---|---|
 | git hook | `code-watch install-hook` sets a global `init.templateDir` with `post-checkout` that runs `code-watch scan .` |
 | agent adapters | each one is a tiny `code-watch adapter <agent>` subcommand that reads that agent's hook JSON on stdin, calls `check`, and prints that agent's response format |
-| PATH shims | generated scripts in `~/.local/share/code-watch/shims/` for `git`, `npm`, `pnpm`, `yarn`, `pip`, `brew`, `curl`; each runs `code-watch check <name> "$@"` then execs the real binary found past the shim dir |
+| PATH shims | `code-watch shims install <dir>` links `git`, `npm`, `pnpm`, `yarn`, `pip`, `brew`, `curl` to the binary, which dispatches on argv[0]: it checks its own argv, then execs the first real tool on `PATH` that is not a code-watch binary |
 
-Adding an agent = one new adapter module implementing `trait Adapter { fn parse(stdin) -> Command; fn render(Report) -> Output; }`.
+Adding an agent = one new adapter module implementing `trait Adapter { fn parse(&self, stdin: &[u8]) -> Result<Call>; fn reply(&self, Decision, &Policy) -> Reply; }`.
 
 ### Exit codes and output
 
@@ -126,25 +126,33 @@ Licenses are all Apache-2.0-compatible. Downloads are all-time / last 90 days. L
 | npm / pnpm / yarn | `serde_json` (npm); `serde_norway` (pnpm, yarn berry YAML; 0.9.42, 2024-12-21, 20 M, MIT OR Apache-2.0); `yarn-lock-parser` (yarn v1; 0.14.0, 2026-02-08, 341 k, MIT) | | | | | `serde_yaml` is archived (`0.9.34+deprecated`), so `serde_norway` is the maintained fork; `serde_yml` (0.0.13, 2026-05-27) is avoided, run `cargo audit` on it before ever choosing it |
 | pip / poetry / uv | `toml` for `poetry.lock` / `uv.lock`; `pep508_rs` (0.9.2, 2025-01-02, 16.8 M, Apache-2.0 OR BSD-2-Clause) for `requirements.txt` lines | | | | | `pep508_rs` is stale but a complete PEP 508 parser; fallback is a small line regex (`name==version`), which is all OSV needs. `uv-lock` (0.0.100) is an internal uv crate: not used |
 | cargo | `cargo-lock` | 11.1.0 | 2026-07-24 | 43 M / 8.3 M | Apache-2.0 OR MIT | RustSec's own parser |
-| go | `gomod-parser` (go.mod; 0.6.0, 2026-10-01, 1.26 M, Apache-2.0); `go.sum` is `module version hash` lines | | | | | small, recent |
+| go | `gomod-parser` (go.mod; 0.6.0, 2026-10-01, 1.26 M, Apache-2.0); `go.sum` is not a source: it keeps versions the build does not use and would raise false findings | | | | | small, recent |
 | Shell command parsing | `brush-parser` | 0.4.0 | 2026-05-03 | 932 k / 512 k | MIT | typed AST of bash/POSIX (lists, pipelines, subshells, groups, `if`/`while`/`for`/`case`, `<(...)`, heredocs) and a word parser that knows quoting inside `$(...)`; returns an `Err` for unterminated or invalid text, so "unparsable" is a finding, not a pass; pure Rust, no C toolchain for the static musl build. Rejected: `tree-sitter-bash` 0.25.1 (2025-12-02, MIT, 22.7 M; with `tree-sitter` 0.27.2) needs a C compiler on every target and returns a tolerant tree with `ERROR` nodes that must be walked for; `yash-syntax` is GPL-3.0, out. `shlex` stays only in the CLI crate, to quote and split the hook commands it writes |
 | Lookalike domains | `idna` (1.1.0, 2025-08-21, 1.15 B) for punycode/IDNA; `psl` (2.1.252, 2026-11-12, 39 M) for the registrable domain; `unicode-security` (0.1.3, 2026-11-02, 18.7 M) for confusable skeletons; `strsim` (0.11.1, 1.27 B) for edit distance against an embedded list of known domains (`brew.sh`, `github.com`, ...) | | | | | all MIT / Apache-2.0, all well used |
 | File walking, globs | `ignore` + `globset` | 0.4.34 / 0.4.21 | 2026-10-27 | 212 M / 291 M | Unlicense OR MIT | ripgrep's own; respects `.gitignore` but we also scan ignored files where it matters (opt-out per rule) |
 | Regex | `regex` | 1.13.1 | 2026-07-15 | 1.38 B | MIT OR Apache-2.0 | linear-time, safe against ReDoS on hostile input |
 | Base64 detection | `base64` | 0.23.1 | current | huge | MIT OR Apache-2.0 | decode candidate blobs |
-| Hash | `sha2` | 0.11.1 | current | huge | MIT OR Apache-2.0 | allowlist pins, cache keys |
+| Hash | `sha2` | 0.11.1 | current | huge | MIT OR Apache-2.0 (RustCrypto) | allowlist pins, hashed file names of the OSV cache |
 | XDG dirs | `dirs` | 7.0.0 | 2026-09-05 | 407 M | MIT OR Apache-2.0 | |
 | macOS signature / notarization | shell out to `codesign --verify --deep --strict`, `spctl --assess --type open --context context:primary-signature` and `xattr` | | | | | present on every Mac (`/usr/bin/codesign`, `/usr/sbin/spctl` confirmed here); `apple-codesign` (0.29.0, 2024-11-29, MPL-2.0) is a signing tool, stale, and MPL is a weaker fit for Apache-2.0; `security-framework` (3.7.0, MIT OR Apache-2.0) has no notarization check |
 | HTTP client for OSV + LLM | `ureq` | 3.5.2 | 2026-11-12 | 265 M / 86 M | MIT OR Apache-2.0 | blocking, small, no async runtime in a CLI that exits in milliseconds; `reqwest` (0.13.5, 2026-09-08, 905 M) works but pulls `tokio`. TLS via rustls |
 | Tests | `assert_cmd` 2.2.2, `insta` 1.49.0 (Apache-2.0), `tempfile` 3.27.0, `rstest` 0.28.0 | | | | | all current |
 
+Two transitive crates are not plain MIT/Apache-2.0: `version-ranges` 0.1.3 (MPL-2.0, file-level copyleft, via `pep508_rs`) and `webpki-roots` 1.0.12 (CDLA-Permissive-2.0, the bundled TLS roots, via `ureq`). Both are usable from an Apache-2.0 binary; the MPL one is the weaker fit and is the reason to replace `pep508_rs` with the small line parser if it ever gets in the way. They are named in `NOTICE`; the `cargo-deny` licence exceptions come with the CI slice.
+
 No async runtime anywhere. `cargo-deny` runs in CI to keep the license list honest.
 
 ## 3. Agent hook APIs (read 2026-11-12, re-read 2026-11-13)
 
-Update 2026-11-13: Codex CLI parses `ask` for `PreToolUse` but does not support it yet, so its adapter answers a warning
-with a deny (`--codex-warn allow` reports it instead); Claude Code hooks accept `onFailure: "block"` (v2.1.295+) and a
-`defer` decision; Cursor has no "no opinion" reply, so a clean command is an `ask` unless `--cursor-clean allow`.
+Update 2026-11-13 (slice 11): Gemini CLI `BeforeTool` is as listed below, with no `ask` decision (only `allow`,
+`deny`, `block`), so a warning is a deny that says how to allow it; the OpenCode docs now describe a different plugin
+API (`Plugin.define`) without hook details, so the plugin follows the older `tool.execute.before` shape that
+third-party plugins use and is untested against a live OpenCode. OpenCode cannot ask either, so a warning is denied
+unless the plugin is installed with `--opencode-warn allow`.
+
+Codex CLI parses `ask` for `PreToolUse` but does not support it yet, so its adapter answers a warning
+with a deny (`--codex-warn allow` reports it instead). Claude Code hooks accept `onFailure: "block"` (v2.1.295+) and a
+`defer` decision. Cursor has no "no opinion" reply, so a clean command is an `ask` unless `--cursor-clean allow`.
 
 All five let the adapter block before a shell command runs except where noted. Each adapter is `code-watch adapter <name>`:
 read the JSON on stdin, extract the command, run `code-watch check`, translate the verdict back.
@@ -180,8 +188,8 @@ Each slice is about one worker-day, one reviewable PR, with its tests and its RE
 | 8 | Downloads layer | `.dmg` / `.pkg` quarantine, `codesign` / `spctl` shell-out behind a trait with a fake, macOS only |
 | 9 | LLM layer | provider trait, openai_compat + anthropic + local, `LlmFindings` newtype, the "only adds" property test, prompt-injection fixtures, `docs/llm-layer.md` |
 | 10 | Adapters 1 | `adapter` subcommand, Claude Code, Cursor, Codex CLI, with fixtures of each agent's stdin JSON |
-| 11 | Adapters 2 + shims | Gemini CLI, OpenCode plugin, PATH shims generator, `docs/adding-an-adapter.md` |
-| 12 | Release | install script and Homebrew tap, `cargo-deny`, release workflow (static binaries macOS arm64/x86_64, Linux musl), SECURITY.md, final README |
+| 11 | Adapters 2 + shims | Gemini CLI, OpenCode plugin, PATH shims (symlinks to the binary that dispatch on argv[0]), `docs/adding-an-adapter.md` |
+| 12 | Release | install script and Homebrew tap, `cargo-deny`, release workflow (static binaries macOS arm64/x86_64, Linux musl), SECURITY.md, final README; check the OpenCode plugin against a real OpenCode |
 
 Slices 2 to 4 and 5 to 6 are independent once slice 1 lands, so two workers can run in parallel.
 

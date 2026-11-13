@@ -1,0 +1,29 @@
+version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["serde"]
+
+[[package]]
+name = "serde"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[package]]
+name = "tokio"
+version = "1.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[package]]
+name = "fork"
+version = "0.2.0"
+source = "git+https://github.com/x/fork#0123456789abcdef0123456789abcdef01234567"
+
+[[package]]
+name = "corp"
+version = "1.0.0"
+source = "registry+https://example.invalid/index"
+checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

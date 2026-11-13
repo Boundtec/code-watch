@@ -4,7 +4,7 @@ use std::path::Path;
 use assert_cmd::Command;
 use serde_json::{Value, json};
 
-const AGENTS: [&str; 3] = ["claude-code", "cursor", "codex"];
+const AGENTS: [&str; 5] = ["claude-code", "cursor", "codex", "gemini", "opencode"];
 
 fn fixture(agent: &str, name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -168,7 +168,8 @@ fn a_tool_call_that_is_not_a_shell_command_is_left_alone() {
 #[test]
 fn bad_input_follows_the_fail_mode_for_every_agent() {
     let no_command = |agent: &str| match agent {
-        "cursor" => r#"{"cwd":"/"}"#,
+        "cursor" | "opencode" => r#"{"cwd":"/"}"#,
+        "gemini" => r#"{"tool_name":"run_shell_command","tool_input":{}}"#,
         _ => r#"{"tool_name":"Bash","tool_input":{}}"#,
     };
     for agent in AGENTS {
@@ -308,7 +309,7 @@ fn the_fail_flags_conflict() {
 
 #[test]
 fn install_adapter_prints_only_the_snippet_on_stdout() {
-    for agent in AGENTS {
+    for agent in AGENTS.into_iter().filter(|a| *a != "opencode") {
         let out = Command::cargo_bin("code-watch")
             .unwrap()
             .args(["install-adapter", agent])
@@ -345,5 +346,144 @@ fn a_cwd_that_is_a_file_inside_a_repo_gets_no_repo_allowlist() {
     assert_eq!(
         decision(&run("claude-code", &[], &input).reply().unwrap()).0,
         "ask"
+    );
+}
+
+fn deny_reason(reply: &Value) -> &str {
+    assert_eq!(reply["decision"], "deny");
+    reply["reason"].as_str().unwrap()
+}
+
+#[test]
+fn gemini_and_opencode_answer_allow_with_nothing_and_block_with_deny() {
+    for agent in ["gemini", "opencode"] {
+        let r = run(agent, &[], &fixture(agent, "allow"));
+        assert_eq!((r.code, r.reply()), (Some(0), None), "{agent}");
+        let r = run(agent, &[], &fixture(agent, "block"));
+        assert_eq!(r.code, Some(0), "{agent}");
+        let reply = r.reply().unwrap();
+        assert!(
+            deny_reason(&reply).contains("code-watch blocked this command"),
+            "{agent}"
+        );
+        assert_eq!(reply.as_object().unwrap().len(), 2, "{agent}");
+    }
+}
+
+#[test]
+fn gemini_and_opencode_deny_a_warning_and_say_what_lets_it_through() {
+    for agent in ["gemini", "opencode"] {
+        let r = run(agent, &[], &fixture(agent, "warn"));
+        assert_eq!(r.code, Some(0), "{agent}");
+        let reply = r.reply().unwrap();
+        let reason = deny_reason(&reply);
+        assert!(
+            reason.contains(r#"rule = "command/pipe-to-shell""#),
+            "{agent}"
+        );
+        assert!(reason.contains("code-watch/allow.toml"), "{agent}");
+    }
+}
+
+#[test]
+fn the_warn_flag_of_gemini_and_opencode_gives_no_opinion_and_the_reason_on_stderr_but_never_softens_a_block()
+ {
+    for (agent, flag) in [("gemini", "--gemini-warn"), ("opencode", "--opencode-warn")] {
+        let flags = [flag, "allow"];
+        let r = run(agent, &flags, &fixture(agent, "warn"));
+        assert_eq!((r.code, r.reply()), (Some(0), None), "{agent}");
+        assert!(r.stderr.contains("code-watch warns about this command"));
+        let r = run(agent, &flags, &fixture(agent, "block"));
+        deny_reason(&r.reply().unwrap());
+    }
+}
+
+#[test]
+fn each_agent_only_listens_to_its_own_warn_flag() {
+    for (agent, other) in [("gemini", "--opencode-warn"), ("opencode", "--gemini-warn")] {
+        let r = run(agent, &[other, "allow"], &fixture(agent, "warn"));
+        deny_reason(&r.reply().unwrap());
+    }
+}
+
+#[test]
+fn the_opencode_warn_choice_is_baked_into_the_plugin_and_refused_for_other_agents() {
+    let install = |args: &[&str]| {
+        Command::cargo_bin("code-watch")
+            .unwrap()
+            .arg("install-adapter")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let printed = install(&["opencode", "--print", "--opencode-warn", "allow"]);
+    let text = String::from_utf8(printed.stdout).unwrap();
+    assert!(text.contains(r#""--opencode-warn","allow"]"#));
+    assert_eq!(
+        install(&["gemini", "--opencode-warn", "allow"])
+            .status
+            .code(),
+        Some(3)
+    );
+}
+
+#[test]
+fn a_gemini_tool_that_is_not_a_shell_command_is_left_alone() {
+    let r = run(
+        "gemini",
+        &["--fail-closed"],
+        &fixture("gemini", "other_tool"),
+    );
+    assert_eq!((r.code, r.reply()), (Some(0), None));
+    assert_eq!(r.stderr, "");
+}
+
+#[test]
+fn the_opencode_plugin_is_printed_or_written_and_never_over_a_foreign_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = |args: &[&str]| {
+        Command::cargo_bin("code-watch")
+            .unwrap()
+            .arg("install-adapter")
+            .arg("opencode")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let printed = install(&["--print"]);
+    assert!(printed.status.success());
+    let text = String::from_utf8(printed.stdout).unwrap();
+    assert!(text.starts_with("// code-watch managed plugin"));
+    assert!(text.contains("code-watch"));
+
+    assert_eq!(install(&[]).status.code(), Some(3));
+    let target = dir.path().join("plugin.js");
+    let path = target.to_str().unwrap();
+    assert!(install(&[path]).status.success());
+    assert_eq!(fs::read_to_string(&target).unwrap(), text);
+    assert!(install(&[path]).status.success());
+
+    fs::write(&target, "mine").unwrap();
+    assert_eq!(install(&[path]).status.code(), Some(3));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "mine");
+    let missing = dir.path().join("nope/p.js");
+    assert_eq!(install(&[missing.to_str().unwrap()]).status.code(), Some(3));
+}
+
+#[test]
+fn install_adapter_for_gemini_prints_the_before_tool_snippet() {
+    let out = Command::cargo_bin("code-watch")
+        .unwrap()
+        .args(["install-adapter", "gemini"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let node = &value["hooks"]["BeforeTool"][0];
+    assert_eq!(node["matcher"], "run_shell_command");
+    assert!(
+        node["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("adapter gemini")
     );
 }
