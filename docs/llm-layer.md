@@ -8,7 +8,7 @@ configure it, and it can only **add** findings.
 
 **For a remote provider, the text of those files leaves your machine.** Nothing is sent unless you configure a
 provider. The request carries at most 12 files, 16 KiB each and 96 KiB in total; binary and non-UTF-8 files, symlinks
-and `node_modules` are never sent. With `provider = "local"` the traffic stays on your machine.
+and `node_modules` are never sent. Files whose name marks them as credentials (`.env*`, `*.pem`, `*.key`, `*.p12`, `id_*`, `.npmrc`, `.netrc`, `.pypirc`, `credentials*`) are never sent, even when a rule found something in them; the report says how many were held back. With `provider = "local"` the traffic stays on your machine and proxy environment variables are never used; remote providers honour `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`.
 
 ## Configure
 
@@ -60,6 +60,10 @@ would have been without it. One call, no retry.
 - Files go to the model in delimited blocks marked as untrusted data. Text inside a file that looks like an instruction,
   a closing delimiter or a fake reply stays data. The reply is never run, never put into a command and never used to
   choose files, and the layer has no way to change a file.
+- Every model finding is marked `[model-written, unverified]` in the terminal and `"unverified": true` in `--json`.
+  The model's remediation is never shown (one fixed text is used), and a title, rule name or excerpt that talks about
+  allowing, ignoring, bypassing, disabling or suppressing, or names the allowlist files, is replaced by a fixed text,
+  so nothing a model or a repo file says tells the agent how to get past a finding.
 - Text from the model is stripped of control and escape characters before it reaches the terminal or `--json`.
 - The key is read from the environment at call time and sent only in the request header. It is not logged and never
   appears in an error message or in the output.

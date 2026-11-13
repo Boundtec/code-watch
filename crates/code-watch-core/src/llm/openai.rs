@@ -33,9 +33,10 @@ impl OpenAiCompat {
         key_env: Option<String>,
         key: KeyFn,
         timeout: Duration,
+        proxy: Option<ureq::Proxy>,
     ) -> Self {
         Self {
-            agent: http::agent(timeout),
+            agent: http::agent(timeout, proxy),
             base_url: base_url.to_owned(),
             model: model.to_owned(),
             key_env,

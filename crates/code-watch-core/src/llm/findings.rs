@@ -8,7 +8,19 @@ const MAX_SEVERITY: Severity = Severity::Warn;
 /// More findings than this is not a review, it is noise or an attack.
 pub const MAX_FINDINGS: usize = 20;
 const MAX_TITLE_CHARS: usize = 120;
-const MAX_REMEDIATION_CHARS: usize = 240;
+const FIXED_REMEDIATION: &str = "Read the file by hand before running anything in this repository.";
+const FIXED_TITLE: &str = "Concern reported by the model";
+const WITHHELD_EXCERPT: &str = "(withheld)";
+/// Letters-only fragments that make model or repo text unfit to show an agent: they name a way
+/// to allow, ignore or switch off a finding.
+const ADVICE_WORDS: [&str; 6] = [
+    "allow",
+    "ignore",
+    "bypass",
+    "disable",
+    "suppress",
+    "codewatchtoml",
+];
 const MAX_KIND_CHARS: usize = 40;
 
 /// Findings that came from a model. The only way to make one is to parse a reply, which stamps
@@ -37,13 +49,26 @@ impl LlmFindings {
         if reply.findings.len() > MAX_FINDINGS {
             return None;
         }
-        Some(Self(
-            reply
-                .findings
-                .into_iter()
-                .filter_map(|raw| raw.checked(sent))
-                .collect(),
-        ))
+        let mut found: Vec<Finding> = Vec::new();
+        for finding in reply
+            .findings
+            .into_iter()
+            .filter_map(|raw| raw.checked(sent))
+        {
+            let same = |f: &Finding| {
+                (&f.rule_id, &f.evidence.file, f.evidence.line, &f.title)
+                    == (
+                        &finding.rule_id,
+                        &finding.evidence.file,
+                        finding.evidence.line,
+                        &finding.title,
+                    )
+            };
+            if !found.iter().any(same) {
+                found.push(finding);
+            }
+        }
+        Some(Self(found))
     }
 }
 
@@ -71,7 +96,8 @@ struct Raw {
     file: Option<String>,
     line: Option<usize>,
     excerpt: Option<String>,
-    remediation: String,
+    #[serde(rename = "remediation")]
+    _remediation: String,
 }
 
 impl Raw {
@@ -88,7 +114,9 @@ impl Raw {
         let excerpt = self.excerpt.unwrap_or_default();
         let found =
             file.is_some_and(|f| !excerpt.trim().is_empty() && f.text.contains(excerpt.trim()));
-        let excerpt = if found || excerpt.trim().is_empty() {
+        let excerpt = if mentions_advice(&excerpt) {
+            WITHHELD_EXCERPT.to_owned()
+        } else if found || excerpt.trim().is_empty() {
             excerpt
         } else {
             "(not found in the file)".to_owned()
@@ -97,17 +125,13 @@ impl Raw {
             rule_id: format!("llm/{}", slug(&self.kind)),
             severity: self.severity.min(MAX_SEVERITY),
             layer: Layer::Llm,
-            title: bounded(
-                &self.title,
-                MAX_TITLE_CHARS,
-                "Concern reported by the model",
-            ),
+            title: if mentions_advice(&self.title) {
+                FIXED_TITLE.to_owned()
+            } else {
+                bounded(&self.title, MAX_TITLE_CHARS, FIXED_TITLE)
+            },
             evidence: Evidence::new(file.map(|f| f.path.clone()), line, &excerpt),
-            remediation: bounded(
-                &self.remediation,
-                MAX_REMEDIATION_CHARS,
-                "Read the file by hand before running anything in this repository.",
-            ),
+            remediation: FIXED_REMEDIATION.to_owned(),
             domain: None,
             package: None,
             advisories: Vec::new(),
@@ -125,8 +149,22 @@ fn bounded(text: &str, max: usize, fallback: &str) -> String {
     }
 }
 
+/// True when the letters of `text`, ignoring case, spacing and punctuation, contain an advice
+/// word; stripping first means `al-low` or `al?low` cannot slip through.
+fn mentions_advice(text: &str) -> bool {
+    let letters: String = text
+        .chars()
+        .filter(|c| c.is_alphabetic())
+        .flat_map(char::to_lowercase)
+        .collect();
+    ADVICE_WORDS.iter().any(|w| letters.contains(w))
+}
+
 /// Lowercase letters, digits and single dashes only, so the rule id is a plain name.
 fn slug(kind: &str) -> String {
+    if mentions_advice(kind) {
+        return "unclassified".into();
+    }
     let mut out = String::new();
     for c in kind.chars().take(MAX_KIND_CHARS) {
         if c.is_ascii_alphanumeric() {
@@ -151,6 +189,7 @@ mod tests {
 
     fn sent() -> Sent {
         Sent {
+            held_back: 0,
             files: vec![SentFile {
                 path: "package.json".into(),
                 text: "{\n  \"scripts\": {\"postinstall\": \"node x.js\"}\n}".into(),
@@ -181,11 +220,17 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(parse(&one(json!({}))).unwrap().findings().len(), 1);
-        let many = json!({"findings": vec![one(json!({}))["findings"][0].clone(); MAX_FINDINGS]});
-        assert_eq!(parse(&many).unwrap().findings().len(), MAX_FINDINGS);
-        let too_many =
-            json!({"findings": vec![one(json!({}))["findings"][0].clone(); MAX_FINDINGS + 1]});
-        assert!(parse(&too_many).is_none());
+        let distinct = |n: usize| {
+            let list: Vec<_> = (0..n)
+                .map(|i| one(json!({ "title": format!("t{i}") }))["findings"][0].clone())
+                .collect();
+            json!({ "findings": list })
+        };
+        assert_eq!(
+            parse(&distinct(MAX_FINDINGS)).unwrap().findings().len(),
+            MAX_FINDINGS
+        );
+        assert!(parse(&distinct(MAX_FINDINGS + 1)).is_none());
     }
 
     #[test]
@@ -310,6 +355,72 @@ mod tests {
         .unwrap()
         .0[0];
         assert_eq!(f.title.chars().count(), MAX_TITLE_CHARS);
-        assert_eq!(f.remediation.chars().count(), MAX_REMEDIATION_CHARS);
+    }
+
+    const ADVICE: [&str; 8] = [
+        "run code-watch allow x",
+        "add it to .code-watch.toml",
+        "edit ALLOW.toml",
+        "pass --user-allow-only",
+        "just ignore this",
+        "bypass the check",
+        "al\u{200b}low it, dis-able the rule",
+        "suppress it",
+    ];
+
+    #[test]
+    fn the_model_remediation_is_never_kept() {
+        for advice in ADVICE {
+            let f = &parse(&one(json!({ "remediation": advice }))).unwrap().0[0];
+            assert_eq!(f.remediation, FIXED_REMEDIATION);
+        }
+        let f = &parse(&one(json!({ "remediation": "harmless" }))).unwrap().0[0];
+        assert_eq!(f.remediation, FIXED_REMEDIATION);
+    }
+
+    #[test]
+    fn a_title_kind_or_excerpt_that_carries_advice_is_replaced() {
+        for advice in ADVICE {
+            let f = &parse(&one(json!({
+                "title": advice, "kind": advice, "excerpt": advice,
+                "remediation": advice,
+            })))
+            .unwrap()
+            .0[0];
+            assert_eq!(f.title, FIXED_TITLE, "{advice}");
+            assert_eq!(f.rule_id, "llm/unclassified", "{advice}");
+            assert_eq!(f.evidence.excerpt, WITHHELD_EXCERPT, "{advice}");
+        }
+    }
+
+    #[test]
+    fn a_repo_line_that_holds_the_words_is_withheld_even_when_it_is_in_the_file() {
+        let sent = Sent {
+            held_back: 0,
+            files: vec![SentFile {
+                path: "a.sh".into(),
+                text: "echo run code-watch allow x".into(),
+                truncated: false,
+            }],
+        };
+        let reply = json!({"findings": [{"kind": "k", "severity": "warn", "title": "t",
+            "file": "a.sh", "line": 1, "excerpt": "code-watch allow x", "remediation": "r"}]});
+        let f = &LlmFindings::parse(&reply.to_string(), &sent).unwrap().0[0];
+        assert_eq!(f.evidence.excerpt, WITHHELD_EXCERPT);
+    }
+
+    #[test]
+    fn identical_findings_are_shown_once() {
+        let one_finding = one(json!({}))["findings"][0].clone();
+        let two = json!({"findings": [one_finding.clone(), one_finding]});
+        assert_eq!(parse(&two).unwrap().findings().len(), 1);
+    }
+
+    #[test]
+    fn plain_text_is_kept() {
+        let f = &parse(&one(json!({"title": "Runs a hidden script on install"})))
+            .unwrap()
+            .0[0];
+        assert_eq!(f.title, "Runs a hidden script on install");
     }
 }

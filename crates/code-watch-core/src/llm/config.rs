@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::anthropic::Anthropic;
-use super::http::KeyFn;
+use super::http::{self, KeyFn};
 use super::openai::OpenAiCompat;
 use super::provider::LlmProvider;
 
@@ -104,6 +104,7 @@ fn build(s: Section, key: KeyFn) -> Result<Box<dyn LlmProvider>, &'static str> {
         return Err("the [llm] config has no api_key_env");
     }
     let nonempty: KeyFn = Box::new(move |name| key(name).filter(|v| !v.is_empty()));
+    let proxy = http::proxy_for(s.provider == Kind::Local, ureq::Proxy::try_from_env);
     Ok(match s.provider {
         Kind::Anthropic => Box::new(Anthropic::new(
             &base,
@@ -111,9 +112,10 @@ fn build(s: Section, key: KeyFn) -> Result<Box<dyn LlmProvider>, &'static str> {
             key_env.as_deref().unwrap_or_default(),
             nonempty,
             timeout,
+            proxy,
         )),
         Kind::OpenaiCompat | Kind::Local => Box::new(OpenAiCompat::new(
-            &base, &s.model, key_env, nonempty, timeout,
+            &base, &s.model, key_env, nonempty, timeout, proxy,
         )),
     })
 }

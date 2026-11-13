@@ -36,12 +36,28 @@ pub struct SentFile {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sent {
     pub files: Vec<SentFile>,
+    /// Credential files that were left out; counted, never named.
+    pub held_back: usize,
 }
 
 impl Sent {
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
+}
+
+/// Files that hold credentials are never sent, even when a rule has a finding in them.
+fn is_secret_file(rel: &str) -> bool {
+    rel.split('/').any(|part| {
+        let name = part.to_ascii_lowercase();
+        name.starts_with(".env")
+            || name.ends_with(".pem")
+            || name.ends_with(".key")
+            || name.ends_with(".p12")
+            || name.starts_with("id_")
+            || name.starts_with("credentials")
+            || [".npmrc", ".netrc", ".pypirc"].contains(&name.as_str())
+    })
 }
 
 /// Picks the files to send: those that already have a finding first, then manifests and install
@@ -58,7 +74,12 @@ pub fn select(root: &Path, findings: &[Finding]) -> Sent {
             paths.push(name);
         }
     }
-    let mut sent = Sent::default();
+    let (secret, paths): (Vec<String>, Vec<String>) =
+        paths.into_iter().partition(|p| is_secret_file(p));
+    let mut sent = Sent {
+        held_back: secret.len(),
+        ..Sent::default()
+    };
     let mut total = 0;
     for rel in paths {
         if sent.files.len() == MAX_FILES || total >= MAX_TOTAL_BYTES {
@@ -194,6 +215,40 @@ mod tests {
                 "scripts/run.sh"
             ]
         );
+    }
+
+    #[test]
+    fn credential_files_are_never_sent_even_with_a_finding_and_are_counted() {
+        let dir = repo(&[
+            ("package.json", b"{}"),
+            (".env", b"K=fake"),
+            (".ENV.local", b"K=fake"),
+            ("deploy/server.PEM", b"fake"),
+            ("a.key", b"fake"),
+            ("c.p12", b"fake"),
+            ("home/id_ed25519", b"fake"),
+            (".npmrc", b"fake"),
+            (".netrc", b"fake"),
+            (".pypirc", b"fake"),
+            ("Credentials.json", b"fake"),
+            ("secrets/run.sh", b"echo"),
+        ]);
+        let all = [
+            ".env",
+            ".ENV.local",
+            "deploy/server.PEM",
+            "a.key",
+            "c.p12",
+            "home/id_ed25519",
+            ".npmrc",
+            ".netrc",
+            ".pypirc",
+            "Credentials.json",
+        ]
+        .map(finding_in);
+        let sent = select(dir.path(), &all);
+        assert_eq!(paths(&sent), ["package.json", "secrets/run.sh"]);
+        assert_eq!(sent.held_back, 10);
     }
 
     #[test]

@@ -21,7 +21,11 @@ pub enum LlmMode<'a> {
 /// verdict, an allow or a removal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LlmOutcome {
-    Ran(LlmFindings),
+    Ran {
+        findings: LlmFindings,
+        /// Credential files left out of the request.
+        held_back: usize,
+    },
     Skipped(String),
 }
 
@@ -30,8 +34,12 @@ pub enum LlmOutcome {
 /// that did not happen.
 pub fn run(root: &Path, existing: &[Finding], provider: &dyn LlmProvider) -> LlmOutcome {
     let sent = select(root, existing);
+    let held_back = sent.held_back;
     if sent.is_empty() {
-        return LlmOutcome::Ran(LlmFindings::empty());
+        return LlmOutcome::Ran {
+            findings: LlmFindings::empty(),
+            held_back,
+        };
     }
     let reply = match provider.complete(&prompt::build(&sent)) {
         Ok(reply) => reply,
@@ -41,7 +49,10 @@ pub fn run(root: &Path, existing: &[Finding], provider: &dyn LlmProvider) -> Llm
         return LlmOutcome::Skipped("the provider's answer was too large".into());
     }
     match LlmFindings::parse(&reply.text, &sent) {
-        Some(findings) => LlmOutcome::Ran(findings),
+        Some(findings) => LlmOutcome::Ran {
+            findings,
+            held_back,
+        },
         None => LlmOutcome::Skipped("the model's answer could not be read".into()),
     }
 }

@@ -19,6 +19,7 @@ pub struct LlmReply {
 pub enum LlmError {
     Timeout,
     Network,
+    Redirected,
     Status(u16),
     Refused,
     Truncated,
@@ -32,6 +33,9 @@ impl fmt::Display for LlmError {
         match self {
             LlmError::Timeout => f.write_str("the provider timed out"),
             LlmError::Network => f.write_str("the provider is unreachable"),
+            LlmError::Redirected => {
+                f.write_str("the provider redirected the request, check base_url")
+            }
             LlmError::Status(code) => write!(f, "the provider answered HTTP {code}"),
             LlmError::Refused => f.write_str("the model refused the request"),
             LlmError::Truncated => f.write_str("the model's answer was cut short"),

@@ -15,13 +15,26 @@ pub type KeyFn = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Redirects are never followed: ureq strips only `Authorization` on a redirect, so an
 /// `x-api-key` header would reach whatever host the endpoint names.
-pub(crate) fn agent(timeout: Duration) -> ureq::Agent {
+///
+/// `proxy` is passed in rather than read here: `local` passes `None` (traffic stays on this
+/// machine whatever `HTTP_PROXY` says); remote providers pass `Proxy::try_from_env()`.
+pub(crate) fn agent(timeout: Duration, proxy: Option<ureq::Proxy>) -> ureq::Agent {
     ureq::Agent::config_builder()
+        .proxy(proxy)
         .timeout_global(Some(timeout))
         .max_redirects(0)
         .user_agent(concat!("code-watch/", env!("CARGO_PKG_VERSION")))
         .build()
         .new_agent()
+}
+
+/// The proxy a provider may use: `local` never goes through one, a remote provider follows the
+/// proxy environment variables (`from_env` is injected so tests leave the process env alone).
+pub(crate) fn proxy_for(
+    local: bool,
+    from_env: impl FnOnce() -> Option<ureq::Proxy>,
+) -> Option<ureq::Proxy> {
+    if local { None } else { from_env() }
 }
 
 pub(crate) fn map_error(err: ureq::Error) -> LlmError {
@@ -45,6 +58,9 @@ pub(crate) fn post_json(
         request = request.header(*name, *value);
     }
     let mut response = request.send(body.to_string()).map_err(map_error)?;
+    if response.status().is_redirection() {
+        return Err(LlmError::Redirected);
+    }
     let text = response
         .body_mut()
         .with_config()

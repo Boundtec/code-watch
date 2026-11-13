@@ -28,9 +28,16 @@ impl fmt::Debug for Anthropic {
 }
 
 impl Anthropic {
-    pub fn new(base_url: &str, model: &str, key_env: &str, key: KeyFn, timeout: Duration) -> Self {
+    pub fn new(
+        base_url: &str,
+        model: &str,
+        key_env: &str,
+        key: KeyFn,
+        timeout: Duration,
+        proxy: Option<ureq::Proxy>,
+    ) -> Self {
         Self {
-            agent: http::agent(timeout),
+            agent: http::agent(timeout, proxy),
             base_url: base_url.to_owned(),
             model: model.to_owned(),
             key_env: key_env.to_owned(),

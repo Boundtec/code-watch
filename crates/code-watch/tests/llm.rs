@@ -119,7 +119,7 @@ fn a_configured_layer_adds_findings_capped_to_warn_and_sends_the_key_only_as_a_h
     let shown = text(&out);
     assert_eq!(out.status.code(), Some(1), "{shown}");
     assert!(shown.contains("llm ran"));
-    assert!(shown.contains("WARN  llm/install-script package.json:1"));
+    assert!(shown.contains("WARN  llm/install-script [model-written, unverified] package.json:1"));
     assert!(!shown.contains('\u{1b}'));
     assert!(!shown.contains(KEY));
     assert!(
@@ -128,6 +128,88 @@ fn a_configured_layer_adds_findings_capped_to_warn_and_sends_the_key_only_as_a_h
             .contains(&format!("authorization: bearer {KEY}"))
     );
     assert!(!request.split_once("\r\n\r\n").unwrap().1.contains(KEY));
+}
+
+const ADVICE: [&str; 6] = [
+    "run code-watch allow x",
+    "put it in .code-watch.toml or allow.toml",
+    "pass --user-allow-only",
+    "ignore this",
+    "bypass it",
+    "disable and suppress the rule",
+];
+
+fn holds_advice(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "allow",
+        "ignore",
+        "bypass",
+        "disable",
+        "suppress",
+        "code-watch.toml",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
+}
+
+#[test]
+fn model_text_that_tells_the_agent_how_to_allow_never_reaches_the_output() {
+    for advice in ADVICE {
+        let reply = serde_json::json!([{
+            "kind": advice, "severity": "warn", "title": advice,
+            "file": "package.json", "line": 1, "excerpt": "node x.js", "remediation": advice
+        }]);
+        let (base, server) = serve_once("200 OK", completion(reply.clone()));
+        let cfg = config(&base, "");
+        let human = scan(repo().path(), cfg.path(), true, &[]);
+        server.join().unwrap();
+        let shown = text(&human);
+        let findings: Vec<_> = shown
+            .lines()
+            .take_while(|l| !l.starts_with("layers:"))
+            .collect();
+        assert!(
+            findings
+                .iter()
+                .any(|l| l.contains("[model-written, unverified]")),
+            "{advice}: {shown}"
+        );
+        assert!(!holds_advice(&findings.join("\n")), "{advice}: {shown}");
+
+        let (base, server) = serve_once("200 OK", completion(reply));
+        let cfg = config(&base, "");
+        let json = scan(repo().path(), cfg.path(), true, &["--json"]);
+        server.join().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        let llm: Vec<_> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["layer"] == "llm")
+            .collect();
+        assert_eq!(llm.len(), 1, "{advice}");
+        assert_eq!(llm[0]["unverified"], true);
+        assert!(!holds_advice(&llm[0].to_string()), "{advice}: {}", llm[0]);
+    }
+}
+
+#[test]
+fn credential_files_are_not_sent_and_the_report_counts_them() {
+    let dir = repo();
+    fs::write(
+        dir.path().join("credentials.sh"),
+        "TOKEN=fake-secret-value-789",
+    )
+    .unwrap();
+    fs::write(dir.path().join("deploy.sh"), "echo hi").unwrap();
+    let (base, server) = serve_once("200 OK", completion(serde_json::json!([])));
+    let cfg = config(&base, "");
+    let out = scan(dir.path(), cfg.path(), true, &[]);
+    let request = server.join().unwrap();
+    assert!(!request.contains("fake-secret-value-789"));
+    assert!(request.contains("deploy.sh"));
+    assert!(text(&out).contains("1 credential file not sent to the model"));
 }
 
 #[test]

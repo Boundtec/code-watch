@@ -66,6 +66,7 @@ pub struct Report {
     layer_notes: BTreeMap<Layer, String>,
     suppressed: Vec<Suppressed>,
     allowlist_warnings: Vec<String>,
+    llm_held_back: usize,
 }
 
 impl Report {
@@ -92,6 +93,7 @@ impl Report {
             layer_notes: BTreeMap::new(),
             suppressed: Vec::new(),
             allowlist_warnings: Vec::new(),
+            llm_held_back: 0,
         }
     }
 
@@ -132,8 +134,12 @@ impl Report {
     /// appended: nothing the other layers found can be removed, replaced or lowered here.
     pub fn with_llm(mut self, outcome: LlmOutcome) -> Self {
         match outcome {
-            LlmOutcome::Ran(found) => {
-                self.findings.extend(found.into_findings());
+            LlmOutcome::Ran {
+                findings,
+                held_back,
+            } => {
+                self.findings.extend(findings.into_findings());
+                self.llm_held_back = held_back;
                 sort_findings(&mut self.findings);
                 self.layers.insert(Layer::Llm, LayerStatus::Ran);
             }
@@ -182,6 +188,11 @@ impl Report {
 
     pub fn layers(&self) -> &BTreeMap<Layer, LayerStatus> {
         &self.layers
+    }
+
+    /// How many credential files the LLM layer left out of its request.
+    pub fn llm_held_back(&self) -> usize {
+        self.llm_held_back
     }
 
     pub fn skipped(&self) -> &[Skipped] {

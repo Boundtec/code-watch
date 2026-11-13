@@ -111,11 +111,11 @@ fn request() -> LlmRequest {
 }
 
 fn openai(base: &str, timeout: Duration) -> OpenAiCompat {
-    OpenAiCompat::new(base, "m", Some("KEY_VAR".into()), key_fn(), timeout)
+    OpenAiCompat::new(base, "m", Some("KEY_VAR".into()), key_fn(), timeout, None)
 }
 
 fn anthropic(base: &str, timeout: Duration) -> Anthropic {
-    Anthropic::new(base, "m", "KEY_VAR", key_fn(), timeout)
+    Anthropic::new(base, "m", "KEY_VAR", key_fn(), timeout, None)
 }
 
 fn openai_ok(content: &str) -> Vec<u8> {
@@ -168,7 +168,7 @@ fn a_good_reply_is_returned_and_the_key_goes_only_in_the_auth_header() {
 #[test]
 fn a_local_provider_without_a_key_sends_no_auth_header() {
     let (base, seen, h) = serve(vec![openai_ok("{}")]);
-    let client = OpenAiCompat::new(&base, "m", None, key_fn(), SHORT);
+    let client = OpenAiCompat::new(&base, "m", None, key_fn(), SHORT, None);
     client.complete(&request()).unwrap();
     h.join().unwrap();
     assert!(
@@ -334,10 +334,11 @@ fn a_missing_key_fails_before_any_request() {
         Some("KEY_VAR".into()),
         none,
         SHORT,
+        None,
     );
     assert_eq!(client.complete(&request()), Err(LlmError::MissingKey));
     let none: super::KeyFn = Box::new(|_| None);
-    let client = Anthropic::new("http://127.0.0.1:9", "m", "KEY_VAR", none, SHORT);
+    let client = Anthropic::new("http://127.0.0.1:9", "m", "KEY_VAR", none, SHORT, None);
     assert_eq!(client.complete(&request()), Err(LlmError::MissingKey));
 }
 
@@ -366,4 +367,46 @@ fn no_error_or_debug_text_carries_the_key() {
     assert!(!format!("{err} {err:?} {client:?}").contains(FAKE_KEY));
     let client = anthropic(&base, SHORT);
     assert!(!format!("{client:?}").contains(FAKE_KEY));
+}
+
+#[test]
+fn a_redirect_is_reported_as_a_redirect() {
+    let redirect = b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let (base, _, h) = serve(vec![redirect.to_vec()]);
+    let result = openai(&base, SHORT).complete(&request());
+    h.join().unwrap();
+    assert_eq!(result, Err(LlmError::Redirected));
+}
+
+#[test]
+fn an_injected_proxy_is_used_and_none_goes_direct() {
+    let (proxy_base, proxy_seen, ph) = serve(vec![openai_ok("via proxy")]);
+    let (target, target_seen, th) = serve(vec![openai_ok("direct")]);
+    let proxied = OpenAiCompat::new(
+        &target,
+        "m",
+        Some("KEY_VAR".into()),
+        key_fn(),
+        SHORT,
+        Some(ureq::Proxy::new(&proxy_base).unwrap()),
+    );
+    let _ = proxied.complete(&request());
+    ph.join().unwrap();
+    assert!(proxy_seen.lock().unwrap()[0].starts_with("CONNECT "));
+    assert!(target_seen.lock().unwrap().is_empty());
+
+    assert_eq!(
+        openai(&target, SHORT).complete(&request()).unwrap().text,
+        "direct"
+    );
+    th.join().unwrap();
+    assert_eq!(proxy_seen.lock().unwrap().len(), 1);
+    assert_eq!(target_seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn local_never_takes_the_proxy_from_the_environment() {
+    let env = || Some(ureq::Proxy::new("http://127.0.0.1:9").unwrap());
+    assert!(super::http::proxy_for(true, env).is_none());
+    assert!(super::http::proxy_for(false, env).is_some());
 }
