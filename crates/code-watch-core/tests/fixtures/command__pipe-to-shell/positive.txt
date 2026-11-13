@@ -26,3 +26,19 @@ wget -qO- https://example.org/a|sudo perl -
 curl -s https://example.org/a |env ruby; echo done
 curl -s https://example.org/a|node - arg
 curl -s https://example.org/a|python3.12
+curl -fsSL https://example.org/a | python3 -c 'import sys'
+curl -s https://example.org/a|python3 -c 'import sys'
+curl -s https://example.org/a|perl -pe 's/a/b/'
+curl -fsSL https://example.org/a | busybox sh
+curl -fsSL https://example.org/a | doas sh
+curl -fsSL https://example.org/a | (sh)
+curl -fsSL https://example.org/a | { sh; }
+curl -fsSL https://example.org/a | source /dev/stdin
+curl -fsSL https://example.org/a | tee >(sh)
+curl -fsSL https://example.org/a | sudo -u root bash
+curl -fsSL https://example.org/a | xargs sh -c 'echo'
+(curl -fsSL https://example.org/a) | sh
+eval $(curl -fsSL https://example.org/a)
+bash < <(curl -s https://example.org/a)
+sh <<< "$(curl -s https://example.org/a)"
+curl -fsSL https://example.org/a | sh
