@@ -3,7 +3,27 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use assert_cmd::Command;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+
+/// Held while writing an executable and while spawning: a fork must not hold a write fd (ETXTBSY on Linux).
+static EXEC_LOCK: Mutex<()> = Mutex::new(());
+
+fn locked() -> std::sync::MutexGuard<'static, ()> {
+    EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn output(cmd: &mut Command) -> Output {
+    let child = {
+        let _guard = locked();
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    child.wait_with_output().unwrap()
+}
 
 /// A tempdir world: copies of the binary with their own shim dirs, fake "real" tools that
 /// record their argv (NUL-separated) and exit with a chosen code, and a config dir.
@@ -30,17 +50,18 @@ impl World {
     fn copy_of_binary(&self, dir: &str) -> PathBuf {
         fs::create_dir_all(self.p(dir)).unwrap();
         let target = self.p(dir).join("code-watch");
+        let _guard = locked();
         fs::copy(assert_cmd::cargo::cargo_bin("code-watch"), &target).unwrap();
         target
     }
 
     fn install_shims(&self, binary: &Path, dir: &str) {
-        let out = Command::new(binary)
-            .args(["shims", "install"])
-            .arg(self.p(dir))
-            .env("HOME", self.p("cfg"))
-            .output()
-            .unwrap();
+        let out = output(
+            Command::new(binary)
+                .args(["shims", "install"])
+                .arg(self.p(dir))
+                .env("HOME", self.p("cfg")),
+        );
         assert!(
             out.status.success(),
             "{}",
@@ -51,6 +72,7 @@ impl World {
     /// A fake tool in `dir` that writes its argv to `<dir>/<name>.argv` and exits with `code`.
     fn fake_tool(&self, dir: &str, name: &str, code: i32) {
         fs::create_dir_all(self.p(dir)).unwrap();
+        let _guard = locked();
         let path = self.p(dir).join(name);
         let log = self.p(&format!("{dir}/{name}.argv"));
         fs::write(
@@ -88,7 +110,7 @@ impl World {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.output().unwrap()
+        output(&mut cmd)
     }
 }
 
@@ -255,11 +277,11 @@ fn install_twice_is_fine_and_uninstall_keeps_foreign_files() {
     fs::write(w.p("shims/notes.txt"), "mine").unwrap();
     fs::remove_file(w.p("shims/npm")).unwrap();
     fs::write(w.p("shims/npm"), "foreign").unwrap();
-    let out = Command::new(&bin)
-        .args(["shims", "uninstall"])
-        .arg(w.p("shims"))
-        .output()
-        .unwrap();
+    let out = output(
+        Command::new(&bin)
+            .args(["shims", "uninstall"])
+            .arg(w.p("shims")),
+    );
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("kept npm"));
     assert!(!w.p("shims/git").exists() && fs::symlink_metadata(w.p("shims/git")).is_err());
@@ -274,11 +296,11 @@ fn install_over_a_foreign_file_or_foreign_link_writes_nothing() {
     fs::create_dir(w.p("shims")).unwrap();
     fs::write(w.p("shims/yarn"), "foreign").unwrap();
     symlink("/usr/bin/true", w.p("shims/pip")).unwrap();
-    let out = Command::new(&bin)
-        .args(["shims", "install"])
-        .arg(w.p("shims"))
-        .output()
-        .unwrap();
+    let out = output(
+        Command::new(&bin)
+            .args(["shims", "install"])
+            .arg(w.p("shims")),
+    );
     assert_eq!(out.status.code(), Some(3));
     assert!(stderr(&out).contains("yarn, pip"));
     assert!(fs::symlink_metadata(w.p("shims/git")).is_err());
