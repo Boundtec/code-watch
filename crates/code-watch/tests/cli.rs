@@ -556,3 +556,74 @@ fn an_error_message_naming_a_hostile_path_is_cleaned() {
     assert!(err.contains("no?[31mwhere"), "{err:?}");
     assert!(!err.contains('\u{1b}'));
 }
+
+#[test]
+fn download_of_a_missing_path_exits_with_the_error_code() {
+    let out = code_watch()
+        .args(["download", "/nonexistent/x.dmg"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn download_of_another_kind_is_allowed_and_json_names_the_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes.txt");
+    fs::write(&file, "hello world").unwrap();
+    let out = code_watch()
+        .args(["--json", "download"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    if cfg!(target_os = "macos") {
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(json["layers"]["download"], "ran");
+    } else {
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(json["layers"]["download"], "skipped");
+        assert!(
+            json["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["rule_id"] == "download/unchecked")
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn download_off_macos_says_the_layer_was_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.dmg");
+    fs::write(&file, "x").unwrap();
+    let out = code_watch().arg("download").arg(&file).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("download skipped (macOS only)"));
+    assert!(text.contains("download/unchecked"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_repo_file_next_to_a_download_cannot_allow_its_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(
+        dir.path().join(".code-watch.toml"),
+        "schema = 1\n[[allow]]\nrule = \"download/unsigned-image\"\n",
+    )
+    .unwrap();
+    let image = dir.path().join("x.dmg");
+    fs::write(&image, vec![0u8; 4096]).unwrap();
+    let out = code_watch()
+        .env("XDG_CONFIG_HOME", dir.path().join("none"))
+        .arg("download")
+        .arg(&image)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("download/unsigned-image"));
+}

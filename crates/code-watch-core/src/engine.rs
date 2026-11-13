@@ -8,6 +8,7 @@ use ignore::WalkBuilder;
 
 use crate::allow::Allowlists;
 use crate::command;
+use crate::download::{self, DownloadError, DownloadStatus, MacTools};
 use crate::osv::{self, Cache, OsvClient, OsvMode, RULE_IDS};
 use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{HEAD_BYTES, RuleError, RuleSet, Target};
@@ -249,7 +250,29 @@ impl Engine {
             .map(|r| r.id.clone())
             .chain(rust_rules)
             .chain(RULE_IDS.iter().map(|id| id.to_string()))
+            .chain(download::RULE_IDS.iter().map(|id| id.to_string()))
             .collect()
+    }
+
+    /// Checks a downloaded file. `tools` is `None` where the layer is not available (not macOS):
+    /// the report then says the layer was skipped and carries a warning finding, never a pass.
+    pub fn check_download(
+        &self,
+        path: &Path,
+        tools: Option<&dyn MacTools>,
+        allow: &Allowlists,
+    ) -> Result<Report, DownloadError> {
+        let subject = download::subject(path)?;
+        let (findings, status) = match tools {
+            Some(tools) => (download::analyze(&subject, tools), DownloadStatus::Ran),
+            None => (
+                vec![download::unavailable(&subject)],
+                DownloadStatus::Skipped("macOS only".into()),
+            ),
+        };
+        let applied = allow.apply(findings, &self.known_rule_ids());
+        Ok(Report::from_download(applied.kept, status)
+            .with_allowlist(applied.suppressed, applied.warnings))
     }
 
     pub fn check_command(&self, command: &str) -> Report {

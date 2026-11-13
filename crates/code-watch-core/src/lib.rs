@@ -3,6 +3,7 @@
 
 pub mod allow;
 pub mod command;
+pub mod download;
 pub mod engine;
 pub mod finding;
 mod names;
