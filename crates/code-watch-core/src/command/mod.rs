@@ -6,6 +6,7 @@ mod domains;
 mod fetch;
 mod parse;
 mod readers;
+mod resolve;
 
 use crate::finding::{Evidence, Finding, Layer, Severity};
 use analysis::{Limit, Occurrence};
@@ -92,7 +93,26 @@ pub const RULES: &[BuiltinRule] = &[
 /// Programs that write to every path word.
 const WRITERS: &[&str] = &["touch", "dd", "curl", "wget", "defaults", "plutil"];
 /// Programs whose last path word is the one written.
-const COPIERS: &[&str] = &["cp", "mv", "ln", "install", "rsync"];
+const COPIERS: &[&str] = &["cp", "mv", "ln", "install", "rsync", "ditto"];
+/// Extractors that write into the directory named by one of their flags; `extracts` is the flag
+/// letter or word that makes them write (`tar -x`), empty when they always do.
+struct DirWriter {
+    program: &'static str,
+    dir_flags: &'static [&'static str],
+    extracts: &'static [&'static str],
+}
+const DIR_WRITERS: &[DirWriter] = &[
+    DirWriter {
+        program: "unzip",
+        dir_flags: &["-d"],
+        extracts: &[],
+    },
+    DirWriter {
+        program: "tar",
+        dir_flags: &["-C", "--directory"],
+        extracts: &["x", "--extract", "--get"],
+    },
+];
 const LAUNCH_DIRS: &[&str] = &["launchagents", "launchdaemons"];
 /// How many levels of `$(...)`, `<(...)`, `sh -c` and `eval` text are analysed again; reaching
 /// it is reported, never ignored.
@@ -111,7 +131,7 @@ pub fn analyze(command: &str, macos: bool) -> Vec<Finding> {
         findings.extend(quarantine(&occ.simple, command));
         if macos {
             findings.extend(osascript(&occ.simple, command));
-            findings.extend(launch_agent(&occ.simple, command));
+            findings.extend(launch_agent(occ, command));
         }
     }
     findings.extend(flat.limits.iter().map(|l| limit_finding(l, command)));
@@ -252,19 +272,40 @@ fn osascript(simple: &Simple, command: &str) -> Option<Finding> {
         .words
         .iter()
         .map(|w| w.text.as_str())
+        .chain(
+            simple
+                .attached
+                .here_texts
+                .iter()
+                .map(|h| h.body.text.as_str()),
+        )
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
-    let asks = script.contains("hidden answer")
-        || (script.contains("display dialog") && script.contains("password"));
+    let script = script.split_whitespace().collect::<Vec<_>>().join(" ");
+    let hidden_answer = script.contains("hidden answer")
+        || script.match_indices("hiddenanswer").any(|(at, key)| {
+            script[at + key.len()..]
+                .trim_start()
+                .strip_prefix(':')
+                .is_some_and(|v| v.trim_start().starts_with("true"))
+        });
+    let asks = hidden_answer || (script.contains("display dialog") && script.contains("password"));
     asks.then(|| finding(OSASCRIPT, Severity::Block, command))
 }
 
-fn launch_agent(simple: &Simple, command: &str) -> Option<Finding> {
+/// A relative path is also tried against the directory the text changed to.
+fn launch_agent(occ: &Occurrence, command: &str) -> Option<Finding> {
+    let simple = &occ.simple;
     let writes = written_paths(simple)
         .into_iter()
         .chain(simple.attached.written_files.iter().map(String::as_str))
-        .any(in_launch_dir);
+        .any(|path| {
+            in_launch_dir(path)
+                || occ.cwd.as_deref().is_some_and(|cwd| {
+                    !path.starts_with(['/', '~']) && in_launch_dir(&format!("{cwd}/{path}"))
+                })
+        });
     writes.then(|| finding(LAUNCH_AGENT, Severity::Block, command))
 }
 
@@ -279,7 +320,7 @@ fn in_launch_dir(path: &str) -> bool {
 }
 
 /// The words a program writes to, as far as its name tells: the destination of a copy, every
-/// file of `tee`, any path word of the other writers.
+/// file of `tee` and `sed -i`, the directory of an extraction, any path word of the other writers.
 fn written_paths(simple: &Simple) -> Vec<&str> {
     let Some(program) = simple.program() else {
         return Vec::new();
@@ -288,6 +329,12 @@ fn written_paths(simple: &Simple) -> Vec<&str> {
     let mut operands = args.iter().copied().filter(|a| !a.starts_with('-'));
     if program == "tee" {
         operands.collect()
+    } else if program == "sed" {
+        if args.iter().any(|a| is_in_place(a)) {
+            operands.collect()
+        } else {
+            Vec::new()
+        }
     } else if COPIERS.contains(&program) {
         let target = args.iter().enumerate().find_map(|(i, a)| match *a {
             "-t" | "--target-directory" => args.get(i + 1).copied(),
@@ -297,12 +344,55 @@ fn written_paths(simple: &Simple) -> Vec<&str> {
             .or_else(|| operands.next_back())
             .into_iter()
             .collect()
+    } else if let Some(writer) = DIR_WRITERS.iter().find(|w| w.program == program) {
+        extraction_dir(writer, &args).into_iter().collect()
     } else if WRITERS.contains(&program) {
         args
     } else {
         Vec::new()
     }
 }
+
+/// `-i`, `-i.bak`, `-ni`, `--in-place[=SUFFIX]`.
+fn is_in_place(arg: &str) -> bool {
+    arg.starts_with("--in-place")
+        || arg.strip_prefix('-').is_some_and(|c| {
+            !c.starts_with('-')
+                && c.contains('i')
+                && c.chars().all(|l| l.is_ascii_alphabetic() || l == '.')
+        })
+}
+
+fn extraction_dir<'a>(writer: &DirWriter, args: &[&'a str]) -> Option<&'a str> {
+    let extracts = writer.extracts.is_empty()
+        || args.iter().enumerate().any(|(i, a)| {
+            writer.extracts.iter().any(|flag| {
+                let cluster = a.strip_prefix('-').or_else(|| (i == 0).then_some(*a));
+                a == flag
+                    || (flag.len() == 1
+                        && cluster.is_some_and(|c| !c.starts_with('-') && c.contains(flag)))
+            })
+        });
+    if !extracts {
+        return None;
+    }
+    args.iter().enumerate().find_map(|(i, a)| {
+        writer.dir_flags.iter().find_map(|flag| {
+            if a == flag {
+                args.get(i + 1).copied()
+            } else if let Some(attached) = a.strip_prefix(&format!("{flag}=")) {
+                Some(attached)
+            } else if flag.len() == 2 {
+                a.strip_prefix(flag).filter(|v| !v.is_empty())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+#[cfg(test)]
+mod coverage_tests;
 
 #[cfg(test)]
 mod tests {
@@ -567,7 +657,6 @@ mod tests {
     #[test]
     fn a_program_name_hidden_in_a_dollar_form_warns_when_piped_into_a_shell() {
         for cmd in [
-            "c=curl; $c https://example.org/a | sh",
             "$(echo curl) https://example.org/a | sh",
             "`echo curl` https://example.org/a | bash",
             "$c x | tee f | sh",

@@ -22,11 +22,11 @@ One core, thin entry points. Everything that decides lives in the core; adapters
 
 | Type | What it is |
 |---|---|
-| `Finding` | `rule_id`, `severity` (info / warn / block), `layer` (rules / osv / llm), `title`, `evidence` (file, line, excerpt, truncated), `remediation` |
-| `Target` | What is checked: `Repo(path)`, `Command(argv + cwd)`, `Install(manager, args, cwd)`, `Download(path)` |
+| `Finding` | `rule_id`, `severity` (info / warn / block), `layer` (rules / osv / llm), `title`, `evidence` (file, line, excerpt, truncated), `remediation`, and when the layer knows them `domain` (the host a command rule parsed), `package` and `advisories` (OSV) |
+| `Target` | The kind of input a rule applies to, in `rules.rs`: `Repo` or `Command`. The install and download layers bring their own entry points with them |
 | `Verdict` | `Allow` / `Warn` / `Block`, derived from the findings, never stored on its own |
-| `Report` | Findings plus the derived verdict plus which layers ran (so "LLM layer off" is always said) |
-| `Layer` | Trait `fn analyze(&self, &Target, &Ctx) -> Vec<Finding>`; the five product layers are modules that provide rules or sources for it |
+| `Report` | Findings plus the derived verdict, which layers ran or were skipped (so "LLM layer off" is always said), the rules that are not active on this platform (`skipped_rules`), the findings an allowlist hid and its warnings |
+| `Layer` | An enum (`Rules`, `Osv`, `Llm`) stamped on each finding. The engine calls the layer modules; there is no layer trait |
 
 ### The five product layers as modules
 
@@ -39,7 +39,7 @@ One core, thin entry points. Everything that decides lives in the core; adapters
 | 5 Downloads | `download` | `Download` | quarantine, signature, notarization (macOS only) |
 
 macOS-only checks are compiled everywhere and registered only when `cfg!(target_os = "macos")`; on Linux they are absent
-and `--json` lists them under `skipped_layers`.
+and `--json` lists them under `skipped_rules` (`skipped_layers` carries the note of a layer that did not run, such as the OSV layer being offline with no fresh cache).
 
 ### Rules format
 
@@ -95,7 +95,7 @@ and exits. Adapters and shims contain no rules.
 | agent adapters | each one is a tiny `code-watch adapter <agent>` subcommand that reads that agent's hook JSON on stdin, calls `check`, and prints that agent's response format |
 | PATH shims | `code-watch shims install <dir>` links `git`, `npm`, `pnpm`, `yarn`, `pip`, `brew`, `curl` to the binary, which dispatches on argv[0]: it checks its own argv, then execs the first real tool on `PATH` that is not a code-watch binary |
 
-Adding an agent = one new adapter module implementing `trait Adapter { fn parse(&self, stdin: &[u8]) -> Result<Call>; fn reply(&self, Decision, &Policy) -> Reply; }`.
+Adding an agent = one new adapter module implementing `trait Adapter { fn parse(&self, stdin: &[u8]) -> anyhow::Result<Call>; fn reply(&self, decision: Decision, policy: &Policy) -> Reply; }`. `Decision` is `Allow`, `Ask`, `Deny` or `Unchecked` (the command could not be checked), and `Reply` is the JSON for stdout, an optional note for stderr and whether the exit code is 2.
 
 ### Exit codes and output
 
@@ -107,8 +107,8 @@ Adding an agent = one new adapter module implementing `trait Adapter { fn parse(
 | 3 | internal or usage error (clap's usage error is mapped to 3 so 2 always means block). A fail-closed adapter (the default) exits 2 instead for every failure, since agents block only on 2; `--fail-open` keeps 3 |
 
 Human output: one line per finding (`BLOCK repo/npm-lifecycle-script package.json:12 ...`), a footer with layers that
-ran and layers that are off. `--json`: `{ "verdict", "layers": {rules, osv, llm: "ran"|"off"|"skipped"}, "findings": [...] }`
-with a `schema` number; the finding shape above is the public contract.
+ran and layers that are off. `--json`: `{ "schema", "verdict", "layers": {rules, osv, llm: "ran"|"off"|"skipped"}, "findings", "skipped", "skipped_rules", "skipped_layers", "suppressed", "allowlist_warnings" }`;
+the `schema` number is bumped on any breaking change and the finding shape above is the public contract.
 
 ## 2. Crate survey
 
@@ -145,7 +145,7 @@ No async runtime anywhere. `cargo-deny` runs in CI to keep the license list hone
 
 ## 3. Agent hook APIs (read 2026-11-12, re-read 2026-11-13)
 
-Update 2026-11-13 (slice 11): Gemini CLI `BeforeTool` is as listed below, with no `ask` decision (only `allow`,
+Update (slice 11): Gemini CLI `BeforeTool` is as listed below, with no `ask` decision (only `allow`,
 `deny`, `block`), so a warning is a deny that tells the model to ask the user; the OpenCode docs now describe a different plugin
 API (`Plugin.define`) without hook details, so the plugin follows the older `tool.execute.before` shape that
 third-party plugins use and is untested against a live OpenCode. OpenCode cannot ask either, so a warning is denied
@@ -160,19 +160,19 @@ read the JSON on stdin, extract the command, run `code-watch check`, translate t
 
 | Agent | Hook | Doc | Adapter |
 |---|---|---|---|
-| Claude Code | `PreToolUse` with matcher `Bash` in `~/.claude/settings.json`; stdin has `tool_name`, `tool_input.command`, `cwd` | [hooks](https://code.claude.com/docs/en/hooks) | read `tool_input.command`; block = exit 2 with the reason on stderr, or JSON `hookSpecificOutput.permissionDecision = "deny"`; warn = `"ask"` |
+| Claude Code | `PreToolUse` with matcher `Bash` in `~/.claude/settings.json`; stdin has `tool_name`, `tool_input.command`, `cwd` | [hooks](https://code.claude.com/docs/en/hooks) | read `tool_input.command`; block = JSON `hookSpecificOutput.permissionDecision = "deny"` (exit 0); warn = `"ask"` |
 | Cursor | `beforeShellExecution` in `~/.cursor/hooks.json` (or per project); stdin has `command`, `cwd`, `sandbox` | [hooks](https://cursor.com/docs/hooks) | read `command`; reply JSON `{"permission": "allow"\|"deny"\|"ask", "user_message", "agent_message"}`; set `failClosed: true` |
-| Codex CLI | `PreToolUse` hooks in `~/.codex/hooks.json` or `config.toml` `[hooks]`, matcher on `tool_name` (shell is `Bash`); stdin has `tool_name`, `tool_input`, `cwd`, `turn_id` | [hooks](https://learn.chatgpt.com/docs/hooks) (the old `developers.openai.com/codex/hooks` URL redirects here) | same shape as Claude Code: `permissionDecision` deny/ask or exit 2 |
-| Gemini CLI | `BeforeTool` in `~/.gemini/settings.json`, matcher `run_shell_command`; stdin has `tool_name`, `tool_input.command`, `cwd` | [hooks](https://geminicli.com/docs/hooks/), [reference](https://geminicli.com/docs/hooks/reference/) | block = exit 2 (stderr is the reason) or stdout JSON `{"decision": "deny", "reason": ...}`; stdout must be only that JSON |
-| OpenCode | no command-hook config: a JS/TS plugin in `.opencode/plugins/` or `~/.config/opencode/plugins/` with `tool.execute.before(input, output)`; for `input.tool === "bash"` the command is `output.args.command`; throwing blocks it | [plugins](https://opencode.ai/docs/plugins/) | `code-watch install-adapter opencode` writes a ~15-line plugin that runs `code-watch check` via `Bun.spawn` and throws on exit 2; the plugin is the only non-Rust file we ship |
+| Codex CLI | `PreToolUse` hooks in `~/.codex/hooks.json` or `config.toml` `[hooks]`, matcher on `tool_name` (shell is `Bash`); stdin has `tool_name`, `tool_input`, `cwd`, `turn_id` | [hooks](https://learn.chatgpt.com/docs/hooks) (the old `developers.openai.com/codex/hooks` URL redirects here) | same shape as Claude Code: `permissionDecision` deny; a warning is a deny too until `--codex-warn allow` |
+| Gemini CLI | `BeforeTool` in `~/.gemini/settings.json`, matcher `run_shell_command`; stdin has `tool_name`, `tool_input.command`, `cwd` | [hooks](https://geminicli.com/docs/hooks/), [reference](https://geminicli.com/docs/hooks/reference/) | block = stdout JSON `{"decision": "deny", "reason": ...}` (exit 0), stdout must be only that JSON; warn = the same deny with a note to ask the user, as Gemini has no `ask` |
+| OpenCode | no command-hook config: a JS/TS plugin in `.opencode/plugins/` or `~/.config/opencode/plugins/` with `tool.execute.before(input, output)`; for `input.tool === "bash"` the command is `output.args.command`; throwing blocks it | [plugins](https://opencode.ai/docs/plugins/) | `code-watch install-adapter opencode` writes a small plugin that runs `code-watch adapter opencode` via `Bun.spawn` and throws on its `deny` answer; the plugin is the only non-Rust file we ship |
 
 Where a hook does not exist: none of the five lacks one today, but the OpenCode one is a plugin and not a config
 entry. Any other agent or harness (Aider, Zed, a custom script, a plain terminal) falls back to the PATH shims. Shims
 also cover commands an agent runs through paths the hook does not see.
 
 Gotcha shared by all: hook exit codes other than the documented block code fail open, so adapters wrap `check` so that
-an internal error follows `--fail-open` / `--fail-closed` explicitly instead of by accident: fail-closed exits 2 with the
-reason on stderr. Codex has no fail-closed setting for a missing binary.
+an internal error follows `--fail-open` / `--fail-closed` explicitly instead of by accident: a fail-closed adapter that
+cannot decide answers deny and exits 2 with the reason on stderr. A decided block is the deny JSON with exit 0. Codex has no fail-closed setting for a missing binary.
 
 ## 4. Build plan
 
@@ -184,7 +184,7 @@ Each slice is about one worker-day, one reviewable PR, with its tests and its RE
 | 2 | Repo layer, rest | `setup.py`, Makefile targets, committed binaries / obfuscation, secret-reading-and-sending patterns; rules schema docs |
 | 3 | Allowlists | user and per-repo files, precedence, the "repo cannot allow itself" rule, `docs/allowlist.md` |
 | 4 | Git hook | `install-hook` / `uninstall-hook`, global template dir, `post-checkout` scan on clone |
-| 5 | Command layer | parsed commands (`brush-parser`), `curl \| sh`, base64 into shell, quarantine removal, `osascript` password, LaunchAgents writes, lookalike-domain check (`idna`, `psl`, `unicode-security`, `strsim`) |
+| 5 | Command layer | parsed commands (`brush-parser`), `curl \| sh`, base64 into shell, quarantine removal, `osascript` password, LaunchAgents writes, lookalike-domain check (`idna`, `psl`, `unicode-security`, `strsim`); variables and `cd` set earlier in the text are followed, and a text a child runs (`sh -c`, `ssh`, `docker run ... sh -c`, inline code of an interpreter) is analysed with them |
 | 6 | Lockfiles + OSV | parsers per ecosystem behind one `PackageSource` trait, OSV client behind a trait with a fake, offline cache with injected clock |
 | 7 | Install layer | `npm/pnpm/yarn install`, `pip install`, `brew install` unknown tap: shows what will run before it runs |
 | 8 | Downloads layer | `.dmg` / `.pkg` quarantine, `codesign` / `spctl` shell-out behind a trait with a fake, macOS only |

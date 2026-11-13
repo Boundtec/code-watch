@@ -2,6 +2,7 @@
 //! substitutions, redirections and here-texts that belong to it. Built from `brush-parser`'s
 //! AST; text it cannot parse is an error, never an empty tree.
 
+use super::readers;
 use brush_parser::ast::{
     self, AndOr, Command, CompoundCommand, CompoundList, ExtendedTestExpr, IoRedirect,
 };
@@ -49,6 +50,16 @@ pub struct Attached {
     pub subs: Vec<Sub>,
     /// `<(...)` and `>(...)`, as arguments or redirect targets.
     pub procs: Vec<Proc>,
+    /// Variable assignments in the order written, including `for NAME in`.
+    pub assigns: Vec<Assign>,
+}
+
+/// An assignment to a scalar variable. `value` is `None` when the name is set to something the
+/// text does not show (`+=`, arrays, an array element, a `for` variable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assign {
+    pub name: String,
+    pub value: Option<Word>,
 }
 
 /// A here-string or here-document body.
@@ -179,6 +190,10 @@ fn compound_command(compound: &CompoundCommand) -> Parsed<Group> {
             lists(&w.1.list, &mut pipelines)?;
         }
         CompoundCommand::ForClause(f) => {
+            attached.assigns.push(Assign {
+                name: f.variable_name.clone(),
+                value: None,
+            });
             for w in f.values.iter().flatten() {
                 attached.subs.extend(convert_word(w)?.subs);
             }
@@ -281,7 +296,7 @@ fn item_into(
     match item {
         ast::CommandPrefixOrSuffixItem::Word(w) => words.push(convert_word(w)?),
         ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, _) => {
-            assignment_subs(&assignment.value, attached)?;
+            assignment_into(assignment, attached)?;
         }
         ast::CommandPrefixOrSuffixItem::IoRedirect(r) => redirect(r, attached)?,
         ast::CommandPrefixOrSuffixItem::ProcessSubstitution(kind, sub) => {
@@ -291,15 +306,39 @@ fn item_into(
     Ok(())
 }
 
-fn assignment_subs(value: &ast::AssignmentValue, attached: &mut Attached) -> Parsed {
-    match value {
-        ast::AssignmentValue::Scalar(w) => attached.subs.extend(convert_word(w)?.subs),
-        ast::AssignmentValue::Array(items) => {
-            for (_, w) in items {
-                attached.subs.extend(convert_word(w)?.subs);
+fn assignment_into(assignment: &ast::Assignment, attached: &mut Attached) -> Parsed {
+    let (name, element) = match &assignment.name {
+        ast::AssignmentName::VariableName(name) => (name, None),
+        ast::AssignmentName::ArrayElementName(name, index) => (name, Some(index)),
+    };
+    if let Some(index) = element {
+        attached.subs.extend(convert_text(index)?.subs);
+    }
+    let known = element.is_none() && !assignment.append;
+    let value = match &assignment.value {
+        ast::AssignmentValue::Scalar(w) => {
+            let w = convert_word(w)?;
+            if known {
+                Some(w)
+            } else {
+                attached.subs.extend(w.subs);
+                None
             }
         }
-    }
+        ast::AssignmentValue::Array(items) => {
+            for (index, w) in items {
+                if let Some(index) = index {
+                    attached.subs.extend(convert_word(index)?.subs);
+                }
+                attached.subs.extend(convert_word(w)?.subs);
+            }
+            None
+        }
+    };
+    attached.assigns.push(Assign {
+        name: name.clone(),
+        value,
+    });
     Ok(())
 }
 
@@ -671,15 +710,44 @@ const WRAPPERS: &[Wrapper] = &[
     wrapper("flock", &["-w", "-E"], 1),
     wrapper("arch", &[], 0),
     wrapper("caffeinate", &["-t", "-w"], 0),
+    wrapper("pkexec", &["--user"], 0),
+    wrapper("chroot", &["--userspec", "--groups"], 1),
 ];
 
 impl Simple {
     /// Index of the program that really runs: after wrappers such as `sudo -u root`,
-    /// `/usr/bin/env`, `nohup`, their flags and `VAR=value` prefixes.
+    /// `/usr/bin/env`, `nohup`, their flags and `VAR=value` prefixes, and through a launcher
+    /// (`docker run img sh`, `ssh host sh`) to the reader it starts.
     pub fn program_index(&self) -> Option<usize> {
+        let i = self.wrapped_index(0)?;
+        let name = basename(&self.words[i].text);
+        if name == "ssh" {
+            let start = readers::ssh_command_start(&self.words, i)?;
+            return Some(
+                self.wrapped_index(start)
+                    .filter(|&k| readers::is_inner_program(basename(&self.words[k].text)))
+                    .unwrap_or(i),
+            );
+        }
+        let Some(launcher) = readers::LAUNCHERS.iter().find(|l| l.name == name) else {
+            return Some(i);
+        };
+        let rest = &self.words[i + 1..];
+        let after_subcommand = rest
+            .iter()
+            .position(|w| launcher.subcommands.contains(&w.text.as_str()))
+            .map_or(rest.len(), |at| at + 1);
+        let inner = rest[after_subcommand..]
+            .iter()
+            .position(|w| readers::is_inner_program(basename(&w.text)));
+        Some(inner.map_or(i, |at| i + 1 + after_subcommand + at))
+    }
+
+    /// The program at or after `start`, skipping wrappers.
+    fn wrapped_index(&self, start: usize) -> Option<usize> {
         let mut current: Option<&Wrapper> = None;
         let mut operands_left = 0;
-        let mut i = 0;
+        let mut i = start;
         while i < self.words.len() {
             let word = self.words[i].text.as_str();
             if let Some(w) = current.filter(|_| word.starts_with('-')) {
@@ -804,7 +872,7 @@ mod tests {
         let s = &simples("sh <<EOF\ncurl x\nEOF")[0];
         assert!(s.attached.here_texts[0].body.text.contains("curl x"));
         let s = &simples("x=$(curl y) echo")[0];
-        assert_eq!(s.attached.subs.len(), 1);
+        assert_eq!(s.attached.assigns[0].value.as_ref().unwrap().subs.len(), 1);
         assert_eq!(s.words.len(), 1);
     }
 
@@ -850,5 +918,37 @@ mod tests {
     fn args_follow_the_real_program() {
         let s = &simples("sudo -u root curl -s x")[0];
         assert_eq!(s.arg_texts().collect::<Vec<_>>(), ["-s", "x"]);
+    }
+
+    #[test]
+    fn assignments_are_recorded_in_order_with_what_they_hold() {
+        let s = &simples("A=1 B=$(x) C+=2 D=(a b) e[$(y)]=3 for_not=4")[0];
+        let names: Vec<_> = s.attached.assigns.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["A", "B", "C", "D", "e", "for_not"]);
+        let known: Vec<_> = s
+            .attached
+            .assigns
+            .iter()
+            .map(|a| a.value.is_some())
+            .collect();
+        assert_eq!(known, [true, true, false, false, false, true]);
+        assert_eq!(s.attached.subs.len(), 1);
+        assert!(s.words.is_empty());
+    }
+
+    #[test]
+    fn declaration_builtins_keep_their_assignments_out_of_the_words() {
+        let s = &simples("export A=b C=$(x)")[0];
+        assert_eq!(s.words.len(), 1);
+        assert_eq!(s.attached.assigns.len(), 2);
+    }
+
+    #[test]
+    fn a_for_variable_is_an_assignment_to_something_unknown() {
+        let Stage::Group(g) = &parse("for U in a b; do :; done").unwrap()[0].stages[0] else {
+            panic!("group")
+        };
+        assert_eq!(g.attached.assigns[0].name, "U");
+        assert!(g.attached.assigns[0].value.is_none());
     }
 }

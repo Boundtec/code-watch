@@ -4,7 +4,7 @@ A local guard that checks your machine **before** risky code runs: a repository 
 agent is about to execute, an install, a download. Open source (Apache-2.0), written in Rust, one binary for macOS and
 Linux. Windows is not supported.
 
-> Status: early. It ships the engine, the CLI, the repo and command rules, allowlists and the OSV layer. See
+> Status: early. It ships the engine, the CLI, the repo and command rules, allowlists, the OSV layer, agent adapters and PATH shims. See
 > [DESIGN.md](DESIGN.md) for the plan.
 
 ## Try it
@@ -63,7 +63,7 @@ reaches that shell": a shell, an interpreter such as `python3` run without a scr
 or `source /dev/stdin` anywhere downstream in the same pipeline counts, and wrappers such as `sudo -u root`, `doas`,
 `env`, `busybox`, `nohup`, `exec`, `command`, `xargs`, `time` and `nice` are skipped to find the real program. Text that
 cannot be parsed, a command over 64 KiB, or nesting deeper than three levels is a finding too, never a clean pass. The lookalike check reads the host
-of every argument of `curl` and `wget` (with or without `https://`, `--url=` included), decodes punycode, takes the
+of every argument of a fetch such as `curl`, `wget`, `http` or `aria2c` (with or without `https://`, `--url=` included), decodes punycode, takes the
 registrable domain from the public suffix list and compares it with a list of well-known domains by Unicode skeleton,
 a single edit, and the same name under another suffix. Real sibling sites (`gitlab.com`, `docker.io`) are never
 flagged. A known domain used as the leftmost labels of another one (`github.com.attacker.example`) or as the userinfo
@@ -71,7 +71,7 @@ of a URL (`https://github.com@attacker.example`) is flagged too; a host that is 
 A shell's `-c` script and the inside of its `$(...)`, backticks and `<(...)` are analysed again, three levels deep; a
 download inside them counts as feeding a shell.
 
-Limits: values only known at run time, such as variables, are not followed, and other layers and your own review still apply. The macOS-only rules run only on macOS; elsewhere `check` lists them under `skipped_rules` in
+Variables and `cd` that the command text sets itself are followed, and so are programs that run text or code (`ssh`, `docker run ... sh -c`, `python3 -c`, a file a download wrote and a later command runs). Limits: values only known at run time are not followed, and other layers and your own review still apply. The macOS-only rules run only on macOS; elsewhere `check` lists them under `skipped_rules` in
 `--json` and in the human footer.
 
 ## Allowlists

@@ -80,10 +80,19 @@ exist but are not active on this platform.
 The command is parsed with `brush-parser` and every simple command of every list, pipeline, subshell, brace group, `if`/`while`/`for`/`case`,
 `$(...)`, backtick and `<(...)` is judged on its parsed words, wherever it is nested. One table (`command/readers.rs`) says what runs text as a
 script: a shell (by name or path, also through `sudo`, `doas`, `env`, `busybox`, `nohup`, `exec`, `command`, `xargs`, `time`, `nice`), an
-interpreter (`python*`, `perl`, `ruby`, `node`) with no script file or with inline code (`-c`, `-e`, `-pe`), `source`/`.` of `/dev/stdin`, a
-`tee >(...)` whose body holds one, and a group with one inside. A download or a base64/`xxd -r` decoder whose output reaches one of these, in the
+interpreter (`python*`, `perl`, `ruby`, `node`, `php`, `lua`, `tclsh`, `osascript`) with no script file or with inline code (`-c`, `-e`, `-pe`, `-r`), `awk`
+when its program runs commands, `ssh` and `su -c` when the command they run holds one (`ssh host` alone opens a shell that reads stdin), `source`/`.` of
+`/dev/stdin`, a `tee >(...)` whose body holds one, and a group with one inside. `docker`, `podman`, `kubectl`, `chroot`, `pkexec` and the like are
+looked through to the program they start. A fetch is `curl`, `wget`, `http`/`https`, `aria2c`, `fetch` or `lwp-download`; a decoder also covers
+`python -m base64 -d`, `basenc` and the decompressors (`gzip -dc`, `zcat`, `xz`, `bzip2`, `zstd`). A download or a base64/`xxd -r` decoder whose output reaches one of these, in the
 same pipeline or because it sits inside the `$(...)` that is the whole text of `sh -c`/`eval`, or inside a `<(...)` or here-string a shell reads,
-is judged as running.
+is judged as running. Text that a program runs is analysed again: the `-c` text of a shell, `eval`, the command of `ssh` and `su -c`, a here-document, the
+text that `echo`/`printf` print into a reader, and the quoted strings of the code given to another interpreter (`python3 -c`, `perl -e`, `awk`, `osascript -e`).
+A file a fetch wrote and a later command runs counts like a pipe, and so does text written to a file and then run.
+
+Variables and `cd` are followed when the command text itself sets them: `NAME=literal` (also `export`, `local`, `readonly`), `NAME=$(...)` held and later run
+(`x=$(curl ...); sh -c "$x"`), and `cd <literal>` for relative paths. A prefix assignment (`U=x sh -c '...'`) is seen by the command it prefixes, and
+everything bound so far is seen by the texts that command runs. A value the text does not show (the environment, `read`, arithmetic) is never guessed.
 
 - `command/pipe-to-shell` (warn): a `curl` or `wget` whose output is run as a script. Piping into an interpreter that runs inline code
   (`python3 -c ...`) counts: the downloaded text goes into an interpreter that executes code, and the code can run what it reads.
@@ -97,8 +106,9 @@ is judged as running.
 - `command/hidden-program-into-shell` (warn) fires when a pipeline ends in a script reader and a command's program word still holds a `$`
   or a backtick after unquoting (`$c`, `$(echo curl)`, also a `$HOME/bin/tool` prefix), and when `eval` gets a variable
   (`eval "$x"`). `eval "$(...)"` does not fire: the substitution is analysed as its own text.
-- `command/launchagent-write` matches `Library/LaunchAgents` and `Library/LaunchDaemons` as path components, not as a substring.
+- `command/launchagent-write` matches `Library/LaunchAgents` and `Library/LaunchDaemons` as path components, not as a substring. Redirects, copies, `tee`, `sed -i`,
+  `unzip -d` and `tar -C` extractions count, also with a relative path after a `cd` into the folder.
 
-What they do not see: values only known at run time, such as variables, are not followed, and other layers and your own review still apply. A lookalike is one edit away (or the same name under another suffix, or the same Unicode skeleton) from
+What they do not see: values only known at run time, a script that is only in a file the text does not write, and other layers and your own review still apply. A lookalike is one edit away (or the same name under another suffix, or the same Unicode skeleton, or the same name with dots and hyphens moved) from
 the known list; `SIBLINGS` in `domains.rs` lists real sites that must never be flagged, so a new known domain that
 collides with a real one gets a negative fixture and a sibling entry.
