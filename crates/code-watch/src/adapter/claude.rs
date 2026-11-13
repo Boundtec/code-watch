@@ -14,9 +14,6 @@ impl Adapter for ClaudeCode {
             Decision::Ask { reason, .. } => Some(pretool::decision("ask", reason)),
             Decision::Deny(reason) => Some(pretool::decision("deny", reason)),
         };
-        Reply {
-            stdout,
-            stderr: None,
-        }
+        Reply::new(stdout, None)
     }
 }

@@ -23,11 +23,13 @@ struct Output {
     agent_message: Option<String>,
 }
 
-fn output(permission: &'static str, message: Option<String>) -> Value {
+/// `user_message` is shown to the user and `agent_message` goes to the model, so only the
+/// former may say how to allow a command.
+fn output(permission: &'static str, user: Option<String>, agent: Option<String>) -> Value {
     json!(Output {
         permission,
-        user_message: message.clone(),
-        agent_message: message,
+        user_message: user,
+        agent_message: agent,
     })
 }
 
@@ -52,15 +54,14 @@ impl Adapter for Cursor {
     fn reply(&self, decision: Decision, policy: &Policy) -> Reply {
         let stdout = match decision {
             Decision::Allow => match policy.cursor_clean {
-                CursorClean::Ask => output("ask", None),
-                CursorClean::Allow => output("allow", None),
+                CursorClean::Ask => output("ask", None, None),
+                CursorClean::Allow => output("allow", None, None),
             },
-            Decision::Ask { reason, .. } => output("ask", Some(reason)),
-            Decision::Deny(reason) => output("deny", Some(reason)),
+            Decision::Ask { reason, allow_hint } => {
+                output("ask", Some(format!("{reason} {allow_hint}")), Some(reason))
+            }
+            Decision::Deny(reason) => output("deny", Some(reason.clone()), Some(reason)),
         };
-        Reply {
-            stdout: Some(stdout),
-            stderr: None,
-        }
+        Reply::new(Some(stdout), None)
     }
 }

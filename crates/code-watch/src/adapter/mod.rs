@@ -20,6 +20,8 @@ mod pretool;
 /// More stdin than this is refused, not truncated, so a hidden tail cannot dodge the check.
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
 const EXIT_ERROR: u8 = 3;
+/// Agents block only on exit 2; any other non-zero code lets the command run.
+const EXIT_BLOCK: u8 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 pub enum Agent {
@@ -75,11 +77,23 @@ pub enum Decision {
 }
 
 /// The adapter's answer: the JSON for stdout (none = the agent's "no opinion") and an optional
-/// note for stderr. The exit code is always 0 so the agent reads the JSON.
+/// note for stderr. The exit code is 0 so the agent reads the JSON, except when a fail-closed
+/// adapter could not decide: then `block_exit` makes it 2, the one code every agent blocks on.
 #[derive(Debug, PartialEq)]
 pub struct Reply {
     pub stdout: Option<Value>,
     pub stderr: Option<String>,
+    pub block_exit: bool,
+}
+
+impl Reply {
+    pub fn new(stdout: Option<Value>, stderr: Option<String>) -> Self {
+        Self {
+            stdout,
+            stderr,
+            block_exit: false,
+        }
+    }
 }
 
 pub trait Adapter {
@@ -101,8 +115,9 @@ pub fn run(agent: Agent, policy: Policy, user_dir: Option<&Path>) -> ExitCode {
     if let Some(note) = &reply.stderr {
         let _ = writeln!(io::stderr(), "code-watch: {note}");
     }
+    let ok = if reply.block_exit { EXIT_BLOCK } else { 0 };
     let Some(value) = reply.stdout else {
-        return ExitCode::SUCCESS;
+        return ExitCode::from(ok);
     };
     let mut out = io::stdout().lock();
     match serde_json::to_writer(&mut out, &value)
@@ -110,7 +125,11 @@ pub fn run(agent: Agent, policy: Policy, user_dir: Option<&Path>) -> ExitCode {
         .and_then(|()| writeln!(out))
         .and_then(|()| out.flush())
     {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => ExitCode::from(ok),
+        Err(_) if policy.fail == FailMode::Closed => {
+            let _ = writeln!(io::stderr(), "code-watch: could not write the reply");
+            ExitCode::from(EXIT_BLOCK)
+        }
         Err(_) => ExitCode::from(EXIT_ERROR),
     }
 }
@@ -143,12 +162,15 @@ fn handle(
 
 fn failed(adapter: &dyn Adapter, why: &str, policy: &Policy) -> Reply {
     match policy.fail {
-        FailMode::Closed => adapter.reply(
-            Decision::Deny(format!(
+        FailMode::Closed => {
+            let reason = format!(
                 "code-watch could not check this command: {why}. Use --fail-open to allow commands it cannot check."
-            )),
-            policy,
-        ),
+            );
+            let mut reply = adapter.reply(Decision::Deny(reason.clone()), policy);
+            reply.stderr = Some(reason);
+            reply.block_exit = true;
+            reply
+        }
         FailMode::Open => {
             let mut reply = adapter.reply(Decision::Allow, policy);
             reply.stderr = Some(format!("could not check this command, allowing it: {why}"));
@@ -165,7 +187,7 @@ fn evaluate(
     match adapter.parse(&input?)? {
         Call::Skip => Ok(Decision::Allow),
         Call::Shell { command, cwd } => {
-            let report = crate::check_command(cwd.as_deref(), &command, user_dir)?;
+            let report = crate::check_command(cwd.as_deref(), &command, user_dir, false)?;
             Ok(decide(&report, user_dir))
         }
     }
@@ -197,7 +219,8 @@ fn decide(report: &Report, user_dir: Option<&Path>) -> Decision {
     }
 }
 
-/// Says what lets a warned command through, since asking again changes nothing.
+/// Says what lets a warned command through, since asking again changes nothing. For the user
+/// only: it names the exact entry, so it must not reach text the model reads.
 fn allow_hint(findings: &[Finding], user_dir: Option<&Path>) -> String {
     let mut ids: Vec<String> = Vec::new();
     for f in findings.iter().filter(|f| f.severity == Severity::Warn) {
@@ -216,7 +239,7 @@ fn allow_hint(findings: &[Finding], user_dir: Option<&Path>) -> String {
         },
     );
     format!(
-        "To let it through, add an [[allow]] entry with {} to {file} (a repository's own .code-watch.toml may also allow warnings).",
+        "To let it through, add an [[allow]] entry with {} to {file}.",
         ids.join(" or ")
     )
 }
@@ -242,6 +265,7 @@ mod tests {
         assert!(allow_hint.contains(r#"rule = "command/pipe-to-shell""#));
         assert!(allow_hint.contains("/cfg/code-watch/allow.toml"));
         assert!(!allow_hint.contains("rerun"));
+        assert!(!allow_hint.contains("repository"));
     }
 
     #[test]
@@ -278,6 +302,7 @@ mod tests {
             cursor_clean: CursorClean::Ask,
         };
         let closed = handle(&Panics, Ok(vec![]), &policy(FailMode::Closed), None);
+        assert!(closed.block_exit);
         let open = handle(&Panics, Ok(vec![]), &policy(FailMode::Open), None);
         let _ = panic::take_hook();
         assert!(
@@ -288,6 +313,7 @@ mod tests {
                 .contains("internal error")
         );
         assert_eq!(open.stdout, None);
+        assert!(!open.block_exit);
         assert!(open.stderr.unwrap().contains("internal error"));
     }
 }

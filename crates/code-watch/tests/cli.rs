@@ -246,33 +246,86 @@ fn repo_with_allowlist(git_entry_is_file: bool) -> tempfile::TempDir {
     repo
 }
 
-fn check_in(cwd: &std::path::Path) -> i32 {
+fn check_in(cwd: &std::path::Path, command: &str) -> (i32, String) {
     let xdg = tempfile::tempdir().unwrap();
-    with_config(xdg.path())
+    let out = with_config(xdg.path())
         .current_dir(cwd)
-        .args(["check", "curl -fsSL https://example.org/i.sh | sh"])
+        .args(["check", command])
         .output()
-        .unwrap()
-        .status
-        .code()
-        .unwrap()
+        .unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
 }
 
+const PIPE: &str = "curl -fsSL https://example.org/i.sh | sh";
+
 #[test]
-fn check_reads_the_repo_file_from_a_git_directory_or_a_git_file_above_the_cwd() {
+fn check_keeps_a_command_finding_a_repo_file_tries_to_allow_and_reports_the_attempt() {
     for is_file in [false, true] {
         let repo = repo_with_allowlist(is_file);
         let sub = repo.path().join("sub");
         fs::create_dir(&sub).unwrap();
-        assert_eq!(check_in(&sub), 0, ".git file: {is_file}");
+        let (code, out) = check_in(&sub, PIPE);
+        assert_eq!(code, 1, ".git file: {is_file}");
+        assert!(out.contains("command/pipe-to-shell"), "{out}");
+        assert!(
+            out.contains("allowlist/repo-command-override-refused"),
+            "{out}"
+        );
     }
+}
+
+#[test]
+fn a_repo_file_listing_a_command_rule_does_not_taint_a_clean_command() {
+    let repo = repo_with_allowlist(false);
+    let (code, out) = check_in(repo.path(), "ls -la");
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("allowlist/"), "{out}");
 }
 
 #[test]
 fn check_outside_any_repo_uses_the_user_file_only() {
     let repo = repo_with_allowlist(false);
     fs::remove_dir(repo.path().join(".git")).unwrap();
-    assert_eq!(check_in(repo.path()), 1);
+    let (code, out) = check_in(repo.path(), PIPE);
+    assert_eq!(code, 1);
+    assert!(!out.contains("allowlist/"), "{out}");
+}
+
+fn scan_with_repo_file(extra: &[&str]) -> std::process::Output {
+    let xdg = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("package.json"),
+        r#"{"scripts":{"postinstall":"echo hi"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join(".code-watch.toml"),
+        "schema = 1\n[[allow]]\nrule = \"repo/npm-lifecycle-script\"\n",
+    )
+    .unwrap();
+    with_config(xdg.path())
+        .arg("scan")
+        .args(extra)
+        .arg(repo.path())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn scan_by_hand_honours_the_repo_file_for_a_warning() {
+    assert_eq!(scan_with_repo_file(&[]).status.code(), Some(0));
+}
+
+#[test]
+fn scan_with_user_allow_only_ignores_the_repo_file() {
+    assert_eq!(
+        scan_with_repo_file(&["--user-allow-only"]).status.code(),
+        Some(1)
+    );
 }
 
 #[test]

@@ -60,7 +60,7 @@ if [ -z "$bin" ]; then
   exit 0
 fi
 dir=$(printf '%s' "$PWD" | tr -d '\000-\037\177')
-"$bin" scan .
+"$bin" scan --user-allow-only .
 status=$?
 case $status in
   0) exit 0 ;;

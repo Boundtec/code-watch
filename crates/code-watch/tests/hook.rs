@@ -281,6 +281,22 @@ fn cloning_a_repo_with_warnings_prints_them_and_succeeds() {
 }
 
 #[test]
+fn a_clone_cannot_allow_its_own_warnings_through_its_repo_file() {
+    let sb = Sandbox::new();
+    let own_file = (
+        ".code-watch.toml",
+        "schema = 1\n[[allow]]\nrule = \"repo/npm-lifecycle-script\"\n",
+    );
+    let src = sb.source_repo(&[LIFECYCLE, own_file]);
+    assert!(sb.code_watch(&["install-hook"]).status.success());
+    let (out, _) = clone(&sb, &src);
+    let shown = both(&out);
+    assert!(shown.contains("repo/npm-lifecycle-script"), "{shown}");
+    assert!(shown.contains("review them"), "{shown}");
+    assert!(!shown.contains("suppressed"), "{shown}");
+}
+
+#[test]
 fn cloning_a_blocked_repo_prints_the_verdict_and_leaves_the_clone_on_disk() {
     let sb = Sandbox::new();
     let src = sb.source_repo(&[BLOCKER]);
