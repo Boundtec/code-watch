@@ -167,7 +167,8 @@ fn mentions_advice(text: &str) -> bool {
 }
 
 /// Lowercase letters of the confusables skeleton of `text`; the skeleton rewrites some letters
-/// (`m` becomes `rn`), so the advice words must go through the same fold.
+/// (`m` becomes `rn`, capital `I` becomes `l`), so the text is lowercased first and the advice
+/// words go through the same fold.
 fn fold_letters(text: &str) -> String {
     let visible: String = text
         .nfkc()
@@ -180,7 +181,8 @@ fn fold_letters(text: &str) -> String {
                         | GeneralCategory::EnclosingMark
                 )
         })
-        .collect();
+        .collect::<String>()
+        .to_lowercase();
     skeleton(&visible)
         .filter(|c| c.is_alphabetic())
         .flat_map(char::to_lowercase)
@@ -462,6 +464,13 @@ mod tests {
             "al\u{200B}low it",
             "by\u{AD}pass it",
             "al\u{3164}low it",
+            "Ignore it",
+            "IGNORE THIS",
+            "DISABLE IT",
+            "Bypass",
+            "ALLOW",
+            "Code-Watch Allow x",
+            "\u{410}LLOW",
         ];
         for text in cases {
             let f = &parse(&one(json!({"title": text, "kind": text}))).unwrap().0[0];
@@ -469,6 +478,20 @@ mod tests {
             assert_eq!(f.rule_id, "llm/unclassified", "{text:?}");
             let f = &parse(&one(json!({"excerpt": text}))).unwrap().0[0];
             assert_eq!(f.evidence.excerpt, WITHHELD_EXCERPT, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn advice_words_in_capitals_cannot_carry_advice() {
+        for word in ADVICE_WORDS {
+            let title_case = word[..1].to_uppercase() + &word[1..];
+            for text in [word.to_uppercase(), title_case] {
+                let f = &parse(&one(json!({"title": text, "kind": text}))).unwrap().0[0];
+                assert_eq!(f.title, FIXED_TITLE, "{text:?}");
+                assert_eq!(f.rule_id, "llm/unclassified", "{text:?}");
+                let f = &parse(&one(json!({"excerpt": text}))).unwrap().0[0];
+                assert_eq!(f.evidence.excerpt, WITHHELD_EXCERPT, "{text:?}");
+            }
         }
     }
 
