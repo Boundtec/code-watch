@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::panic::{self, UnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use code_watch_core::allow::find_repo_root;
 use code_watch_core::{Allowlists, Engine, Report, render};
 
+mod adapter;
 mod hook;
 
 /// Exit code for errors and bad usage. Verdicts use 0, 1 and 2, so 2 always means "block".
@@ -39,6 +40,21 @@ enum Cmd {
     },
     /// Scan every repository on clone, through a git template hook (changes your global git config)
     InstallHook,
+    /// Answer an agent's pre-command hook: reads its hook JSON on stdin, replies in its format
+    Adapter {
+        agent: adapter::Agent,
+        /// Allow commands the adapter cannot check (default: deny them)
+        #[arg(long)]
+        fail_open: bool,
+        /// Deny commands the adapter cannot check (the default)
+        #[arg(long, conflicts_with = "fail_open")]
+        fail_closed: bool,
+        /// Codex cannot ask: answer a warning with a deny (default) or let it run and say so on stderr
+        #[arg(long, value_enum, default_value_t = adapter::CodexWarn::Deny)]
+        codex_warn: adapter::CodexWarn,
+    },
+    /// Print the settings snippet that connects an agent to `adapter` (edits nothing)
+    InstallAdapter { agent: adapter::Agent },
     /// Remove what install-hook added, leaving your git config as it was
     UninstallHook,
 }
@@ -65,6 +81,26 @@ fn real_main() -> ExitCode {
             return ExitCode::from(if ok { 0 } else { EXIT_ERROR });
         }
     };
+    match &cli.command {
+        Cmd::Adapter {
+            agent,
+            fail_open,
+            codex_warn,
+            ..
+        } => {
+            let policy = adapter::Policy {
+                fail: if *fail_open {
+                    adapter::FailMode::Open
+                } else {
+                    adapter::FailMode::Closed
+                },
+                codex_warn: *codex_warn,
+            };
+            return adapter::run(*agent, policy, user_dir().as_deref());
+        }
+        Cmd::InstallAdapter { agent } => return install_adapter(*agent),
+        _ => {}
+    }
     let report = match run(&cli) {
         Ok(Outcome::Report(report)) => report,
         Ok(Outcome::Message(message)) => {
@@ -101,22 +137,56 @@ enum Outcome {
 }
 
 fn run(cli: &Cli) -> anyhow::Result<Outcome> {
-    let user_dir = user_config_dir(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir());
+    let user_dir = user_dir();
     Ok(match &cli.command {
         Cmd::Scan { dir } => {
             let allow = Allowlists::load(user_dir.as_deref(), Some(dir))?;
             Outcome::Report(Engine::embedded()?.scan_dir_with(dir, &allow)?)
         }
         Cmd::Check { command } => {
-            let repo = std::env::current_dir()
-                .ok()
-                .and_then(|d| find_repo_root(&d));
-            let allow = Allowlists::load(user_dir.as_deref(), repo.as_deref())?;
-            Outcome::Report(Engine::embedded()?.check_command_with(&command.join(" "), &allow))
+            let cwd = std::env::current_dir().ok();
+            let command = command.join(" ");
+            Outcome::Report(check_command(
+                cwd.as_deref(),
+                &command,
+                user_dir.as_deref(),
+            )?)
         }
+        Cmd::Adapter { .. } | Cmd::InstallAdapter { .. } => unreachable!("handled before run"),
         Cmd::InstallHook => Outcome::Message(hook::install(&std::env::current_exe()?)?),
         Cmd::UninstallHook => Outcome::Message(hook::uninstall()?),
     })
+}
+
+fn user_dir() -> Option<PathBuf> {
+    user_config_dir(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir())
+}
+
+/// The check shared by `check` and the adapters. A repo allowlist applies only when `cwd` is a
+/// directory inside a git work tree; any other `cwd` is treated as outside a repo.
+fn check_command(
+    cwd: Option<&Path>,
+    command: &str,
+    user_dir: Option<&Path>,
+) -> anyhow::Result<Report> {
+    let repo = cwd.filter(|d| d.is_dir()).and_then(find_repo_root);
+    let allow = Allowlists::load(user_dir, repo.as_deref())?;
+    Ok(Engine::embedded()?.check_command_with(command, &allow))
+}
+
+fn install_adapter(agent: adapter::Agent) -> ExitCode {
+    let printed = std::env::current_exe()
+        .map_err(anyhow::Error::from)
+        .and_then(|exe| adapter::install::snippet(agent, &exe))
+        .and_then(|(value, file)| {
+            let _ = writeln!(io::stderr(), "code-watch: merge this into {file}:");
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
+        });
+    match printed {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&format!("{e:#}")),
+    }
 }
 
 /// `$XDG_CONFIG_HOME` when it is an absolute path, else `~/.config`; the same on macOS and Linux.
