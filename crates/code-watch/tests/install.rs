@@ -90,6 +90,10 @@ impl Env {
             self.path("shim").display(),
             std::env::var("PATH").unwrap()
         );
+        self.run_on_path(base_url, version, &path)
+    }
+
+    fn run_on_path(&self, base_url: &str, version: Option<&str>, path: &str) -> Output {
         let mut cmd = Command::new("sh");
         cmd.arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh"))
             .env_clear()
@@ -102,6 +106,21 @@ impl Env {
             cmd.env("CODE_WATCH_VERSION", v);
         }
         cmd.output().unwrap()
+    }
+
+    /// A PATH that holds the shimmed `uname` and links to only the tools the script needs,
+    /// plus `extra` (the checksum tool, or nothing).
+    fn restricted_path(&self, extra: &[&str]) -> String {
+        let bin = self.path("shim");
+        for tool in [
+            "sh", "mktemp", "curl", "grep", "wc", "cut", "tar", "rm", "mkdir", "cp", "chmod", "mv",
+        ]
+        .iter()
+        .chain(extra)
+        {
+            std::os::unix::fs::symlink(find_tool(tool), bin.join(tool)).unwrap();
+        }
+        bin.display().to_string()
     }
 
     fn file_url(&self) -> String {
@@ -139,6 +158,17 @@ fn sha256(file: &Path) -> String {
         .next()
         .unwrap()
         .to_string()
+}
+
+fn find_tool(name: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("{name} not on PATH"))
+}
+
+fn find_tool_opt(name: &str) -> bool {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap()).any(|dir| dir.join(name).is_file())
 }
 
 /// Serves `root` on 127.0.0.1; `/latest/download/<f>` answers 302 to `/download/v<latest>/<f>`.
@@ -372,4 +402,96 @@ fn path_hint_appears_only_when_the_dir_is_not_on_path() {
     env.good_release("download/v1.2.3", "1.2.3", "good");
     let out = env.run(&env.file_url(), Some("1.2.3"));
     assert!(String::from_utf8_lossy(&out.stdout).contains("add it to your PATH"));
+}
+
+#[test]
+fn lookalike_sums_lines_never_supply_the_expected_sum() {
+    let env = Env::new();
+    let dir = "download/v1.2.3";
+    let (file, sum) = env.add_archive(dir, "1.2.3", TARGET, "good");
+    env.write_sums(
+        dir,
+        &[
+            (format!("{file}.evil"), "1".repeat(64)),
+            (format!("{file}.sig"), "2".repeat(64)),
+            (file, sum),
+        ],
+    );
+    let out = env.run(&env.file_url(), Some("1.2.3"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(run_binary(&env), "good");
+}
+
+#[test]
+fn only_lookalike_sums_lines_refuse() {
+    let env = Env::new();
+    let dir = "download/v1.2.3";
+    let (file, sum) = env.add_archive(dir, "1.2.3", TARGET, "good");
+    env.write_sums(
+        dir,
+        &[
+            (format!("{file}.evil"), sum.clone()),
+            (format!("{file}.sig"), sum),
+        ],
+    );
+    env.assert_refused(&env.run(&env.file_url(), Some("1.2.3")), "no entry");
+}
+
+#[test]
+fn two_entries_for_one_target_refuse() {
+    let env = Env::new();
+    let dir = "download/v1.2.3";
+    let (file, sum) = env.add_archive(dir, "1.2.3", TARGET, "good");
+    env.write_sums(dir, &[(file.clone(), sum.clone()), (file, sum)]);
+    env.assert_refused(
+        &env.run(&env.file_url(), Some("1.2.3")),
+        "more than one entry",
+    );
+}
+
+#[test]
+fn a_pinned_version_ignores_the_sums_line_of_another_version() {
+    let env = Env::new();
+    let dir = "download/v1.0.0";
+    let old = env.add_archive(dir, "1.0.0", TARGET, "old");
+    let new = env.add_archive(dir, "2.0.0", TARGET, "new");
+    env.write_sums(dir, &[old, new]);
+    let out = env.run(&env.file_url(), Some("1.0.0"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(run_binary(&env), "old");
+}
+
+#[test]
+fn no_checksum_tool_refuses_and_installs_nothing() {
+    let env = Env::new();
+    env.good_release("download/v1.2.3", "1.2.3", "good");
+    let path = env.restricted_path(&[]);
+    let out = env.run_on_path(&env.file_url(), Some("1.2.3"), &path);
+    env.assert_refused(&out, "neither sha256sum nor shasum");
+}
+
+#[test]
+fn restricted_path_installs_once_a_checksum_tool_is_present() {
+    let env = Env::new();
+    env.good_release("download/v1.2.3", "1.2.3", "good");
+    let tool = if find_tool_opt("sha256sum") {
+        "sha256sum"
+    } else {
+        "shasum"
+    };
+    let path = env.restricted_path(&[tool]);
+    let out = env.run_on_path(&env.file_url(), Some("1.2.3"), &path);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
