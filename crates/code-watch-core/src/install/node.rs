@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use globset::Glob;
 
 use super::read::{MAX_LOCK_BYTES, MAX_TEXT_BYTES, ReadError, read_optional};
-use super::{Judge, finding, shown, unchecked};
+use super::{Judge, finding, list, shown, unchecked};
 use crate::finding::{Finding, Severity};
 
 /// The scripts a project install may run, in npm's order. pnpm and yarn run a subset; listing
@@ -19,12 +19,12 @@ const SCRIPTS: &[&str] = &[
     "postprepare",
 ];
 
-/// Dependency names listed in one finding before "and N more".
-const LISTED_NAMES: usize = 20;
 /// Workspace members and flagged dependencies whose own manifest is read.
 const MAX_MEMBERS: usize = 50;
 /// Installed manifests read to find dependency scripts.
 const MAX_INSPECTED: usize = 5000;
+/// Parent directories searched for a lockfile.
+const MAX_WALK_UP: usize = 16;
 
 const INSTALL_WORDS: &[&str] = &[
     "install",
@@ -46,6 +46,90 @@ const INSTALL_WORDS: &[&str] = &[
     "install-test",
     "install-ci-test",
 ];
+
+/// Subcommands that run lifecycle scripts or fetch and run code but are not analysed.
+fn runs_code_unchecked(manager: &str, sub: &str) -> bool {
+    match manager {
+        "npm" => matches!(
+            sub,
+            "update"
+                | "up"
+                | "upgrade"
+                | "udpate"
+                | "rebuild"
+                | "rb"
+                | "link"
+                | "ln"
+                | "dedupe"
+                | "ddp"
+                | "find-dupes"
+                | "exec"
+                | "x"
+        ),
+        "pnpm" => matches!(
+            sub,
+            "update"
+                | "up"
+                | "upgrade"
+                | "rebuild"
+                | "rb"
+                | "dlx"
+                | "approve-builds"
+                | "link"
+                | "ln"
+                | "create"
+        ),
+        _ => matches!(
+            sub,
+            "up" | "upgrade" | "upgrade-interactive" | "dlx" | "rebuild" | "create" | "link"
+        ),
+    }
+}
+
+/// Subcommands that take another subcommand (`yarn workspace <w> add`, `pnpm recursive install`).
+fn wraps_subcommand(manager: &str, sub: &str) -> bool {
+    match manager {
+        "pnpm" => matches!(sub, "recursive" | "multi" | "m"),
+        "yarn" => matches!(sub, "workspace" | "workspaces"),
+        _ => false,
+    }
+}
+
+/// Subcommands after which later words are arguments, not a subcommand.
+fn takes_free_words(sub: &str) -> bool {
+    matches!(
+        sub,
+        "run"
+            | "run-script"
+            | "rum"
+            | "urn"
+            | "test"
+            | "tst"
+            | "t"
+            | "start"
+            | "stop"
+            | "restart"
+            | "view"
+            | "info"
+            | "ls"
+            | "list"
+            | "ll"
+            | "la"
+            | "config"
+            | "set"
+            | "get"
+            | "pack"
+            | "publish"
+            | "cache"
+            | "audit"
+            | "outdated"
+            | "why"
+            | "explain"
+            | "whoami"
+            | "version"
+            | "help"
+    )
+}
 
 /// Flags that take the next word as a value, so it is not mistaken for a package.
 const VALUE_FLAGS: &[&str] = &[
@@ -69,6 +153,15 @@ const VALUE_FLAGS: &[&str] = &[
     "--prefix",
     "-C",
     "--dir",
+    "--install-strategy",
+    "--script-shell",
+    "--before",
+    "--otp",
+    "--lockfile-dir",
+    "--globalconfig",
+    "--min-release-age",
+    "--audit-level",
+    "--fund-level",
 ];
 
 struct Invocation {
@@ -78,7 +171,13 @@ struct Invocation {
     ignore_scripts: bool,
 }
 
-fn parse(manager: &str, args: &[String], here: &Path) -> Option<Invocation> {
+enum Parsed {
+    Install(Invocation),
+    NotChecked(String),
+    Other,
+}
+
+fn parse(manager: &str, args: &[String], here: &Path) -> Parsed {
     let mut global = false;
     let mut ignore_scripts = false;
     let mut dir = here.to_path_buf();
@@ -93,7 +192,15 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Option<Invocation> {
         match flag {
             "-g" | "--global" => global = true,
             "--location" if inline == Some("global") => global = true,
-            "--ignore-scripts" => ignore_scripts = inline != Some("false"),
+            "--ignore-scripts" => {
+                // npm's option parser takes a following `true` or `false` as the value.
+                let value = inline.or_else(|| {
+                    let next = args.get(i + 1).map(String::as_str);
+                    next.filter(|n| matches!(*n, "true" | "false"))
+                        .inspect(|_| i += 1)
+                });
+                ignore_scripts = value != Some("false");
+            }
             "--no-ignore-scripts" => ignore_scripts = false,
             "--prefix" | "-C" | "--dir" | "--cwd" => {
                 let value = inline.or_else(|| {
@@ -114,25 +221,65 @@ fn parse(manager: &str, args: &[String], here: &Path) -> Option<Invocation> {
         }
         i += 1;
     }
-    let mut rest = positionals.into_iter();
-    let sub = rest.next();
-    let mut packages: Vec<String> = rest.map(String::from).collect();
-    match (manager, sub) {
-        ("yarn", None) => {}
-        ("yarn", Some("global")) => {
-            if packages.first().map(String::as_str) != Some("add") {
-                return None;
-            }
-            packages.remove(0);
-            global = true;
-        }
-        (_, Some(s)) if is_install(manager, s) => {}
-        _ => return None,
+    let Some((at, sub)) = positionals
+        .iter()
+        .copied()
+        .enumerate()
+        .take_while(|(_, p)| !takes_free_words(p))
+        .find(|(_, p)| {
+            is_install(manager, p)
+                || runs_code_unchecked(manager, p)
+                || wraps_subcommand(manager, p)
+                || (manager == "yarn" && *p == "global")
+        })
+    else {
+        return match (manager, positionals.first()) {
+            ("yarn", None) => Parsed::Install(Invocation {
+                global,
+                packages: Vec::new(),
+                dir,
+                ignore_scripts,
+            }),
+            _ => Parsed::Other,
+        };
+    };
+    let mut packages: Vec<String> = positionals[at + 1..]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+    if wraps_subcommand(manager, sub) {
+        let inner = positionals[at + 1..]
+            .iter()
+            .find(|p| is_install(manager, p) || runs_code_unchecked(manager, p));
+        return match inner {
+            Some(inner) => Parsed::NotChecked(format!("{manager} {sub} {inner}")),
+            None => Parsed::Other,
+        };
     }
-    if matches!(sub, Some("ci" | "clean-install" | "cit")) {
+    if manager == "yarn" && sub == "global" {
+        return match packages.first().map(String::as_str) {
+            Some("add") => {
+                packages.remove(0);
+                Parsed::Install(Invocation {
+                    global: true,
+                    packages,
+                    dir,
+                    ignore_scripts,
+                })
+            }
+            Some(other) if runs_code_unchecked(manager, other) => {
+                Parsed::NotChecked(format!("yarn global {other}"))
+            }
+            _ => Parsed::Other,
+        };
+    }
+    if !is_install(manager, sub) {
+        return Parsed::NotChecked(format!("{manager} {sub}"));
+    }
+    if matches!(sub, "ci" | "clean-install" | "cit") {
         packages.clear();
     }
-    Some(Invocation {
+    Parsed::Install(Invocation {
         global,
         packages,
         dir,
@@ -163,8 +310,10 @@ pub(super) fn analyze(
     cwd: &Path,
     judge: &Judge,
 ) -> Vec<Finding> {
-    let Some(inv) = parse(manager, args, here) else {
-        return Vec::new();
+    let inv = match parse(manager, args, here) {
+        Parsed::Install(inv) => inv,
+        Parsed::NotChecked(what) => return vec![super::unchecked_command(&what)],
+        Parsed::Other => return Vec::new(),
     };
     if inv.global {
         return inv
@@ -186,55 +335,187 @@ pub(super) fn analyze(
     let project = Project {
         manager,
         dir: &inv.dir,
+        root: find_root(manager, &inv.dir),
         cwd,
         judge,
     };
-    if inv.ignore_scripts || project.scripts_off(&mut out) {
+    project.repo_code(&mut out);
+    // Yarn berry has no --ignore-scripts and does not read .npmrc.
+    let flagged = inv.ignore_scripts && !project.berry();
+    if flagged || project.scripts_off(&mut out) {
         out.push(finding(
             "install/no-scripts",
             Severity::Info,
             None,
             None,
-            &format!("{manager} install with scripts turned off"),
+            &format!(
+                "{manager} install with lifecycle scripts turned off; an environment setting such as npm_config_ignore_scripts can override this"
+            ),
             None,
         ));
         return out;
     }
-    project.own_scripts(!inv.packages.is_empty(), &mut out);
-    project.dependency_scripts(&mut out);
-    if !out.iter().any(|f| {
-        matches!(
-            f.rule_id.as_str(),
-            "install/lifecycle-script"
-                | "install/lifecycle-script-fetch-run"
-                | "install/dependency-scripts"
-                | super::RULE_UNCHECKED
-        )
-    }) {
+    let mut remote = BTreeMap::new();
+    let declared = project.own_scripts(!inv.packages.is_empty(), &mut remote, &mut out);
+    let covered = project.dependency_scripts(&declared, &mut remote, &mut out);
+    project.report_remote(&remote, &mut out);
+    for spec in &inv.packages {
+        out.push(finding(
+            "install/dependency-scripts",
+            Severity::Warn,
+            None,
+            None,
+            &format!(
+                "{spec} and its dependencies may run install scripts; they cannot be read offline"
+            ),
+            Some(package_name(spec).to_string()),
+        ));
+    }
+    if covered && inv.packages.is_empty() && out.is_empty() {
         out.push(finding(
             "install/no-script-found",
             Severity::Info,
             Some(shown(&inv.dir.join("package.json"), cwd)),
             None,
-            "no install script in package.json or the lockfile",
+            "no install script in package.json, and the lockfile covers every dependency",
             None,
         ));
     }
     out
 }
 
+/// The directory holding the lockfile or workspace file this install reads: the nearest
+/// ancestor with one, not looking above a repository root. Settings and lockfiles live there
+/// even when the command runs in a workspace member.
+fn find_root(manager: &str, dir: &Path) -> PathBuf {
+    let markers: &[&str] = match manager {
+        "npm" => &["package-lock.json", "npm-shrinkwrap.json"],
+        "pnpm" => &["pnpm-lock.yaml", "pnpm-workspace.yaml"],
+        _ => &["yarn.lock"],
+    };
+    for ancestor in dir.ancestors().take(MAX_WALK_UP) {
+        if markers.iter().any(|m| ancestor.join(m).is_file()) {
+            return ancestor.to_path_buf();
+        }
+        if ancestor.join(".git").exists() {
+            break;
+        }
+    }
+    dir.to_path_buf()
+}
+
+/// Dependencies declared by the manifests read: name and spec.
+type Declared = Vec<(String, String)>;
+/// Dependencies that do not come from a registry tarball, by name, with where from.
+type Remote = BTreeMap<String, String>;
+
 struct Project<'a> {
     manager: &'a str,
     dir: &'a Path,
+    root: PathBuf,
     cwd: &'a Path,
     judge: &'a Judge<'a>,
 }
 
 impl Project<'_> {
+    /// A file next to the project's `package.json`.
     fn file(&self, name: &str) -> (PathBuf, String) {
         let path = self.dir.join(name);
         let shown = shown(&path, self.cwd);
         (path, shown)
+    }
+
+    /// A lockfile or settings file, from the workspace root.
+    fn root_file(&self, name: &str) -> (PathBuf, String) {
+        let path = self.root.join(name);
+        let shown = shown(&path, self.cwd);
+        (path, shown)
+    }
+
+    /// Whether this is yarn berry (2 and later), which has its own config file and scripts rules.
+    fn berry(&self) -> bool {
+        if self.manager != "yarn" {
+            return false;
+        }
+        match read_optional(&self.root.join("yarn.lock"), MAX_LOCK_BYTES) {
+            Ok(Some(lock)) => lock.contains("__metadata:"),
+            _ => self.root.join(".yarnrc.yml").is_file() || self.dir.join(".yarnrc.yml").is_file(),
+        }
+    }
+
+    /// Repository files whose code runs on every install, whatever `ignore-scripts` says.
+    fn repo_code(&self, out: &mut Vec<Finding>) {
+        let mut found: Vec<(String, String)> = Vec::new();
+        match self.manager {
+            "pnpm" => {
+                for name in [".pnpmfile.cjs", ".pnpmfile.mjs"] {
+                    for (path, shown) in [self.root_file(name), self.file(name)] {
+                        if path.is_file() && !found.iter().any(|(f, _)| *f == shown) {
+                            found.push((shown, "pnpm hooks".into()));
+                        }
+                    }
+                }
+                if let Some(y) = self.yaml("pnpm-workspace.yaml", out) {
+                    for key in ["pnpmfile", "globalPnpmfile"] {
+                        if y.get(key).is_some() {
+                            found.push((
+                                self.root_file("pnpm-workspace.yaml").1,
+                                format!("{key} setting"),
+                            ));
+                        }
+                    }
+                }
+                let (path, shown) = self.root_file("package.json");
+                if let Ok(Some((json, _))) = manifest_if_present(&path)
+                    && json.pointer("/pnpm/pnpmfile").is_some()
+                {
+                    found.push((shown, "pnpm.pnpmfile setting".into()));
+                }
+            }
+            "yarn" => {
+                if let Some(y) = self.yaml(".yarnrc.yml", out) {
+                    let plugins = y
+                        .get("plugins")
+                        .and_then(|p| p.as_sequence())
+                        .is_some_and(|p| !p.is_empty());
+                    for (hit, what) in [
+                        (
+                            y.get("yarnPath").is_some(),
+                            "yarnPath replaces yarn with a checked-in file",
+                        ),
+                        (plugins, "plugins are loaded from the repository"),
+                    ] {
+                        if hit {
+                            found.push((self.root_file(".yarnrc.yml").1, what.into()));
+                        }
+                    }
+                }
+                let (path, shown) = self.root_file(".yarnrc");
+                if let Ok(Some(text)) = read_optional(&path, MAX_TEXT_BYTES)
+                    && text
+                        .lines()
+                        .any(|l| l.trim_start().starts_with("yarn-path"))
+                {
+                    found.push((
+                        shown,
+                        "yarn-path replaces yarn with a checked-in file".into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        for (file, what) in found {
+            out.push(finding(
+                "install/repo-code-at-install",
+                Severity::Warn,
+                Some(file),
+                None,
+                &format!(
+                    "{what}: repository code runs on every install, whatever ignore-scripts says"
+                ),
+                None,
+            ));
+        }
     }
 
     /// Whether the project's own settings turn install scripts off. An unreadable settings
@@ -244,36 +525,42 @@ impl Project<'_> {
             "pnpm" => self
                 .yaml("pnpm-workspace.yaml", out)
                 .is_some_and(|y| y.get("ignoreScripts").and_then(|v| v.as_bool()) == Some(true)),
+            _ if self.berry() => false,
             _ => {
-                let (path, name) = self.file(".npmrc");
-                match read_optional(&path, MAX_TEXT_BYTES) {
-                    Ok(Some(text)) => npmrc_ignores_scripts(&text),
-                    Ok(None) => false,
-                    Err(e) => {
-                        out.push(unchecked(&name, e.describe()));
-                        false
+                for (path, name) in [self.file(".npmrc"), self.root_file(".npmrc")] {
+                    match read_optional(&path, MAX_TEXT_BYTES) {
+                        Ok(Some(text)) => {
+                            if let Some(off) = npmrc_ignores_scripts(&text) {
+                                return off;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => out.push(unchecked(&name, e.describe())),
+                    }
+                    if self.root == self.dir {
+                        break;
                     }
                 }
+                false
             }
         }
     }
 
+    /// A settings file from the workspace root; one that is invalid is reported once.
     fn yaml(&self, name: &str, out: &mut Vec<Finding>) -> Option<serde_norway::Value> {
-        let (path, shown) = self.file(name);
-        match read_optional(&path, MAX_TEXT_BYTES) {
-            Ok(None) => None,
+        let (path, shown) = self.root_file(name);
+        let problem = match read_optional(&path, MAX_TEXT_BYTES) {
+            Ok(None) => return None,
             Ok(Some(text)) => match serde_norway::from_str(&text) {
-                Ok(v) => Some(v),
-                Err(_) => {
-                    out.push(unchecked(&shown, "is not valid YAML"));
-                    None
-                }
+                Ok(v) => return Some(v),
+                Err(_) => unchecked(&shown, "is not valid YAML"),
             },
-            Err(e) => {
-                out.push(unchecked(&shown, e.describe()));
-                None
-            }
+            Err(e) => unchecked(&shown, e.describe()),
+        };
+        if !out.contains(&problem) {
+            out.push(problem);
         }
+        None
     }
 
     fn package_json(
@@ -302,15 +589,54 @@ impl Project<'_> {
         }
     }
 
-    fn own_scripts(&self, named_packages: bool, out: &mut Vec<Finding>) {
+    /// Lists the project's own install scripts and its workspace members', and returns the
+    /// dependencies they declare; those that come from git or a URL go into `remote`.
+    fn own_scripts(
+        &self,
+        named_packages: bool,
+        remote: &mut Remote,
+        out: &mut Vec<Finding>,
+    ) -> Declared {
+        let mut declared = Declared::new();
         let Some((root, text)) = self.package_json(self.dir, out) else {
-            return;
+            return declared;
         };
         self.list_scripts(self.dir, &root, &text, named_packages, None, out);
+        collect_dependencies(&root, &mut declared, remote);
         for member in self.workspace_dirs(&root, out) {
             if let Some((json, text)) = self.package_json(&member, out) {
                 self.list_scripts(&member, &json, &text, false, None, out);
+                collect_dependencies(&json, &mut declared, remote);
             }
+        }
+        declared
+    }
+
+    /// One warning per dependency that is fetched from git or a URL: npm and pnpm run its
+    /// `prepare` as well as its install scripts, and lockfiles do not flag that.
+    fn report_remote(&self, remote: &Remote, out: &mut Vec<Finding>) {
+        for (name, from) in remote.iter().take(MAX_MEMBERS) {
+            out.push(finding(
+                "install/dependency-scripts",
+                Severity::Warn,
+                None,
+                None,
+                &format!("{name} comes from {from}, not a registry tarball: its prepare and install scripts may run"),
+                Some(name.clone()),
+            ));
+        }
+        if remote.len() > MAX_MEMBERS {
+            out.push(finding(
+                "install/dependency-scripts",
+                Severity::Warn,
+                None,
+                None,
+                &format!(
+                    "and {} more dependencies come from git or a URL",
+                    remote.len() - MAX_MEMBERS
+                ),
+                None,
+            ));
         }
     }
 
@@ -427,89 +753,165 @@ impl Project<'_> {
         dirs
     }
 
-    fn dependency_scripts(&self, out: &mut Vec<Finding>) {
+    /// Reports dependencies that run scripts and returns whether the lockfile was read and
+    /// covers every declared dependency, which is the only case that can be called clean.
+    fn dependency_scripts(
+        &self,
+        declared: &Declared,
+        remote: &mut Remote,
+        out: &mut Vec<Finding>,
+    ) -> bool {
         match self.manager {
-            "npm" => self.npm_dependencies(out),
-            "pnpm" => self.pnpm_dependencies(out),
-            _ => self.yarn_dependencies(out),
+            "npm" => self.npm_dependencies(declared, remote, out),
+            "pnpm" => self.pnpm_dependencies(declared, remote, out),
+            _ => self.yarn_dependencies(remote, out),
         }
     }
 
-    fn npm_dependencies(&self, out: &mut Vec<Finding>) {
+    /// The declared dependencies a lockfile has no entry for, as one unknown finding.
+    fn covers(
+        &self,
+        declared: &Declared,
+        locked: &HashSet<String>,
+        file: &str,
+        out: &mut Vec<Finding>,
+    ) -> bool {
+        let missing: BTreeSet<String> = declared
+            .iter()
+            .map(|(name, _)| name)
+            .filter(|name| !locked.contains(*name))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return true;
+        }
+        self.unknown(
+            file,
+            &format!(
+                "the lockfile does not list {}; they may run install scripts",
+                list(&missing)
+            ),
+            Severity::Warn,
+            out,
+        );
+        false
+    }
+
+    fn npm_dependencies(
+        &self,
+        declared: &Declared,
+        remote: &mut Remote,
+        out: &mut Vec<Finding>,
+    ) -> bool {
         for name in [
             "package-lock.json",
             "npm-shrinkwrap.json",
             "node_modules/.package-lock.json",
         ] {
-            let (path, shown) = self.file(name);
+            let (path, shown) = self.root_file(name);
             let text = match read_optional(&path, MAX_LOCK_BYTES) {
                 Ok(Some(t)) => t,
                 Ok(None) => continue,
                 Err(e) => {
                     out.push(unchecked(&shown, e.describe()));
-                    return;
+                    return false;
                 }
             };
             let Ok(lock) =
                 serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
             else {
                 out.push(unchecked(&shown, "is not valid JSON"));
-                return;
+                return false;
             };
             let Some(packages) = lock.get("packages").and_then(|p| p.as_object()) else {
                 self.unknown(
                     &shown,
-                    "this lockfile version does not record install scripts",
+                    "this lockfile version does not record install scripts; dependencies may run them",
+                    Severity::Warn,
                     out,
                 );
-                return;
+                return false;
             };
-            let names: BTreeSet<String> = packages
-                .iter()
-                .filter(|(_, e)| e.get("hasInstallScript").and_then(|v| v.as_bool()) == Some(true))
-                .map(|(key, e)| {
-                    let tail = key
-                        .rsplit_once("node_modules/")
-                        .map_or(key.as_str(), |(_, t)| t);
-                    e.get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or(tail)
-                        .to_string()
-                })
-                .collect();
+            let tail_of = |key: &str| {
+                key.rsplit_once("node_modules/")
+                    .map_or(key.to_string(), |(_, t)| t.to_string())
+            };
+            let mut locked = HashSet::new();
+            let mut names = BTreeSet::new();
+            for (key, entry) in packages.iter().filter(|(k, _)| !k.is_empty()) {
+                let tail = tail_of(key);
+                if entry.get("hasInstallScript").and_then(|v| v.as_bool()) == Some(true) {
+                    names.insert(
+                        entry
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or(&tail)
+                            .to_string(),
+                    );
+                }
+                if let Some(resolved) = entry.get("resolved").and_then(|r| r.as_str())
+                    && entry.get("link").and_then(|l| l.as_bool()) != Some(true)
+                    && !is_registry_tarball(resolved)
+                {
+                    remote.insert(tail.clone(), redact(resolved));
+                }
+                locked.insert(tail);
+            }
             self.report_dependencies(
                 &names,
                 "will run",
                 &shown,
-                &|n| Some(self.dir.join("node_modules").join(n)),
+                &|n| Some(self.root.join("node_modules").join(n)),
                 out,
             );
-            return;
+            return self.covers(declared, &locked, &shown, out);
         }
         self.unknown(
             "package-lock.json",
-            "no lockfile or node_modules found",
+            "no lockfile or node_modules found; every dependency may run install scripts",
+            Severity::Warn,
             out,
         );
+        false
     }
 
     /// pnpm 10's lockfile does not record which packages build (`requiresBuild` is only written
     /// by older versions), so a package counts when the lock flags it or its installed
-    /// manifest under `node_modules/.pnpm` has an install-time script.
-    fn pnpm_dependencies(&self, out: &mut Vec<Finding>) {
-        let (path, shown) = self.file("pnpm-lock.yaml");
+    /// manifest under `node_modules/.pnpm` has an install-time script. A package in the lock
+    /// that is not installed cannot be read, so it makes the result unknown.
+    fn pnpm_dependencies(
+        &self,
+        declared: &Declared,
+        remote: &mut Remote,
+        out: &mut Vec<Finding>,
+    ) -> bool {
+        let (path, shown) = self.root_file("pnpm-lock.yaml");
         let text = match read_optional(&path, MAX_LOCK_BYTES) {
             Ok(Some(t)) => t,
-            Ok(None) => return self.unknown("pnpm-lock.yaml", "no lockfile found", out),
-            Err(e) => return out.push(unchecked(&shown, e.describe())),
+            Ok(None) => {
+                self.unknown(
+                    "pnpm-lock.yaml",
+                    "no lockfile found; dependencies may run install scripts",
+                    Severity::Warn,
+                    out,
+                );
+                return false;
+            }
+            Err(e) => {
+                out.push(unchecked(&shown, e.describe()));
+                return false;
+            }
         };
         let Ok(lock) = serde_norway::from_str::<serde_norway::Value>(&text) else {
-            return out.push(unchecked(&shown, "is not valid YAML"));
+            out.push(unchecked(&shown, "is not valid YAML"));
+            return false;
         };
         let mut names = BTreeSet::new();
         let mut dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
         let mut inspected = 0usize;
-        let store = self.dir.join("node_modules/.pnpm");
+        let mut total = 0usize;
+        let mut not_installed = 0usize;
+        let store = self.root.join("node_modules/.pnpm");
         for section in ["packages", "snapshots"] {
             let Some(map) = lock.get(section).and_then(|s| s.as_mapping()) else {
                 continue;
@@ -522,52 +924,86 @@ impl Project<'_> {
                 if entry.get("requiresBuild").and_then(|v| v.as_bool()) == Some(true) {
                     names.insert(name.to_string());
                 }
+                if section == "packages"
+                    && let Some(res) = entry.get("resolution").and_then(|r| r.as_mapping())
+                    && ["repo", "directory", "tarball"]
+                        .iter()
+                        .any(|k| res.contains_key(*k))
+                {
+                    remote.insert(name.to_string(), "git or a URL".into());
+                }
                 let bare = key.strip_prefix('/').unwrap_or(key).replace('/', "+");
                 let dir = store.join(&bare).join("node_modules").join(name);
-                if section == "packages" && dir.is_dir() && inspected < MAX_INSPECTED {
-                    inspected += 1;
-                    if installs_something(&dir) {
-                        names.insert(name.to_string());
+                let installed = dir.is_dir();
+                if section == "packages" {
+                    total += 1;
+                    not_installed += usize::from(!installed);
+                    if installed && inspected < MAX_INSPECTED {
+                        inspected += 1;
+                        if installs_something(&dir) {
+                            names.insert(name.to_string());
+                        }
                     }
                 }
-                if dir.is_dir() {
+                if installed {
                     dirs.insert(name.to_string(), dir);
                 }
             }
         }
-        if inspected == 0 && names.is_empty() {
-            return self.unknown(
+        let covered = self.covers(declared, &pnpm_locked(&lock), &shown, out);
+        if total > 0 && inspected == 0 && names.is_empty() {
+            self.unknown(
                 &shown,
-                "pnpm-lock.yaml does not say which packages run build scripts and node_modules is not installed",
+                "pnpm-lock.yaml does not say which packages run build scripts and node_modules is not installed; they may run",
+                Severity::Warn,
+                out,
+            );
+            return false;
+        }
+        if not_installed > 0 {
+            self.unknown(
+                &shown,
+                &format!("{not_installed} packages in the lockfile are not in node_modules, so whether they run build scripts cannot be read; they may run"),
+                Severity::Warn,
                 out,
             );
         }
-        if names.is_empty() {
-            return;
+        if !names.is_empty() {
+            self.report_pnpm_builds(&names, &dirs, &shown, out);
         }
+        covered && not_installed == 0
+    }
+
+    fn report_pnpm_builds(
+        &self,
+        names: &BTreeSet<String>,
+        dirs: &BTreeMap<String, PathBuf>,
+        shown: &str,
+        out: &mut Vec<Finding>,
+    ) {
         let settings = PnpmBuilds::read(self, out);
         let dir_of = |n: &str| dirs.get(n).cloned();
         match settings.mode() {
-            PnpmMode::RunsAll => self.report_dependencies(&names, "will run", &shown, &dir_of, out),
+            PnpmMode::RunsAll => self.report_dependencies(names, "will run", shown, &dir_of, out),
             PnpmMode::Unknown(problem) => {
                 let why = problem.map_or_else(String::new, |p| format!(": {p}"));
                 self.report_dependencies(
-                    &names,
-                    &format!("may run (the pnpm version is not known{why})"),
-                    &shown,
+                    names,
+                    &format!("may run (what pnpm allows is not known{why})"),
+                    shown,
                     &dir_of,
                     out,
                 );
             }
             PnpmMode::Gated => {
                 let (allowed, blocked): (BTreeSet<_>, BTreeSet<_>) =
-                    names.into_iter().partition(|n| settings.allows(n));
-                self.report_dependencies(&allowed, "will run", &shown, &dir_of, out);
+                    names.iter().cloned().partition(|n| settings.allows(n));
+                self.report_dependencies(&allowed, "will run", shown, &dir_of, out);
                 if !blocked.is_empty() {
                     out.push(finding(
                         "install/dependency-scripts-blocked",
                         Severity::Info,
-                        Some(shown),
+                        Some(shown.into()),
                         None,
                         &format!(
                             "{} blocked by pnpm unless allowed: {}",
@@ -581,19 +1017,54 @@ impl Project<'_> {
         }
     }
 
-    fn yarn_dependencies(&self, out: &mut Vec<Finding>) {
-        let (path, shown) = self.file("yarn.lock");
+    fn yarn_dependencies(&self, remote: &mut Remote, out: &mut Vec<Finding>) -> bool {
+        let (path, shown) = self.root_file("yarn.lock");
         let lock = match read_optional(&path, MAX_LOCK_BYTES) {
             Ok(Some(t)) => t,
-            Ok(None) => return self.unknown("yarn.lock", "no lockfile found", out),
-            Err(e) => return out.push(unchecked(&shown, e.describe())),
+            Ok(None) => {
+                self.unknown(
+                    "yarn.lock",
+                    "no lockfile found; dependencies may run install scripts",
+                    Severity::Warn,
+                    out,
+                );
+                return false;
+            }
+            Err(e) => {
+                out.push(unchecked(&shown, e.describe()));
+                return false;
+            }
         };
         if !lock.contains("__metadata:") {
-            return self.unknown(
+            self.unknown(
                 &shown,
                 "yarn 1 runs dependency scripts and its lockfile does not list them",
+                Severity::Warn,
                 out,
             );
+            return false;
+        }
+        if let Ok(parsed) = serde_norway::from_str::<serde_norway::Value>(&lock) {
+            for (key, entry) in parsed.as_mapping().into_iter().flatten() {
+                let (Some(key), Some(res)) = (
+                    key.as_str(),
+                    entry.get("resolution").and_then(|r| r.as_str()),
+                ) else {
+                    continue;
+                };
+                let registry = ["@npm:", "@workspace:", "@patch:", "@builtin<"]
+                    .iter()
+                    .any(|m| res.contains(m));
+                if !registry
+                    && let Some(name) = key
+                        .split(", ")
+                        .next()
+                        .and_then(pnpm_key_name)
+                        .map(String::from)
+                {
+                    remote.insert(name, redact(res));
+                }
+            }
         }
         let rc = self.yaml(".yarnrc.yml", out);
         let enabled = rc
@@ -605,7 +1076,7 @@ impl Project<'_> {
             out.push(finding(
                 "install/dependency-scripts",
                 Severity::Warn,
-                Some(self.file(".yarnrc.yml").1),
+                Some(self.root_file(".yarnrc.yml").1),
                 None,
                 "enableScripts is on: dependencies may run install scripts and yarn.lock does not list them",
                 None,
@@ -614,15 +1085,17 @@ impl Project<'_> {
             self.unknown(
                 &shown,
                 "yarn does not run dependency scripts unless enableScripts is on",
+                Severity::Info,
                 out,
             );
         }
+        false
     }
 
-    fn unknown(&self, file: &str, why: &str, out: &mut Vec<Finding>) {
+    fn unknown(&self, file: &str, why: &str, severity: Severity, out: &mut Vec<Finding>) {
         out.push(finding(
             "install/dependency-scripts-unknown",
-            Severity::Info,
+            severity,
             Some(file.into()),
             None,
             why,
@@ -673,22 +1146,10 @@ impl Project<'_> {
     }
 }
 
-fn list(names: &BTreeSet<String>) -> String {
-    let shown: Vec<&str> = names
-        .iter()
-        .take(LISTED_NAMES)
-        .map(String::as_str)
-        .collect();
-    let mut joined = shown.join(", ");
-    if names.len() > LISTED_NAMES {
-        joined.push_str(&format!(" and {} more", names.len() - LISTED_NAMES));
-    }
-    joined
-}
-
-/// Last assignment wins; `;` and `#` start a comment line.
-fn npmrc_ignores_scripts(text: &str) -> bool {
-    let mut off = false;
+/// What the last `ignore-scripts` assignment says, if there is one; `;` and `#` start a
+/// comment line.
+fn npmrc_ignores_scripts(text: &str) -> Option<bool> {
+    let mut off = None;
     for line in text.lines().map(str::trim) {
         if line.starts_with(['#', ';']) {
             continue;
@@ -696,10 +1157,110 @@ fn npmrc_ignores_scripts(text: &str) -> bool {
         if let Some((key, value)) = line.split_once('=')
             && key.trim() == "ignore-scripts"
         {
-            off = value.trim().trim_matches(['"', '\'']) == "true";
+            off = Some(value.trim().trim_matches(['"', '\'']) == "true");
         }
     }
     off
+}
+
+/// The `dependencies`, `devDependencies` and `optionalDependencies` of a manifest. Specs that
+/// fetch from git or a URL go into `remote` too.
+fn collect_dependencies(json: &serde_json::Value, declared: &mut Declared, remote: &mut Remote) {
+    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+        let Some(map) = json.get(section).and_then(|d| d.as_object()) else {
+            continue;
+        };
+        for (name, spec) in map {
+            let spec = spec.as_str().unwrap_or("");
+            if is_remote_spec(spec) {
+                remote.insert(name.clone(), redact(spec));
+            }
+            declared.push((name.clone(), spec.to_string()));
+        }
+    }
+}
+
+/// A dependency spec that npm and pnpm fetch from git, a URL or disk instead of the registry,
+/// and so may build (`prepare`) as well as run install scripts.
+fn is_remote_spec(spec: &str) -> bool {
+    const SCHEMES: &[&str] = &[
+        "git+",
+        "git:",
+        "ssh:",
+        "github:",
+        "gitlab:",
+        "bitbucket:",
+        "gist:",
+        "http:",
+        "https:",
+        "file:",
+        "link:",
+        "portal:",
+    ];
+    if SCHEMES.iter().any(|s| spec.starts_with(s)) {
+        return true;
+    }
+    // `owner/repo` shorthand for a GitHub repository.
+    let (path, _) = spec.split_once('#').unwrap_or((spec, ""));
+    let word = |w: &str| {
+        !w.is_empty()
+            && !w.starts_with('.')
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    };
+    path.split_once('/')
+        .is_some_and(|(owner, repo)| word(owner) && word(repo))
+}
+
+/// A lockfile `resolved` that is an https tarball from a registry, not a git or file source.
+fn is_registry_tarball(resolved: &str) -> bool {
+    resolved.starts_with("https://")
+        && resolved
+            .split(['?', '#'])
+            .next()
+            .is_some_and(|p| p.ends_with(".tgz"))
+}
+
+/// A source address without a user, token or password in it.
+fn redact(source: &str) -> String {
+    let Some((scheme, rest)) = source.split_once("://") else {
+        return source.to_string();
+    };
+    let (authority, tail) = rest.split_once('/').map_or((rest, ""), |(a, t)| (a, t));
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("{scheme}://{host}/{tail}")
+}
+
+/// Names of the dependencies the lockfile's importers (or older top-level maps) list.
+fn pnpm_locked(lock: &serde_norway::Value) -> HashSet<String> {
+    let mut sources: Vec<&serde_norway::Value> = vec![lock];
+    sources.extend(
+        lock.get("importers")
+            .and_then(|i| i.as_mapping())
+            .into_iter()
+            .flat_map(|m| m.values()),
+    );
+    let mut names = HashSet::new();
+    for source in sources {
+        for section in [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "specifiers",
+        ] {
+            for key in source
+                .get(section)
+                .and_then(|d| d.as_mapping())
+                .into_iter()
+                .flat_map(|m| m.keys())
+            {
+                if let Some(name) = key.as_str() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    names
 }
 
 /// `name@1.0.0(peer@2)` (v6, v9), `/name@1.0.0` or `/name/1.0.0` (v5) to `name`.
@@ -727,6 +1288,8 @@ struct PnpmBuilds {
     allowed: Vec<globset::GlobMatcher>,
     major: Option<u32>,
     manifest_problem: Option<String>,
+    /// An `onlyBuiltDependenciesFile` that could not be read: what it allows is then unknown.
+    file_problem: Option<String>,
 }
 
 impl PnpmBuilds {
@@ -736,10 +1299,11 @@ impl PnpmBuilds {
             allowed: Vec::new(),
             major: None,
             manifest_problem: None,
+            file_problem: None,
         };
         let mut sources = Vec::new();
         sources.extend(p.yaml("pnpm-workspace.yaml", out));
-        let (path, shown) = p.file("package.json");
+        let (path, shown) = p.root_file("package.json");
         match manifest_if_present(&path) {
             Ok(Some((json, _))) => {
                 me.major = json
@@ -759,6 +1323,12 @@ impl PnpmBuilds {
             }
         }
         for source in sources {
+            if let Some(file) = source
+                .get("onlyBuiltDependenciesFile")
+                .and_then(|v| v.as_str())
+            {
+                me.read_allow_file(p, file);
+            }
             if source
                 .get("dangerouslyAllowAllBuilds")
                 .and_then(|v| v.as_bool())
@@ -791,6 +1361,24 @@ impl PnpmBuilds {
         me
     }
 
+    /// The JSON array of package names in `onlyBuiltDependenciesFile`, a path inside the project.
+    fn read_allow_file(&mut self, p: &Project, file: &str) {
+        let relative = Path::new(file);
+        let inside = relative.is_relative()
+            && !relative
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+        let names = inside
+            .then(|| read_optional(&p.root.join(relative), MAX_TEXT_BYTES))
+            .and_then(Result::ok)
+            .flatten()
+            .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok());
+        match names {
+            Some(names) => names.iter().for_each(|n| self.add(n)),
+            None => self.file_problem = Some(format!("{file} could not be read")),
+        }
+    }
+
     /// A `name@version || version` entry allows the package name; the version part is ignored,
     /// which can only show more than pnpm would run.
     fn add(&mut self, entry: &str) {
@@ -811,8 +1399,9 @@ impl PnpmBuilds {
     /// An unreadable package.json (already reported once by the project scan) leaves the version unknown, which shows more, and says why.
     fn mode(&self) -> PnpmMode {
         match self.major {
-            Some(major) if major >= 10 => PnpmMode::Gated,
-            Some(_) => PnpmMode::RunsAll,
+            Some(major) if major < 10 => PnpmMode::RunsAll,
+            _ if self.file_problem.is_some() => PnpmMode::Unknown(self.file_problem.clone()),
+            Some(_) => PnpmMode::Gated,
             None => PnpmMode::Unknown(self.manifest_problem.clone()),
         }
     }
@@ -832,6 +1421,10 @@ fn manifest_if_present(path: &Path) -> Result<Option<(serde_json::Value, String)
 
 /// Whether an installed package's manifest has a script npm and pnpm run when installing it.
 fn installs_something(dir: &Path) -> bool {
+    // npm and node-gyp build a package with a binding.gyp and no install script on their own.
+    if dir.join("binding.gyp").is_file() {
+        return true;
+    }
     let Ok(Some(text)) = read_optional(&dir.join("package.json"), MAX_TEXT_BYTES) else {
         return false;
     };

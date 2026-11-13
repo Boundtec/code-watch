@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use super::read::{MAX_TEXT_BYTES, read_optional, read_text};
-use super::{Judge, finding, shown, unchecked};
+use super::{Judge, finding, list, shown, unchecked};
 use crate::finding::{Finding, Severity};
 
 /// Nested `-r` files followed.
@@ -46,13 +47,22 @@ const VALUE_FLAGS: &[&str] = &[
     "--global-option",
     "--install-option",
     "--hash",
+    "--client-cert",
+    "--keyring-provider",
 ];
 
-#[derive(Default)]
+/// Short flags whose value may be glued to them (`-rreq.txt`).
+const GLUED_SHORT: &[char] = &['r', 'e', 'c', 'i', 'f', 't', 'C'];
+
 struct Scan {
+    /// Where the install runs: local paths are resolved against it.
+    root: PathBuf,
     only_binary_all: bool,
-    no_binary: bool,
+    /// Names given to `--no-binary` (and `:all:`), after the later `--only-binary` flags.
+    no_binary: BTreeSet<String>,
     targets: BTreeSet<Target>,
+    /// Index packages named on the command line or in requirements files.
+    names: BTreeSet<String>,
     problems: Vec<(String, String)>,
 }
 
@@ -67,51 +77,55 @@ enum Target {
 enum Kind {
     Directory,
     Source,
-    Other,
+    Index(String),
+    Wheel,
 }
 
-/// `pip install` args (after `install`) of one command. Only files on disk are read: a bare
-/// package name gets no finding because whether pip builds it depends on what the index
-/// offers, and that is never fetched here.
+/// Where `install` is among pip's args: the first word that is neither a flag nor a flag's value.
+fn install_position(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg.starts_with('-') && arg.len() > 1 {
+            if VALUE_FLAGS.contains(&arg) {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        return (arg == "install").then_some(i);
+    }
+    None
+}
+
+/// `pip ...` args of one command (after the program). `pip install name` cannot be judged
+/// offline: whether pip builds a package depends on what the index offers, so named packages
+/// are reported as "may build".
 pub(super) fn analyze(args: &[String], here: &Path, cwd: &Path, judge: &Judge) -> Vec<Finding> {
-    let mut words = args.iter().filter(|a| !a.starts_with('-') || a.len() > 1);
-    // The subcommand is the first word that is not a flag; pip's global flags take no value here.
-    let Some(sub) = words.find(|a| !a.starts_with('-')) else {
+    let Some(at) = install_position(args) else {
         return Vec::new();
     };
-    if sub != "install" {
-        return Vec::new();
-    }
-    let rest: Vec<String> = args
-        .iter()
-        .skip_while(|a| *a != "install")
-        .skip(1)
-        .cloned()
-        .collect();
-    let mut scan = Scan::default();
-    read_args(&rest, here, cwd, 0, &mut scan);
+    let mut scan = Scan {
+        root: here.to_path_buf(),
+        only_binary_all: false,
+        no_binary: BTreeSet::new(),
+        targets: BTreeSet::new(),
+        names: BTreeSet::new(),
+        problems: Vec::new(),
+    };
+    read_args(&args[at + 1..], here, cwd, 0, &mut scan);
     let mut out = Vec::new();
     for (file, why) in &scan.problems {
         out.push(unchecked(file, why));
     }
-    if scan.only_binary_all {
-        out.push(finding(
-            "install/pip-wheels-only",
-            Severity::Info,
-            None,
-            None,
-            "--only-binary :all:",
-            None,
-        ));
-        return out;
-    }
-    if scan.no_binary {
+    if !scan.no_binary.is_empty() {
+        let names: BTreeSet<String> = scan.no_binary.iter().cloned().collect();
         out.push(finding(
             "install/pip-build-code",
             Severity::Warn,
             None,
             None,
-            "--no-binary makes pip build packages from source",
+            &format!("--no-binary makes pip build from source: {}", list(&names)),
             None,
         ));
     }
@@ -127,6 +141,30 @@ pub(super) fn analyze(args: &[String], here: &Path, cwd: &Path, judge: &Judge) -
             )),
             Target::Directory(dir) => out.extend(directory(dir, here, cwd, judge)),
         }
+    }
+    let wheels_only = scan.only_binary_all && scan.no_binary.is_empty();
+    if !scan.only_binary_all && !scan.no_binary.contains(":all:") && !scan.names.is_empty() {
+        out.push(finding(
+            "install/pip-build-code",
+            Severity::Warn,
+            None,
+            None,
+            &format!(
+                "pip may build these from source when the index has no wheel (not checked offline): {}",
+                list(&scan.names)
+            ),
+            None,
+        ));
+    }
+    if wheels_only && scan.targets.is_empty() {
+        out.push(finding(
+            "install/pip-wheels-only",
+            Severity::Info,
+            None,
+            None,
+            "--only-binary :all:",
+            None,
+        ));
     }
     out
 }
@@ -180,55 +218,117 @@ fn directory(dir: &str, here: &Path, cwd: &Path, judge: &Judge) -> Vec<Finding> 
     out
 }
 
-fn classify(spec: &str) -> Kind {
-    let lower = spec.to_ascii_lowercase();
+/// The spec as pip would read it: a PEP 508 `name @ url` is its url, anything else as written.
+fn direct_reference(spec: &str) -> String {
+    match pep508_rs::Requirement::<pep508_rs::VerbatimUrl>::from_str(spec) {
+        Ok(req) => match req.version_or_url {
+            Some(pep508_rs::VersionOrUrl::Url(url)) => url.to_string(),
+            _ => spec.to_string(),
+        },
+        Err(_) => spec.to_string(),
+    }
+}
+
+fn package_name(spec: &str) -> String {
+    pep508_rs::Requirement::<pep508_rs::VerbatimUrl>::from_str(spec)
+        .map(|r| r.name.to_string())
+        .unwrap_or_else(|_| spec.to_string())
+}
+
+fn classify(spec: &str, root: &Path) -> Kind {
+    let target = direct_reference(spec);
+    let lower = target.to_ascii_lowercase();
+    let path = lower.split(['#', '?']).next().unwrap_or("");
+    if path.ends_with(".whl") {
+        return Kind::Wheel;
+    }
     let archive = [".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".zip", ".tar"]
         .iter()
-        .any(|e| lower.split(['#', '?']).next().unwrap_or("").ends_with(e));
-    if ["git+", "hg+", "svn+", "bzr+"]
-        .iter()
-        .any(|p| lower.starts_with(p))
-        || archive
-    {
+        .any(|e| path.ends_with(e));
+    if lower.contains("://") || lower.starts_with("file:") || archive {
         Kind::Source
-    } else if lower.contains(".whl") {
-        Kind::Other
-    } else if spec == "." || spec == ".." || spec.starts_with(['.', '/', '~']) {
+    } else if target == "."
+        || target == ".."
+        || target.starts_with(['.', '/', '~'])
+        || (target.contains('/') && root.join(&target).is_dir())
+    {
         Kind::Directory
     } else {
-        Kind::Other
+        Kind::Index(package_name(spec))
     }
 }
 
 fn add_spec(spec: &str, scan: &mut Scan) {
-    match classify(spec) {
+    let spec = spec.split(" --").next().unwrap_or(spec).trim();
+    let spec = spec.split(" ;").next().unwrap_or(spec).trim();
+    let shown = direct_reference(spec);
+    match classify(spec, &scan.root) {
         Kind::Directory => {
-            scan.targets.insert(Target::Directory(spec.to_string()));
+            scan.targets.insert(Target::Directory(shown));
         }
         Kind::Source => {
-            scan.targets.insert(Target::Source(spec.to_string()));
+            scan.targets.insert(Target::Source(shown));
         }
-        Kind::Other => {}
+        Kind::Index(name) => {
+            scan.names.insert(name);
+        }
+        Kind::Wheel => {}
     }
 }
 
+/// pip's format control: a later flag overrides an earlier one for the names it mentions, and
+/// `:all:` resets the other flag.
 fn binary_flag(flag: &str, value: Option<&str>, scan: &mut Scan) {
-    let value = value.unwrap_or("");
-    match flag {
-        "--only-binary" if value.split(',').any(|v| v == ":all:") => scan.only_binary_all = true,
-        "--no-binary" if value.split(',').any(|v| v != ":none:") => scan.no_binary = true,
-        _ => {}
+    for name in value.unwrap_or("").split(',').map(str::to_ascii_lowercase) {
+        match (flag, name.as_str()) {
+            ("--only-binary", ":all:") => {
+                scan.only_binary_all = true;
+                scan.no_binary.clear();
+            }
+            ("--only-binary", ":none:") => scan.only_binary_all = false,
+            ("--only-binary", _) => {
+                scan.no_binary.remove(&name);
+            }
+            ("--no-binary", ":all:") => {
+                scan.only_binary_all = false;
+                scan.no_binary.clear();
+                scan.no_binary.insert(name);
+            }
+            ("--no-binary", ":none:") => scan.no_binary.clear(),
+            ("--no-binary", _) => {
+                scan.no_binary.insert(name);
+            }
+            _ => {}
+        }
     }
 }
 
+/// `-rreq.txt` as (`-r`, `req.txt`); anything else as (flag, inline value of `--flag=value`).
+fn split_flag(arg: &str) -> (&str, Option<&str>) {
+    if let Some(long) = arg.strip_prefix("--") {
+        return match long.split_once('=') {
+            Some((_, v)) => (&arg[..arg.len() - v.len() - 1], Some(v)),
+            None => (arg, None),
+        };
+    }
+    let mut chars = arg.chars();
+    if chars.next() == Some('-')
+        && let Some(short) = chars.next()
+        && GLUED_SHORT.contains(&short)
+        && arg.len() > 2
+    {
+        return (&arg[..2], Some(&arg[2..]));
+    }
+    (arg, None)
+}
+
+/// Reads install options and specs from CLI words; requirements-file option lines are
+/// tokenised and read through here too, so both take the same forms.
 fn read_args(args: &[String], here: &Path, cwd: &Path, depth: usize, scan: &mut Scan) {
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
-        let (flag, inline) = match arg.split_once('=') {
-            Some((f, v)) if arg.starts_with("--") => (f, Some(v)),
-            _ => (arg, None),
-        };
+        let (flag, inline) = split_flag(arg);
         let mut value = || {
             inline.or_else(|| {
                 i += 1;
@@ -243,7 +343,7 @@ fn read_args(args: &[String], here: &Path, cwd: &Path, depth: usize, scan: &mut 
             }
             "-e" | "--editable" => {
                 if let Some(target) = value() {
-                    if matches!(classify(target), Kind::Source) {
+                    if matches!(classify(target, &scan.root), Kind::Source) {
                         add_spec(target, scan);
                     } else {
                         scan.targets.insert(Target::Directory(target.to_string()));
@@ -257,7 +357,7 @@ fn read_args(args: &[String], here: &Path, cwd: &Path, depth: usize, scan: &mut 
             f if VALUE_FLAGS.contains(&f) => {
                 let _ = value();
             }
-            f if f.starts_with('-') => {}
+            f if f.starts_with('-') && f.len() > 1 => {}
             _ => add_spec(arg, scan),
         }
         i += 1;
@@ -287,15 +387,14 @@ fn requirements(file: &str, here: &Path, cwd: &Path, depth: usize, scan: &mut Sc
             continue;
         }
         if line.starts_with('-') {
-            let words: Vec<String> = line
-                .split_once(char::is_whitespace)
-                .map(|(f, v)| vec![f.to_string(), v.trim().to_string()])
-                .unwrap_or_else(|| vec![line.to_string()]);
-            read_args(&words, &base, cwd, depth + 1, scan);
+            match shlex::split(line) {
+                Some(words) => read_args(&words, &base, cwd, depth + 1, scan),
+                None => scan
+                    .problems
+                    .push((name.clone(), "has a line that cannot be read".into())),
+            }
         } else {
-            let spec = line.split(" ;").next().unwrap_or(line).trim();
-            let spec = spec.split(" @ ").nth(1).unwrap_or(spec).trim();
-            add_spec(spec, scan);
+            add_spec(line, scan);
         }
     }
 }

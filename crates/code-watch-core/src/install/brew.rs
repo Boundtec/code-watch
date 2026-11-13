@@ -10,6 +10,9 @@ pub(super) fn analyze(args: &[String]) -> Vec<Finding> {
     let Some(sub) = positionals.next() else {
         return Vec::new();
     };
+    if sub == "bundle" {
+        return vec![super::unchecked_command("brew bundle")];
+    }
     let named: Vec<&String> = positionals.collect();
     let hits: Vec<&String> = match sub.as_str() {
         "install" | "reinstall" | "upgrade" => named

@@ -54,8 +54,24 @@ struct Entry {
     rule: String,
     path: Option<GlobMatcher>,
     domain: Option<String>,
-    package: Option<GlobMatcher>,
+    package: Option<PackageMatch>,
     reason: Option<String>,
+}
+
+/// OSV entries name one package exactly; only `install/*` rules take a glob, because their
+/// packages come from lockfile keys such as `@scope/name`.
+enum PackageMatch {
+    Exact(String),
+    Glob(GlobMatcher),
+}
+
+impl PackageMatch {
+    fn matches(&self, found: Option<&str>) -> bool {
+        match self {
+            PackageMatch::Exact(want) => same(Some(want), found),
+            PackageMatch::Glob(g) => found.is_some_and(|p| g.is_match(p)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -219,7 +235,7 @@ impl Entry {
             && self
                 .package
                 .as_ref()
-                .is_none_or(|g| f.package.as_deref().is_some_and(|p| g.is_match(p)))
+                .is_none_or(|m| m.matches(f.package.as_deref()))
     }
 }
 
@@ -268,10 +284,13 @@ fn parse(text: &str, path: &str) -> Result<Vec<Entry>, AllowError> {
                 .package
                 .as_deref()
                 .map(|p| {
+                    if !raw.rule.starts_with("install/") {
+                        return Ok(PackageMatch::Exact(p.to_string()));
+                    }
                     GlobBuilder::new(p)
                         .case_insensitive(true)
                         .build()
-                        .map(|g| g.compile_matcher())
+                        .map(|g| PackageMatch::Glob(g.compile_matcher()))
                         .map_err(|e| invalid(format!("package {p:?}: {e}")))
                 })
                 .transpose()?;
@@ -634,7 +653,26 @@ mod tests {
     }
 
     #[test]
-    fn the_package_narrower_is_a_case_insensitive_glob() {
+    fn an_install_rule_package_is_a_case_insensitive_glob() {
+        let k = known(&["install/x"]);
+        let pkg = |p: &str| Finding {
+            package: Some(p.into()),
+            ..finding("install/x", Severity::Warn)
+        };
+        let allowed = |entry: &str, name: &str| {
+            let user = format!("[[allow]]\nrule = \"install/x\"\npackage = \"{entry}\"\n");
+            lists(&user, "").apply(vec![pkg(name)], &k).kept.is_empty()
+        };
+        assert!(allowed("Left-Pad", "left-pad"));
+        assert!(allowed("@scope/*", "@scope/x"));
+        assert!(!allowed("@scope/*", "@other/x"));
+        assert!(allowed("lib[ab]", "liba"));
+        assert!(!allowed("lib[ab]", "libc"));
+        assert!(allowed("*", "anything"));
+    }
+
+    #[test]
+    fn an_osv_package_is_matched_exactly() {
         let k = known(&["w"]);
         let pkg = |p: &str| Finding {
             package: Some(p.into()),
@@ -644,13 +682,10 @@ mod tests {
             let user = format!("[[allow]]\nrule = \"w\"\npackage = \"{entry}\"\n");
             lists(&user, "").apply(vec![pkg(name)], &k).kept.is_empty()
         };
-        assert!(allowed("Left-Pad", "left-pad"));
-        assert!(allowed("left-pad", "LEFT-PAD"));
-        assert!(allowed("@scope/*", "@scope/x"));
-        assert!(!allowed("@scope/*", "@other/x"));
-        assert!(allowed("lib[ab]", "liba"));
-        assert!(!allowed("lib[ab]", "lib[ab]"));
-        assert!(!allowed("lib[ab]", "libc"));
+        assert!(allowed("lib[ab]", "lib[ab]"));
+        assert!(!allowed("lib[ab]", "liba"));
+        assert!(!allowed("@scope/*", "@scope/x"));
+        assert!(!allowed("*", "anything"));
     }
 
     #[test]

@@ -7,9 +7,13 @@ mod node;
 mod pip;
 mod read;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::finding::{Evidence, Finding, Layer, Severity};
+
+/// Dependency names listed in one finding before "and N more".
+const LISTED_NAMES: usize = 20;
 
 pub const RULE_UNCHECKED: &str = "install/unchecked";
 
@@ -47,8 +51,13 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         id: "install/no-scripts",
-        title: "Install scripts are turned off, nothing runs on install",
+        title: "Lifecycle scripts are turned off for this install",
         remediation: "",
+    },
+    Spec {
+        id: "install/repo-code-at-install",
+        title: "The repository ships code that runs on every install",
+        remediation: "Read the file before installing; --ignore-scripts does not stop it.",
     },
     Spec {
         id: "install/no-script-found",
@@ -63,7 +72,7 @@ const SPECS: &[Spec] = &[
     Spec {
         id: "install/pip-build-code",
         title: "pip builds and runs project code to install this",
-        remediation: "Read setup.py or the build backend first, or install wheels only with --only-binary :all:.",
+        remediation: "Read setup.py or the build backend first. --only-binary :all: stops source builds from an index, not a local directory, an editable or a VCS install.",
     },
     Spec {
         id: "install/pip-wheels-only",
@@ -89,6 +98,7 @@ pub const RULE_IDS: &[&str] = &[
     "install/dependency-scripts-blocked",
     "install/dependency-scripts-unknown",
     "install/no-scripts",
+    "install/repo-code-at-install",
     "install/no-script-found",
     "install/global-package",
     "install/pip-build-code",
@@ -141,6 +151,20 @@ pub(crate) fn unchecked(file: &str, why: &str) -> Finding {
     )
 }
 
+/// Names for one finding: the first few, then "and N more".
+pub(crate) fn list(names: &BTreeSet<String>) -> String {
+    let shown: Vec<&str> = names
+        .iter()
+        .take(LISTED_NAMES)
+        .map(String::as_str)
+        .collect();
+    let mut joined = shown.join(", ");
+    if names.len() > LISTED_NAMES {
+        joined.push_str(&format!(" and {} more", names.len() - LISTED_NAMES));
+    }
+    joined
+}
+
 /// `path` as the user would write it: relative to `cwd` when it lies under it.
 pub(crate) fn shown(path: &Path, cwd: &Path) -> String {
     path.strip_prefix(cwd)
@@ -159,9 +183,109 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
+/// Programs and subcommands that run code at install time and are not analysed; an empty list
+/// means every use. A match is reported as "not checked", never as clean.
+const NOT_CHECKED: &[(&str, &[&[&str]])] = &[
+    ("npx", &[]),
+    ("pnpx", &[]),
+    ("bunx", &[]),
+    ("uvx", &[]),
+    (
+        "bun",
+        &[
+            &["install"],
+            &["i"],
+            &["add"],
+            &["a"],
+            &["update"],
+            &["upgrade"],
+            &["x"],
+            &["create"],
+        ],
+    ),
+    (
+        "pipx",
+        &[
+            &["install"],
+            &["run"],
+            &["upgrade"],
+            &["upgrade-all"],
+            &["reinstall"],
+            &["inject"],
+        ],
+    ),
+    ("poetry", &[&["install"], &["add"], &["update"], &["sync"]]),
+    (
+        "uv",
+        &[
+            &["sync"],
+            &["add"],
+            &["pip", "install"],
+            &["pip", "sync"],
+            &["tool", "install"],
+            &["tool", "run"],
+        ],
+    ),
+];
+
+/// The not-checked finding for a program the layer does not analyse, if this use runs code.
+fn not_checked(program: &str, args: &[String]) -> Option<Finding> {
+    let (_, subs) = NOT_CHECKED.iter().find(|(p, _)| *p == program)?;
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let hit = if subs.is_empty() {
+        Some(program.to_string())
+    } else {
+        subs.iter()
+            .find(|sub| words.windows(sub.len()).any(|w| w == **sub))
+            .map(|sub| format!("{program} {}", sub.join(" ")))
+    }?;
+    Some(unchecked_command(&hit))
+}
+
+pub(crate) fn unchecked_command(what: &str) -> Finding {
+    finding(
+        RULE_UNCHECKED,
+        Severity::Warn,
+        None,
+        None,
+        &format!("not checked: {what} may run install-time code"),
+        None,
+    )
+}
+
+/// Where `-m pip` is among a Python interpreter's args: interpreter flags (`-I`, `-u`,
+/// `-W ignore`, `-Im`) may come first; the first word that is not a flag is a script.
+fn python_dash_m_pip(args: &[String]) -> Option<&[String]> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let dash_m =
+            arg == "-m" || (arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('m'));
+        if dash_m {
+            return match args.get(i + 1).map(String::as_str) {
+                Some("pip") => Some(&args[i + 2..]),
+                _ => None,
+            };
+        }
+        match arg {
+            "-c" => return None,
+            "-W" | "-X" => i += 1,
+            _ if arg.starts_with('-') => {}
+            _ => return None,
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Checks each simple command of a command line, in order, for an install. Each entry holds the
 /// words of one command starting at the program. A `cd <dir>` before an install moves where it
-/// is judged. `uv pip`, `bun`, `npx`, `npm exec` and `brew bundle` are not recognised.
+/// is judged. Programs that install but are not analysed (`npx`, `bun`, `uv`, `pipx`, `poetry`,
+/// `brew bundle`) give `install/unchecked` where they run code.
 pub fn analyze(commands: &[Vec<String>], cwd: &Path, judge: &Judge) -> Vec<Finding> {
     let mut findings = Vec::new();
     let mut here: PathBuf = cwd.to_path_buf();
@@ -183,14 +307,11 @@ pub fn analyze(commands: &[Vec<String>], cwd: &Path, judge: &Judge) -> Vec<Findi
             "brew" => findings.extend(brew::analyze(args)),
             p if versioned(p, "pip") => findings.extend(pip::analyze(args, &here, cwd, judge)),
             p if versioned(p, "python") => {
-                if let [flag, module, rest @ ..] = args
-                    && flag == "-m"
-                    && module == "pip"
-                {
+                if let Some(rest) = python_dash_m_pip(args) {
                     findings.extend(pip::analyze(rest, &here, cwd, judge));
                 }
             }
-            _ => {}
+            p => findings.extend(not_checked(p, args)),
         }
     }
     findings

@@ -28,14 +28,15 @@ schema = 1
 rule = "repo/npm-lifecycle-script"   # required: an exact rule id, no wildcard
 path = "packages/**/package.json"    # optional glob on the finding's file, relative to the scanned root
 domain = "example.org"               # optional: the host a command finding is about
-package = "left-pad"                 # optional glob: the package an OSV or install finding is about (`@scope/*`)
+package = "left-pad"                 # optional: the package an OSV or install finding is about; a glob (`@scope/*`) for `install/*` rules only
 reason = "internal build step"       # optional, echoed in --json
 ```
 
 All narrowers on an entry must match. `path` uses `*` within one directory (it does not cross `/`; use `**`), and a
 finding with no file never matches a path entry. `domain` and `package` compare against fields the rule itself sets,
-case-insensitively (`package` is a glob, `domain` is exact): `example.org` does not cover `cdn.example.org`, and the finding's excerpt is never
-consulted. The `package` narrower was an exact match before install findings existed: a name with a glob character (`[`, `*`, `?`) now matches as a pattern and differing case now matches, so an existing OSV allow entry with such a name covers more than before.
+case-insensitively (`domain` is exact): `example.org` does not cover `cdn.example.org`, and the finding's excerpt is never
+consulted. `package` is an exact name for OSV rules, as it always was. Only `install/*` rules read it as a case-insensitive glob (`@scope/*`, `Left-Pad`),
+because their names come from lockfile keys; `package = "*"` on an install rule in the user file silences that rule for every package.
 
 A finding has a `domain` only when it is about a download and the command is unambiguous: the finding is
 `command/pipe-to-shell` (the host is taken from its URL) or `command/lookalike-download-domain` (the host it flagged).

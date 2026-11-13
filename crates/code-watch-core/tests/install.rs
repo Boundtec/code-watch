@@ -77,16 +77,14 @@ fn a_command_that_is_not_an_install_reads_nothing_and_reports_nothing() {
     for cmd in [
         "npm run build",
         "npm test",
-        "npm exec foo",
-        "npx foo",
-        "bun install",
-        "uv pip install .",
-        "brew bundle",
         "brew list",
         "pnpm run x",
         "yarn run x",
-        "yarn dlx x",
+        "npm run install-docs i",
+        "bun run build",
+        "uv pip list",
         "pip list",
+        "pip --python /x list",
         "python -m venv .v",
         "python -m pip list",
         "ls -la",
@@ -96,17 +94,85 @@ fn a_command_that_is_not_an_install_reads_nothing_and_reports_nothing() {
 }
 
 #[test]
-fn npm_with_no_install_script_says_so_and_that_dependencies_are_unknown() {
+fn npm_without_a_lockfile_warns_that_dependency_scripts_may_run_and_never_says_none_found() {
     let t = Tree::with(&[("package.json", &manifest(r#""test":"x""#))]);
     let f = run("npm install", t.path());
-    assert_eq!(
-        ids(&f),
-        [
-            "install/dependency-scripts-unknown",
-            "install/no-script-found"
-        ]
+    assert_eq!(ids(&f), ["install/dependency-scripts-unknown"]);
+    assert_eq!(f[0].severity, Severity::Warn);
+}
+
+const LEFT_PAD_LOCK: &str = r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/left-pad":{"version":"1.3.0","resolved":"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"}}}"#;
+
+fn with_dependency(extra: &str) -> String {
+    format!(r#"{{"name":"x","dependencies":{{{extra}}}}}"#)
+}
+
+#[test]
+fn no_script_found_only_when_the_lock_was_read_and_covers_every_dependency() {
+    let covered = Tree::with(&[
+        ("package.json", &with_dependency(r#""left-pad":"1.3.0""#)),
+        ("package-lock.json", LEFT_PAD_LOCK),
+    ]);
+    let f = run("npm ci", covered.path());
+    assert_eq!(ids(&f), ["install/no-script-found"]);
+    assert_eq!(f[0].severity, Severity::Info);
+
+    let stale = Tree::with(&[
+        (
+            "package.json",
+            &with_dependency(r#""left-pad":"1.3.0","new-dep":"1""#),
+        ),
+        ("package-lock.json", LEFT_PAD_LOCK),
+    ]);
+    let f = run("npm ci", stale.path());
+    assert_eq!(ids(&f), ["install/dependency-scripts-unknown"]);
+    assert_eq!(f[0].severity, Severity::Warn);
+    assert!(f[0].evidence.excerpt.contains("new-dep"));
+}
+
+#[test]
+fn a_named_package_install_may_run_scripts_and_is_never_clean() {
+    let t = Tree::with(&[
+        ("package.json", &with_dependency(r#""left-pad":"1.3.0""#)),
+        ("package-lock.json", LEFT_PAD_LOCK),
+    ]);
+    for (cmd, package) in [
+        ("npm i evil-pkg", "evil-pkg"),
+        ("npm install @scope/evil@2", "@scope/evil"),
+        ("yarn add evil-pkg", "evil-pkg"),
+        ("pnpm add evil-pkg", "evil-pkg"),
+    ] {
+        let f = run(cmd, t.path());
+        let d = one(&f, "install/dependency-scripts");
+        assert_eq!(d.severity, Severity::Warn, "{cmd}");
+        assert_eq!(d.package.as_deref(), Some(package), "{cmd}");
+        assert!(!ids(&f).contains(&"install/no-script-found"), "{cmd}");
+    }
+}
+
+#[test]
+fn a_partly_installed_pnpm_project_is_unknown_not_clean() {
+    let t = Tree::with(&[
+        ("package.json", &with_dependency(r#""a":"1","b":"1""#)),
+        ("pnpm-workspace.yaml", "packages:\n  - \".\"\n"),
+        (
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      a:\n        specifier: '1'\n        version: 1.0.0\n      b:\n        specifier: '1'\n        version: 1.0.0\npackages:\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n  b@1.0.0:\n    resolution: {integrity: sha512-y}\n",
+        ),
+        (
+            "node_modules/.pnpm/a@1.0.0/node_modules/a/package.json",
+            r#"{"name":"a"}"#,
+        ),
+    ]);
+    let f = run("pnpm install", t.path());
+    let u = one(&f, "install/dependency-scripts-unknown");
+    assert_eq!(u.severity, Severity::Warn);
+    assert!(
+        u.evidence.excerpt.contains("1 packages"),
+        "{}",
+        u.evidence.excerpt
     );
-    assert!(f.iter().all(|f| f.severity == Severity::Info));
+    assert!(!ids(&f).contains(&"install/no-script-found"));
 }
 
 #[test]
@@ -535,7 +601,7 @@ fn pnpm_ignore_scripts_in_the_workspace_file_turns_scripts_off_and_a_broken_one_
 #[test]
 fn yarn_berry_does_not_run_dependency_scripts_unless_enabled_and_yarn_1_cannot_be_listed() {
     let berry = Tree::with(&[("package.json", &manifest("")), ("yarn.lock", YARN_BERRY)]);
-    for cmd in ["yarn", "yarn install", "yarn add left-pad"] {
+    for cmd in ["yarn", "yarn install"] {
         let f = run(cmd, berry.path());
         assert!(
             ids(&f).contains(&"install/dependency-scripts-unknown"),
@@ -664,30 +730,150 @@ fn pip_local_projects_vcs_and_source_archives_run_build_code_and_wheels_do_not()
             "{cmd}"
         );
     }
+    assert!(run("pip install ./dist/x-1.0-py3-none-any.whl", t.path()).is_empty());
+}
+
+#[test]
+fn a_named_pip_package_may_build_from_source_unless_wheels_only() {
+    let t = Tree::new();
     for cmd in [
-        "pip install ./dist/x-1.0-py3-none-any.whl",
         "pip install requests",
         "pip install requests==2.0 -i https://pypi.example.invalid/simple",
         "pip install --no-binary :none: requests",
+    ] {
+        let f = run(cmd, t.path());
+        let d = one(&f, "install/pip-build-code");
+        assert_eq!(d.severity, Severity::Warn, "{cmd}");
+        assert!(d.evidence.excerpt.contains("requests"), "{cmd}");
+    }
+    assert_eq!(
+        ids(&run("pip install --only-binary :all: requests", t.path())),
+        ["install/pip-wheels-only"]
+    );
+}
+
+#[test]
+fn pip_wheels_only_is_info_and_a_partial_only_binary_is_not() {
+    let t = Tree::with(&[("proj/setup.py", "x")]);
+    let f = run("pip install --only-binary :all: requests", t.path());
+    assert_eq!(ids(&f), ["install/pip-wheels-only"]);
+    assert_eq!(f[0].severity, Severity::Info);
+    assert_eq!(
+        ids(&run("pip install --only-binary numpy ./proj", t.path())),
+        ["install/pip-build-code"]
+    );
+}
+
+#[test]
+fn only_binary_all_does_not_stop_a_directory_or_vcs_build_and_a_later_no_binary_reenables_one() {
+    let t = Tree::with(&[
+        ("vendor/pkg/setup.py", "x"),
+        ("req.txt", "git+https://example.invalid/y.git\n"),
+    ]);
+    for cmd in [
+        "pip install --only-binary :all: ./vendor/pkg",
+        "pip install --only-binary=:all: git+https://example.invalid/y.git",
+        "pip install --only-binary :all: -r req.txt",
+        "pip install --only-binary :all: -e ./vendor/pkg",
+    ] {
+        let f = run(cmd, t.path());
+        assert_eq!(ids(&f), ["install/pip-build-code"], "{cmd}");
+    }
+    let f = run(
+        "pip install --only-binary :all: --no-binary foo requests",
+        t.path(),
+    );
+    let d = one(&f, "install/pip-build-code");
+    assert!(d.evidence.excerpt.contains("foo"));
+    assert!(!ids(&f).contains(&"install/pip-wheels-only"));
+    // The later flag wins both ways.
+    let f = run(
+        "pip install --no-binary :all: --only-binary :all: requests",
+        t.path(),
+    );
+    assert_eq!(ids(&f), ["install/pip-wheels-only"]);
+}
+
+#[test]
+fn the_pip_build_code_advice_does_not_offer_only_binary_as_a_full_fix() {
+    let t = Tree::with(&[("proj/setup.py", "x")]);
+    let f = run("pip install ./proj", t.path());
+    let fix = &one(&f, "install/pip-build-code").remediation;
+    assert!(fix.contains("not a local directory"), "{fix}");
+}
+
+#[test]
+fn every_pip_form_that_builds_code_is_seen() {
+    let t = Tree::with(&[
+        ("vendor/pkg/setup.py", "x"),
+        ("proj/setup.py", "x"),
+        ("req.txt", "git+https://example.invalid/y.git\n"),
+        ("c.txt", "requests==2\n"),
+    ]);
+    for cmd in [
+        "pip install -rreq.txt",
+        "pip install -r req.txt",
+        "pip install --requirement=req.txt",
+        "pip install -e./proj",
+        "pip install -cc.txt ./proj",
+        "pip --python /x install ./vendor/pkg",
+        "pip --log f install ./proj",
+        "pip --proxy p install ./proj",
+        "pip --cache-dir d install ./proj",
+        "pip --isolated -q install ./proj",
+        "python3 -I -m pip install ./proj",
+        "python -u -m pip install ./proj",
+        "python -W ignore -m pip install ./proj",
+        "python -Im pip install ./proj",
+        "pip install vendor/pkg",
+        "pip install \"pkg @ git+https://example.invalid/y.git\"",
+        "pip install pkg@git+https://example.invalid/y.git",
+        "pip install https://github.com/x/y/archive/main",
+        "pip install https://example.invalid/pkg?download",
+        "pip install ftp://example.invalid/pkg.tar.gz",
+    ] {
+        let f = run(cmd, t.path());
+        assert_eq!(ids(&f), ["install/pip-build-code"], "{cmd}");
+        assert_eq!(f[0].severity, Severity::Warn, "{cmd}");
+        assert!(!f[0].evidence.excerpt.contains("may build"), "{cmd}");
+    }
+    for cmd in [
+        "pip install https://example.invalid/x-1.0-py3-none-any.whl",
+        "pip install \"x @ https://example.invalid/x-1.0-py3-none-any.whl\"",
     ] {
         assert!(run(cmd, t.path()).is_empty(), "{cmd}");
     }
 }
 
 #[test]
-fn pip_wheels_only_is_info_and_a_partial_only_binary_is_not() {
-    let t = Tree::with(&[("proj/setup.py", "x")]);
-    for cmd in [
-        "pip install --only-binary :all: requests",
-        "pip install --only-binary=:all: ./proj",
-    ] {
-        let f = run(cmd, t.path());
-        assert_eq!(ids(&f), ["install/pip-wheels-only"], "{cmd}");
-        assert_eq!(f[0].severity, Severity::Info);
-    }
+fn a_pep_508_direct_reference_is_shown_as_its_url() {
+    let t = Tree::new();
+    let f = run(
+        "pip install \"pkg @ git+https://example.invalid/y.git\"",
+        t.path(),
+    );
     assert_eq!(
-        ids(&run("pip install --only-binary numpy ./proj", t.path())),
-        ["install/pip-build-code"]
+        one(&f, "install/pip-build-code").evidence.excerpt,
+        "pip builds git+https://example.invalid/y.git from source"
+    );
+}
+
+#[test]
+fn requirements_file_option_lines_take_the_same_forms_as_the_command_line() {
+    let t = Tree::with(&[
+        ("proj/setup.py", "x"),
+        ("nested.txt", "-e./proj\n"),
+        ("req.txt", "-rnested.txt\n"),
+    ]);
+    let f = run("pip install -r req.txt", t.path());
+    assert_eq!(ids(&f), ["install/pip-build-code"]);
+    t.write("quoted.txt", "--no-binary \"foo bar\"\n");
+    let f = run("pip install -r quoted.txt", t.path());
+    assert!(
+        one(&f, "install/pip-build-code")
+            .evidence
+            .excerpt
+            .contains("foo")
     );
 }
 
@@ -864,4 +1050,338 @@ fn the_install_module_cannot_run_a_program_write_or_reach_the_network() {
             );
         }
     }
+}
+
+#[test]
+fn commands_that_run_install_time_code_but_are_not_analysed_are_not_checked() {
+    let gone = Path::new("/nonexistent-code-watch-dir");
+    for (cmd, said) in [
+        ("npm update", "npm update"),
+        ("npm up", "npm up"),
+        ("npm upgrade", "npm upgrade"),
+        ("npm rebuild", "npm rebuild"),
+        ("npm link", "npm link"),
+        ("npm dedupe", "npm dedupe"),
+        ("npm exec foo", "npm exec"),
+        ("npx foo", "npx"),
+        ("pnpx foo", "pnpx"),
+        ("yarn workspace foo add x", "yarn workspace add"),
+        (
+            "yarn workspaces foreach run x install",
+            "yarn workspaces install",
+        ),
+        ("yarn up", "yarn up"),
+        ("yarn upgrade", "yarn upgrade"),
+        ("yarn dlx x", "yarn dlx"),
+        ("pnpm update", "pnpm update"),
+        ("pnpm up", "pnpm up"),
+        ("pnpm rebuild", "pnpm rebuild"),
+        ("pnpm recursive install", "pnpm recursive install"),
+        ("pnpm m i", "pnpm m i"),
+        ("pnpm approve-builds", "pnpm approve-builds"),
+        ("pnpm dlx evil", "pnpm dlx"),
+        ("uv pip install x", "uv pip install"),
+        ("uv sync", "uv sync"),
+        ("uvx tool", "uvx"),
+        ("bun install", "bun install"),
+        ("bunx tool", "bunx"),
+        ("pipx install x", "pipx install"),
+        ("poetry install", "poetry install"),
+        ("brew bundle", "brew bundle"),
+    ] {
+        let f = run(cmd, gone);
+        assert_eq!(ids(&f), ["install/unchecked"], "{cmd}");
+        assert_eq!(f[0].severity, Severity::Warn, "{cmd}");
+        assert!(
+            f[0].evidence
+                .excerpt
+                .contains(&format!("not checked: {said}")),
+            "{cmd}: {}",
+            f[0].evidence.excerpt
+        );
+    }
+}
+
+#[test]
+fn an_install_word_is_found_past_a_value_flag_the_layer_does_not_know() {
+    let t = Tree::with(&[("package.json", &manifest(r#""postinstall":"x""#))]);
+    for cmd in [
+        "npm --install-strategy hoisted i",
+        "npm --script-shell sh install",
+        "npm --some-unknown-flag value i",
+        "npm --otp 123456 ci",
+    ] {
+        let f = run(cmd, t.path());
+        assert!(ids(&f).contains(&"install/lifecycle-script"), "{cmd}");
+    }
+}
+
+#[test]
+fn ignore_scripts_takes_a_following_true_or_false_word_as_its_value() {
+    let t = Tree::with(&[("package.json", &manifest(r#""postinstall":"x""#))]);
+    let f = run("npm i --ignore-scripts false", t.path());
+    assert!(ids(&f).contains(&"install/lifecycle-script"));
+    assert!(!ids(&f).contains(&"install/no-scripts"));
+    assert_eq!(
+        ids(&run("npm i --ignore-scripts true", t.path())),
+        ["install/no-scripts"]
+    );
+}
+
+#[test]
+fn scripts_off_does_not_claim_that_nothing_runs() {
+    let t = Tree::with(&[("package.json", &manifest(""))]);
+    let f = run("npm i --ignore-scripts", t.path());
+    let n = one(&f, "install/no-scripts");
+    assert!(!n.title.contains("nothing runs") && !n.evidence.excerpt.contains("nothing runs"));
+    assert!(n.title.contains("Lifecycle scripts"));
+    assert!(n.evidence.excerpt.contains("npm_config_ignore_scripts"));
+}
+
+#[test]
+fn repository_code_that_runs_on_install_is_its_own_warning_whatever_ignore_scripts_says() {
+    let pnpm = Tree::with(&[
+        ("package.json", &manifest("")),
+        ("pnpm-workspace.yaml", "ignoreScripts: true\n"),
+        (".pnpmfile.cjs", "module.exports = {}\n"),
+    ]);
+    let f = run("pnpm install", pnpm.path());
+    assert_eq!(
+        one(&f, "install/repo-code-at-install").severity,
+        Severity::Warn
+    );
+    assert!(ids(&f).contains(&"install/no-scripts"));
+
+    let setting = Tree::with(&[
+        ("package.json", &manifest("")),
+        ("pnpm-workspace.yaml", "pnpmfile: hooks/pnpmfile.cjs\n"),
+    ]);
+    assert!(ids(&run("pnpm i", setting.path())).contains(&"install/repo-code-at-install"));
+
+    for rc in [
+        "yarnPath: .yarn/releases/yarn.cjs\n",
+        "plugins:\n  - path: .yarn/plugins/x.cjs\n",
+    ] {
+        let berry = Tree::with(&[
+            ("package.json", &manifest("")),
+            ("yarn.lock", YARN_BERRY),
+            (".yarnrc.yml", rc),
+        ]);
+        let f = run("yarn install", berry.path());
+        assert_eq!(
+            one(&f, "install/repo-code-at-install").severity,
+            Severity::Warn,
+            "{rc}"
+        );
+    }
+    let plain = Tree::with(&[("package.json", &manifest("")), ("yarn.lock", YARN_BERRY)]);
+    assert!(!ids(&run("yarn install", plain.path())).contains(&"install/repo-code-at-install"));
+}
+
+#[test]
+fn yarn_berry_reads_yarnrc_yml_not_npmrc_and_still_runs_the_projects_own_scripts() {
+    let t = Tree::with(&[
+        ("package.json", &manifest(r#""postinstall":"x""#)),
+        ("yarn.lock", YARN_BERRY),
+        (".npmrc", "ignore-scripts=true\n"),
+    ]);
+    let f = run("yarn install", t.path());
+    assert!(ids(&f).contains(&"install/lifecycle-script"));
+    assert!(!ids(&f).contains(&"install/no-scripts"));
+    let flagged = run("yarn install --ignore-scripts", t.path());
+    assert!(ids(&flagged).contains(&"install/lifecycle-script"));
+}
+
+#[test]
+fn a_package_with_a_binding_gyp_counts_as_an_install_script() {
+    let t = pnpm_tree(PNPM_WORKSPACE, PNPM_10, false);
+    t.write(
+        "node_modules/.pnpm/esbuild@0.21.5/node_modules/esbuild/package.json",
+        r#"{"name":"esbuild"}"#,
+    );
+    let without = run("pnpm install", t.path());
+    assert!(!ids(&without).contains(&"install/dependency-scripts"));
+    t.write(
+        "node_modules/.pnpm/esbuild@0.21.5/node_modules/esbuild/binding.gyp",
+        "{}",
+    );
+    let f = run("pnpm install", t.path());
+    assert!(
+        one(&f, "install/dependency-scripts")
+            .evidence
+            .excerpt
+            .contains("esbuild")
+    );
+}
+
+#[test]
+fn an_only_built_dependencies_file_is_read_inside_the_project_or_means_may_run() {
+    let with_file = |file: Option<&str>, setting: &str| {
+        let t = pnpm_tree(
+            &format!("onlyBuiltDependenciesFile: {setting}\n"),
+            PNPM_10,
+            true,
+        );
+        if let Some(text) = file {
+            t.write("allow.json", text);
+        }
+        run("pnpm install", t.path())
+    };
+    let f = with_file(Some(r#"["esbuild"]"#), "allow.json");
+    assert!(
+        one(&f, "install/dependency-scripts")
+            .evidence
+            .excerpt
+            .contains("will run")
+    );
+    let f = with_file(Some(r#"["other"]"#), "allow.json");
+    assert!(ids(&f).contains(&"install/dependency-scripts-blocked"));
+    for (file, setting) in [
+        (None, "allow.json"),
+        (Some("not json"), "allow.json"),
+        (Some(r#"["esbuild"]"#), "../allow.json"),
+        (Some(r#"["esbuild"]"#), "/etc/allow.json"),
+    ] {
+        let f = with_file(file, setting);
+        let d = one(&f, "install/dependency-scripts");
+        assert!(
+            d.evidence.excerpt.contains("may run"),
+            "{setting}: {}",
+            d.evidence.excerpt
+        );
+    }
+}
+
+#[test]
+fn a_member_directory_reads_the_lockfile_of_the_workspace_root() {
+    let t = Tree::with(&[
+        ("package.json", &manifest("")),
+        ("package-lock.json", NPM_LOCK),
+        (
+            "packages/a/package.json",
+            &with_dependency(r#""esbuild":"0.21.5""#),
+        ),
+    ]);
+    let f = run("npm ci --prefix packages/a", t.path());
+    assert!(
+        one(&f, "install/dependency-scripts")
+            .evidence
+            .excerpt
+            .contains("esbuild")
+    );
+    assert!(!ids(&f).contains(&"install/dependency-scripts-unknown"));
+
+    let pnpm = Tree::with(&[
+        ("package.json", PNPM_10),
+        ("pnpm-lock.yaml", PNPM_LOCK),
+        ("pnpm-workspace.yaml", "ignoreScripts: true\n"),
+        ("packages/a/package.json", &manifest(r#""postinstall":"x""#)),
+    ]);
+    assert_eq!(
+        ids(&run("pnpm install --dir packages/a", pnpm.path())),
+        ["install/no-scripts"]
+    );
+}
+
+#[test]
+fn dependencies_from_git_or_a_url_may_run_prepare_and_are_warned_per_dependency() {
+    for spec in [
+        "github:evil/d",
+        "git+ssh://git@github.com/evil/d.git",
+        "https://example.invalid/d.tgz",
+        "file:../d",
+        "link:../d",
+        "evil/d#main",
+    ] {
+        let t = Tree::with(&[
+            (
+                "package.json",
+                &with_dependency(&format!(r#""d":"{spec}""#)),
+            ),
+            (
+                "package-lock.json",
+                r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/d":{"version":"1.0.0"}}}"#,
+            ),
+        ]);
+        let f = run("npm ci", t.path());
+        let d = one(&f, "install/dependency-scripts");
+        assert_eq!(d.severity, Severity::Warn, "{spec}");
+        assert_eq!(d.package.as_deref(), Some("d"), "{spec}");
+        assert!(d.evidence.excerpt.contains("prepare"), "{spec}");
+        assert!(!ids(&f).contains(&"install/no-script-found"), "{spec}");
+    }
+    let registry = Tree::with(&[
+        (
+            "package.json",
+            &with_dependency(r#""d":"^1.2.3","e":"npm:d@1","@s/f":"~2""#),
+        ),
+        (
+            "package-lock.json",
+            r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/d":{},"node_modules/e":{},"node_modules/@s/f":{}}}"#,
+        ),
+    ]);
+    assert_eq!(
+        ids(&run("npm ci", registry.path())),
+        ["install/no-script-found"]
+    );
+}
+
+#[test]
+fn a_lock_entry_that_is_not_a_registry_tarball_is_warned_in_every_lockfile_format() {
+    let npm = Tree::with(&[
+        ("package.json", &with_dependency(r#""d":"1""#)),
+        (
+            "package-lock.json",
+            r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/d":{"resolved":"git+ssh://git@github.com/evil/d.git#abc"}}}"#,
+        ),
+    ]);
+    let pnpm = Tree::with(&[
+        ("package.json", &with_dependency(r#""d":"1""#)),
+        ("pnpm-workspace.yaml", "packages:\n  - \".\"\n"),
+        (
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      d:\n        specifier: '1'\n        version: 1.0.0\npackages:\n  d@1.0.0:\n    resolution: {tarball: 'https://example.invalid/d.tgz'}\n",
+        ),
+        (
+            "node_modules/.pnpm/d@1.0.0/node_modules/d/package.json",
+            r#"{"name":"d"}"#,
+        ),
+    ]);
+    let berry = Tree::with(&[
+        ("package.json", &with_dependency(r#""d":"1""#)),
+        (
+            "yarn.lock",
+            "__metadata:\n  version: 8\n\n\"d@git@github.com:evil/d.git#commit=abc\":\n  version: 1.0.0\n  resolution: \"d@git@github.com:evil/d.git#commit=abc\"\n",
+        ),
+    ]);
+    for (cmd, t) in [
+        ("npm ci", &npm),
+        ("pnpm install", &pnpm),
+        ("yarn install", &berry),
+    ] {
+        let f = run(cmd, t.path());
+        let d = one(&f, "install/dependency-scripts");
+        assert_eq!(d.package.as_deref(), Some("d"), "{cmd}");
+    }
+}
+
+#[test]
+fn a_source_address_never_prints_credentials() {
+    let t = Tree::with(&[
+        (
+            "package.json",
+            &with_dependency(r#""d":"https://user:s3cr3t@example.invalid/d.git""#),
+        ),
+        (
+            "package-lock.json",
+            r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/d":{}}}"#,
+        ),
+    ]);
+    let f = run("npm ci", t.path());
+    let text = format!("{f:?}");
+    assert!(
+        !text.contains("s3cr3t") && !text.contains("user:"),
+        "{text}"
+    );
+    assert!(text.contains("example.invalid"));
 }
