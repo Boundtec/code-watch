@@ -8,6 +8,7 @@ use ignore::WalkBuilder;
 
 use crate::allow::Allowlists;
 use crate::command;
+use crate::download::{self, DownloadError, DownloadStatus, MacTools};
 use crate::finding::Finding;
 use crate::osv::{self, Cache, OsvClient, OsvMode, RULE_IDS};
 use crate::report::{Report, SkipReason, Skipped};
@@ -250,6 +251,7 @@ impl Engine {
             .map(|r| r.id.clone())
             .chain(rust_rules)
             .chain(RULE_IDS.iter().map(|id| id.to_string()))
+            .chain(download::RULE_IDS.iter().map(|id| id.to_string()))
             .collect()
     }
 
@@ -263,6 +265,26 @@ impl Engine {
         if let Some(rule) = self.rules.rules().iter().find(|r| r.id == ID) {
             findings.push(rule.command_finding(command));
         }
+    }
+
+    /// Checks a downloaded file. `tools` is `None` where the layer is not available (not macOS):
+    /// the report then says the layer was skipped and why, never that it passed.
+    pub fn check_download(
+        &self,
+        path: &Path,
+        tools: Option<&dyn MacTools>,
+        allow: &Allowlists,
+    ) -> Result<Report, DownloadError> {
+        let subject = download::subject(path)?;
+        let Some(tools) = tools else {
+            return Ok(Report::from_download(
+                Vec::new(),
+                DownloadStatus::Skipped("macOS only".into()),
+            ));
+        };
+        let applied = allow.apply(download::analyze(&subject, tools), &self.known_rule_ids());
+        Ok(Report::from_download(applied.kept, DownloadStatus::Ran)
+            .with_allowlist(applied.suppressed, applied.warnings))
     }
 
     pub fn check_command(&self, command: &str) -> Report {

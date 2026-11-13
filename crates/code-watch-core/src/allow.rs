@@ -187,7 +187,7 @@ enum Decision {
 }
 
 fn suppressible(f: &Finding) -> bool {
-    matches!(f.layer, Layer::Rules | Layer::Osv)
+    matches!(f.layer, Layer::Rules | Layer::Osv | Layer::Download)
         && !f.rule_id.starts_with("allowlist/")
         && f.rule_id != "repo/unscanned-target"
         && f.rule_id != crate::osv::RULE_UNPARSED

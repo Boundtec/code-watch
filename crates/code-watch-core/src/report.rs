@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::allow::Suppressed;
+use crate::download::DownloadStatus;
 use crate::finding::{Evidence, Finding, Layer, Severity};
 use crate::names::display_as_wire_name;
 use crate::osv::OsvStatus;
@@ -97,6 +98,24 @@ impl Report {
             suppressed: Vec::new(),
             allowlist_warnings: Vec::new(),
         }
+    }
+
+    /// Builds a report for a downloaded file: only the downloads layer ran or was skipped, and
+    /// a skipped one keeps its reason, so it never reads as passed.
+    pub fn from_download(findings: Vec<Finding>, status: DownloadStatus) -> Self {
+        let mut report = Self::from_scan(findings, Vec::new());
+        let (layer_status, note) = match status {
+            DownloadStatus::Ran => (LayerStatus::Ran, None),
+            DownloadStatus::Skipped(why) => (LayerStatus::Skipped, Some(why)),
+        };
+        report.layers = BTreeMap::from([
+            (Layer::Download, layer_status),
+            (Layer::Llm, LayerStatus::Off),
+        ]);
+        report
+            .layer_notes
+            .extend(note.map(|why| (Layer::Download, why)));
+        report
     }
 
     /// Records how the OSV layer ended. `Skipped` keeps its reason, so a report never says
