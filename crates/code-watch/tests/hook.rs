@@ -1,8 +1,31 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard};
 
 use tempfile::TempDir;
+
+/// Held while an executable is written and while a child is spawned: a child forked by another
+/// test thread keeps the write fd open until its exec, and exec of that file then fails with
+/// ETXTBSY on Linux.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+fn spawn_lock() -> MutexGuard<'static, ()> {
+    SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `Command::output` with the spawn under the lock and the wait outside it.
+fn output_of(cmd: &mut Command) -> Output {
+    let child = {
+        let _guard = spawn_lock();
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    child.wait_with_output().unwrap()
+}
 
 /// A fake home: every git call and every code-watch call in a test runs inside it, and the
 /// real global git config is checked to be untouched when the test ends.
@@ -27,7 +50,10 @@ impl Sandbox {
             .collect();
         let bin = root.path().join("tool dir/it's/code-watch");
         fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        fs::copy(assert_cmd::cargo::cargo_bin("code-watch"), &bin).unwrap();
+        {
+            let _guard = spawn_lock();
+            fs::copy(assert_cmd::cargo::cargo_bin("code-watch"), &bin).unwrap();
+        }
         Sandbox { root, bin, real }
     }
 
@@ -63,7 +89,7 @@ impl Sandbox {
 
     fn run(&self, cmd: &mut Command) -> Output {
         self.isolate(cmd);
-        cmd.output().unwrap()
+        output_of(cmd)
     }
 
     fn config_value(&self, key: &str) -> Option<String> {
@@ -257,10 +283,7 @@ fn an_environment_template_dir_makes_install_refuse_and_write_nothing() {
     let mut cmd = Command::new(&sb.bin);
     cmd.arg("install-hook");
     sb.isolate(&mut cmd);
-    let out = cmd
-        .env("GIT_TEMPLATE_DIR", sb.path("env-tpl"))
-        .output()
-        .unwrap();
+    let out = output_of(cmd.env("GIT_TEMPLATE_DIR", sb.path("env-tpl")));
     assert_eq!(out.status.code(), Some(3));
     assert!(both(&out).contains("GIT_TEMPLATE_DIR"));
     assert!(sb.config_value("init.templateDir").is_none());
@@ -395,12 +418,11 @@ fn an_override_outside_the_global_config_rolls_the_install_back_completely() {
     let mut cmd = Command::new(&sb.bin);
     cmd.arg("install-hook");
     sb.isolate(&mut cmd);
-    let out = cmd
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "init.templateDir")
-        .env("GIT_CONFIG_VALUE_0", sb.path("elsewhere"))
-        .output()
-        .unwrap();
+    let out = output_of(
+        cmd.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "init.templateDir")
+            .env("GIT_CONFIG_VALUE_0", sb.path("elsewhere")),
+    );
     assert_eq!(out.status.code(), Some(3), "{}", both(&out));
     assert!(both(&out).contains("overrides init.templateDir"));
     assert_eq!(fs::read_to_string(sb.gitconfig()).unwrap(), OTHER_KEYS);
@@ -433,7 +455,7 @@ fn a_repo_local_hooks_path_does_not_block_the_install() {
     let mut cmd = Command::new(&sb.bin);
     cmd.arg("install-hook");
     sb.isolate(&mut cmd);
-    let out = cmd.current_dir(&repo).output().unwrap();
+    let out = output_of(cmd.current_dir(&repo));
     assert_eq!(out.status.code(), Some(0), "{}", both(&out));
 }
 
@@ -476,7 +498,7 @@ fn a_moved_binary_is_found_again_on_the_path() {
     let mut cmd = Command::new("git");
     cmd.args(["clone", src.to_str().unwrap(), dst.to_str().unwrap()]);
     sb.isolate(&mut cmd);
-    let out = cmd.env("PATH", path).output().unwrap();
+    let out = output_of(cmd.env("PATH", path));
     assert_eq!(out.status.code(), Some(0), "{}", both(&out));
     assert!(
         both(&out).contains("repo/npm-lifecycle-script"),
