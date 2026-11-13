@@ -40,7 +40,7 @@ behaves as before. Allowlist entries with a `domain` do not match a quoted fetch
 shell: `sh -c "$(curl ...)"`, `eval "$(curl ...)"`, `bash <(curl ...)`, `source <(curl ...)`, `. <(curl ...)`, and a
 `curl` or `wget` piped into `python`, `perl`, `ruby` or `node` that reads a script from stdin (no script argument, or `-`;
 `curl ... | python3 tool.py` does not fire). The official Homebrew install line (`/bin/bash -c "$(curl -fsSL ...)"`) is
-therefore a warn, like `curl | bash`. Glued operators (`curl x|python3`) are not split, so that spelling is not seen.
+therefore a warn, like `curl | bash`.
 
 Globs are matched against the path relative to the scanned root; braces work (`**/*.{js,py}`). Patterns use the Rust
 `regex` crate: linear time, safe on hostile input, no look-around. `all_regex` is how "reads credentials **and** sends

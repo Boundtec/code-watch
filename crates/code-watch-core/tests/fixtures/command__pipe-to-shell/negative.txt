@@ -10,3 +10,8 @@ source <(echo hi)
 eval "$(ssh-agent -s)"
 echo "$(curl -s https://example.org/a)"
 curl -fsSL https://example.org/a | python3 -c 'import sys'
+curl -s https://example.org/a|python3 tool.py
+curl -s https://example.org/a|python3 -c 'import sys'
+curl -s https://example.org/a|pythonista
+curl -s https://example.org/a|node-sass
+curl -s https://example.org/a|perl -pe 's/a/b/'

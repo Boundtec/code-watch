@@ -12,7 +12,7 @@ id = "command/pipe-to-shell"
 severity = "warn"
 title = "The command pipes a download straight into a shell"
 remediation = "Download the script to a file, read it, then run it."
-match = { kind = "command_regex", pattern = '\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+(-\S+\s+)*)?(env\s+)?(/\S*/)?(ba|z|da|k)?sh\b' }
+match = { kind = "command_regex", pattern = '\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+(-\S+\s+)*)?(env\s+)?(/\S*/)?(ba|z|da|k)?sh\b|\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+(-\S+\s+)*)?(env\s+)?(/\S*/)?(python[0-9.]*|perl|ruby|node)(\s*$|\s*[|;&)]|\s+-(\s|$))' }
 
 [[rule]]
 id = "command/quarantine-removal"

