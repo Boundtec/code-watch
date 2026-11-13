@@ -267,6 +267,16 @@ mod tests {
     }
 
     #[test]
+    fn a_download_report_lists_the_download_layer_and_a_skipped_one_keeps_its_reason() {
+        let ran = Report::from_download(vec![], DownloadStatus::Ran);
+        assert_eq!(ran.layers()[&Layer::Download], LayerStatus::Ran);
+        assert!(!ran.layers().contains_key(&Layer::Rules));
+        let skipped = Report::from_download(vec![], DownloadStatus::Skipped("macOS only".into()));
+        assert_eq!(skipped.layers()[&Layer::Download], LayerStatus::Skipped);
+        assert_eq!(skipped.layer_notes()[&Layer::Download], "macOS only");
+    }
+
+    #[test]
     fn llm_and_osv_layers_report_off() {
         let r = Report::from_rules(vec![]);
         assert_eq!(r.layers()[&Layer::Rules], LayerStatus::Ran);

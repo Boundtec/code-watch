@@ -680,6 +680,16 @@ mod tests {
     }
 
     #[test]
+    fn a_download_finding_can_be_allowed() {
+        let mut d = finding("download/x", Severity::Block);
+        d.layer = Layer::Download;
+        let a =
+            lists("[[allow]]\nrule = \"download/x\"\n", "").apply(vec![d], &known(&["download/x"]));
+        assert!(a.kept.is_empty());
+        assert_eq!(a.suppressed.len(), 1);
+    }
+
+    #[test]
     fn an_osv_finding_can_be_allowed() {
         let mut osv = finding("osv/x", Severity::Warn);
         osv.layer = Layer::Osv;

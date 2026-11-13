@@ -500,3 +500,45 @@ fn an_error_message_naming_a_hostile_path_is_cleaned() {
     assert!(err.contains("no?[31mwhere"), "{err:?}");
     assert!(!err.contains('\u{1b}'));
 }
+
+#[test]
+fn download_of_a_missing_path_exits_with_the_error_code() {
+    let out = code_watch()
+        .args(["download", "/nonexistent/x.dmg"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn download_of_another_kind_is_allowed_and_json_names_the_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("notes.txt");
+    fs::write(&file, "hello world").unwrap();
+    let out = code_watch()
+        .args(["--json", "download"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        json["layers"]["download"],
+        if cfg!(target_os = "macos") {
+            "ran"
+        } else {
+            "skipped"
+        }
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn download_off_macos_says_the_layer_was_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.dmg");
+    fs::write(&file, "x").unwrap();
+    let out = code_watch().arg("download").arg(&file).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("download skipped (macOS only)"));
+}
