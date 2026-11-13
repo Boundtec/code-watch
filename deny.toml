@@ -27,6 +27,8 @@ exceptions = [
     { allow = ["MPL-2.0"], crate = "version-ranges" },
     # Bundled Mozilla roots for the TLS client. Named in NOTICE.
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    # Permissive; build-time only (psm build script), not in the binary, so not in NOTICE.
+    { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "ar_archive_writer" },
 ]
 
 [bans]
