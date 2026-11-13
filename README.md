@@ -76,7 +76,7 @@ rule cannot see it. The macOS-only rules run only on macOS; elsewhere `check` li
 ## Allowlists
 
 `~/.config/code-watch/allow.toml` (or `$XDG_CONFIG_HOME`) decides which findings are hidden; a repo's own
-`.code-watch.toml` can only allow non-block rules unless your file also lists them. Hidden findings are listed under
+`.code-watch.toml` can only allow `repo/*` warnings, never a block or a command rule. Hidden findings are listed under
 `suppressed` in `--json` and counted in the footer. Details in [docs/allowlist.md](docs/allowlist.md).
 
 ## Scan on clone
@@ -92,9 +92,9 @@ deny and a warning is an ask. `code-watch install-adapter <agent>` prints the se
 
 - **Claude Code**: `PreToolUse` on `Bash` in `~/.claude/settings.json`; clean commands get the empty reply.
 - **Cursor**: `beforeShellExecution` in `~/.cursor/hooks.json`; Cursor has no "no opinion" reply, so a clean command is an `ask` (Cursor's own prompt decides; `--cursor-clean allow` for auto-run mode).
-- **Codex CLI**: `PreToolUse` on `Bash` in `~/.codex/hooks.json`; Codex cannot ask, so a warning is denied with the allowlist entry that lets it through (`--codex-warn allow` to only report it).
+- **Codex CLI**: `PreToolUse` on `Bash` in `~/.codex/hooks.json`; Codex cannot ask, so a warning is denied (`--codex-warn allow` to only report it).
 
-Commands the adapter cannot check are denied (`--fail-open` to allow them). Details in [docs/adapters.md](docs/adapters.md).
+Commands the adapter cannot check are denied with exit 2 (`--fail-open` to allow them). Details in [docs/adapters.md](docs/adapters.md).
 
 ## Layers
 

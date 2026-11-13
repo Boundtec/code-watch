@@ -16,7 +16,8 @@ guard. A repo entry that would hide a `block` finding leaves the finding and add
 one that would hide a `command/*` finding leaves the finding and adds `allowlist/repo-command-override-refused` (only
 when it matches an actual finding, so a clean command stays clean). The agent adapters and the clone-time scan
 (`scan --user-allow-only`, what `install-hook` installs) read the user file only; hooks installed earlier call plain
-`scan .`, so run `install-hook` again. `check <command>` reads the repo file only to report such an attempt, and only
+`scan .`, so run `install-hook` again (it says "updated from an older version"); a copy of the hook already
+in a clone's `.git/hooks` is not touched, so run `install-hook` again and re-create the hook there. `check <command>` reads the repo file only to report such an attempt, and only
 when the working directory is inside a git work tree; `scan <dir>` run by hand still honours `repo/*` warnings from
 `<dir>/.code-watch.toml`.
 

@@ -91,7 +91,7 @@ and exits. Adapters and shims contain no rules.
 
 | Entry | What it is |
 |---|---|
-| git hook | `code-watch install-hook` sets a global `init.templateDir` with `post-checkout` that runs `code-watch scan .` |
+| git hook | `code-watch install-hook` sets a global `init.templateDir` with `post-checkout` that runs `code-watch scan --user-allow-only .` (the hook file carries a version marker; `install-hook` replaces an older one) |
 | agent adapters | each one is a tiny `code-watch adapter <agent>` subcommand that reads that agent's hook JSON on stdin, calls `check`, and prints that agent's response format |
 | PATH shims | generated scripts in `~/.local/share/code-watch/shims/` for `git`, `npm`, `pnpm`, `yarn`, `pip`, `brew`, `curl`; each runs `code-watch check <name> "$@"` then execs the real binary found past the shim dir |
 

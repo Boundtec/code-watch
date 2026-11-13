@@ -12,11 +12,14 @@ It edits nothing: merge the snippet into your existing `hooks` object yourself.
 | Verdict | Claude Code | Cursor | Codex CLI |
 |---|---|---|---|
 | clean | empty reply (Claude Code's own permission flow decides) | `ask` (`--cursor-clean allow`: `allow`) | empty reply |
-| warn | `permissionDecision: "ask"` | `permission: "ask"` | `deny` that says only that the user can allow it (`--codex-warn allow`: empty reply, reason on stderr) |
+| warn | `permissionDecision: "ask"` | `permission: "ask"` | `deny` that tells the model to ask the user (`--codex-warn allow`: empty reply, reason on stderr) |
 | block | `permissionDecision: "deny"` | `permission: "deny"` | `deny` |
 
 The reason names the rule titles. How to allow a command (the `[[allow]]` entry and the file) is never put in text the
-model reads: Cursor shows it in `user_message` only, Codex has one channel so its deny does not carry it. "No findings" never means "approved to run": where an agent has a no-opinion reply,
+model reads: Cursor shows it in `user_message` only, Codex has one channel so its deny does not carry it.
+The same holds for internal failures: the flag, file paths and parse errors appear only in Cursor's `user_message`, never in
+a field or stderr line the model reads. With stdout closed or sent to `/dev/null` the reply cannot be delivered, so a
+fail-closed adapter exits 2. "No findings" never means "approved to run": where an agent has a no-opinion reply,
 a clean command gets it.
 
 ## Claude Code
@@ -34,15 +37,13 @@ mode, add `--cursor-clean allow` to the hook command.
 ## Codex CLI
 
 Hook `PreToolUse`, matcher `^Bash$`, in `~/.codex/hooks.json`. Codex parses `ask` but does not support it yet, so a
-warning is answered with a deny that says the user can allow the command in their code-watch settings (the entry stays
-out, because the model reads it). Retrying the same command is denied again. With `--codex-warn allow` a warning runs and the reason goes to
+warning is answered with a deny that tells the model to ask the user (how to allow it stays out, because the model reads it). Retrying the same command is denied again. With `--codex-warn allow` a warning runs and the reason goes to
 stderr.
 
 ## When the adapter cannot decide
 
 Empty or invalid input, a missing command field, input over 1 MiB, a broken user allowlist or an internal error follow
-the fail mode. **`--fail-closed` is the default**: the command is denied with a message that says why and names
-`--fail-open`, the reason is also written to stderr and the exit code is 2, because Codex and older Claude Code
+the fail mode. **`--fail-closed` is the default**: the command is denied with a fixed message ("code-watch could not check this command, so it was blocked. Ask the user to check their code-watch setup."), the same text goes to stderr and the exit code is 2, because Codex and older Claude Code
 versions treat every other non-zero code as "let it run". The same exit 2 applies to a usage error (a bad flag in the
 hook command) and to a reply that cannot be written to stdout. With `--fail-open` the command is allowed (the empty reply, or Cursor's `--cursor-clean` answer) and the reason goes to
 stderr. Codex has no fail-closed setting for a missing or moved binary (the shell's 127 does not block); keep the hook command
