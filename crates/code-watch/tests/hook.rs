@@ -1,8 +1,18 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Mutex;
 
 use tempfile::TempDir;
+
+/// Writing an executable while another thread forks makes that child hold the file open, and
+/// exec then fails with ETXTBSY: the copy and every spawn take this lock.
+static EXEC_LOCK: Mutex<()> = Mutex::new(());
+
+fn output(cmd: &mut Command) -> Output {
+    let _exec = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    cmd.output().unwrap()
+}
 
 /// A fake home: every git call and every code-watch call in a test runs inside it, and the
 /// real global git config is checked to be untouched when the test ends.
@@ -27,7 +37,10 @@ impl Sandbox {
             .collect();
         let bin = root.path().join("tool dir/it's/code-watch");
         fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        fs::copy(assert_cmd::cargo::cargo_bin("code-watch"), &bin).unwrap();
+        {
+            let _exec = EXEC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            fs::copy(assert_cmd::cargo::cargo_bin("code-watch"), &bin).unwrap();
+        }
         Sandbox { root, bin, real }
     }
 
@@ -63,7 +76,7 @@ impl Sandbox {
 
     fn run(&self, cmd: &mut Command) -> Output {
         self.isolate(cmd);
-        cmd.output().unwrap()
+        output(cmd)
     }
 
     fn config_value(&self, key: &str) -> Option<String> {
@@ -251,10 +264,7 @@ fn an_environment_template_dir_makes_install_refuse_and_write_nothing() {
     let mut cmd = Command::new(&sb.bin);
     cmd.arg("install-hook");
     sb.isolate(&mut cmd);
-    let out = cmd
-        .env("GIT_TEMPLATE_DIR", sb.path("env-tpl"))
-        .output()
-        .unwrap();
+    let out = output(cmd.env("GIT_TEMPLATE_DIR", sb.path("env-tpl")));
     assert_eq!(out.status.code(), Some(3));
     assert!(both(&out).contains("GIT_TEMPLATE_DIR"));
     assert!(sb.config_value("init.templateDir").is_none());
@@ -405,12 +415,11 @@ fn an_override_outside_the_global_config_rolls_the_install_back_completely() {
     let mut cmd = Command::new(&sb.bin);
     cmd.arg("install-hook");
     sb.isolate(&mut cmd);
-    let out = cmd
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "init.templateDir")
-        .env("GIT_CONFIG_VALUE_0", sb.path("elsewhere"))
-        .output()
-        .unwrap();
+    let out = output(
+        cmd.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "init.templateDir")
+            .env("GIT_CONFIG_VALUE_0", sb.path("elsewhere")),
+    );
     assert_eq!(out.status.code(), Some(3), "{}", both(&out));
     assert!(both(&out).contains("overrides init.templateDir"));
     assert_eq!(fs::read_to_string(sb.gitconfig()).unwrap(), OTHER_KEYS);
@@ -443,8 +452,29 @@ fn a_repo_local_hooks_path_does_not_block_the_install() {
     let mut cmd = Command::new(&sb.bin);
     cmd.arg("install-hook");
     sb.isolate(&mut cmd);
-    let out = cmd.current_dir(&repo).output().unwrap();
+    let out = output(cmd.current_dir(&repo));
     assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+}
+
+#[test]
+fn an_older_hook_is_replaced_and_the_message_says_so() {
+    let sb = Sandbox::new();
+    assert!(sb.code_watch(&["install-hook"]).status.success());
+    let old = "#!/bin/sh\n# code-watch managed hook\ncode-watch scan .\n";
+    fs::write(sb.template_hook(), old).unwrap();
+    let out = sb.code_watch(&["install-hook"]);
+    assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+    assert!(
+        both(&out).contains("updated from an older version"),
+        "{}",
+        both(&out)
+    );
+    let script = fs::read_to_string(sb.template_hook()).unwrap();
+    assert!(script.contains("# code-watch managed hook v2"));
+    assert!(script.contains("scan --user-allow-only ."));
+    let again = sb.code_watch(&["install-hook"]);
+    assert!(both(&again).contains("hook refreshed"), "{}", both(&again));
+    assert!(!both(&again).contains("older version"));
 }
 
 #[test]
@@ -486,7 +516,7 @@ fn a_moved_binary_is_found_again_on_the_path() {
     let mut cmd = Command::new("git");
     cmd.args(["clone", src.to_str().unwrap(), dst.to_str().unwrap()]);
     sb.isolate(&mut cmd);
-    let out = cmd.env("PATH", path).output().unwrap();
+    let out = output(cmd.env("PATH", path));
     assert_eq!(out.status.code(), Some(0), "{}", both(&out));
     assert!(
         both(&out).contains("repo/npm-lifecycle-script"),
