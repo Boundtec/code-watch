@@ -135,6 +135,12 @@ A shim is a smaller guard than a hook. It sees the argv of one tool, not the she
 Limits, ways around a shim: calling the tool by absolute path, `command -p`, `env PATH=... tool`, `env -i tool`, and
 sandboxes or launchers that reset `PATH`.
 
+## Downloads
+
+`code-watch download <path>` checks a downloaded `.dmg`, `.pkg`, `.app` or executable before you open it: quarantine
+mark, code signature and Gatekeeper verdict, read-only, macOS only (skipped and said so elsewhere). Details in
+[docs/downloads.md](docs/downloads.md).
+
 ## Layers
 
 Rules and the OSV layer need no key. The optional LLM layer is off until you configure it; every report says which

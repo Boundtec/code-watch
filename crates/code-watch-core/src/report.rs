@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::allow::Suppressed;
+use crate::download::DownloadStatus;
 use crate::finding::{Evidence, Finding, Layer, Severity};
 use crate::llm::LlmOutcome;
 use crate::names::display_as_wire_name;
@@ -92,6 +93,24 @@ impl Report {
             suppressed: Vec::new(),
             allowlist_warnings: Vec::new(),
         }
+    }
+
+    /// Builds a report for a downloaded file: only the downloads layer ran or was skipped, and
+    /// a skipped one keeps its reason, so it never reads as passed.
+    pub fn from_download(findings: Vec<Finding>, status: DownloadStatus) -> Self {
+        let mut report = Self::from_scan(findings, Vec::new());
+        let (layer_status, note) = match status {
+            DownloadStatus::Ran => (LayerStatus::Ran, None),
+            DownloadStatus::Skipped(why) => (LayerStatus::Skipped, Some(why)),
+        };
+        report.layers = BTreeMap::from([
+            (Layer::Download, layer_status),
+            (Layer::Llm, LayerStatus::Off),
+        ]);
+        report
+            .layer_notes
+            .extend(note.map(|why| (Layer::Download, why)));
+        report
     }
 
     /// Records how the OSV layer ended. `Skipped` keeps its reason, so a report never says
@@ -267,6 +286,16 @@ mod tests {
         let skipped = Report::from_rules(vec![]).with_osv(OsvStatus::Skipped("offline".into()));
         assert_eq!(skipped.layers()[&Layer::Osv], LayerStatus::Skipped);
         assert_eq!(skipped.layer_notes()[&Layer::Osv], "offline");
+    }
+
+    #[test]
+    fn a_download_report_lists_the_download_layer_and_a_skipped_one_keeps_its_reason() {
+        let ran = Report::from_download(vec![], DownloadStatus::Ran);
+        assert_eq!(ran.layers()[&Layer::Download], LayerStatus::Ran);
+        assert!(!ran.layers().contains_key(&Layer::Rules));
+        let skipped = Report::from_download(vec![], DownloadStatus::Skipped("macOS only".into()));
+        assert_eq!(skipped.layers()[&Layer::Download], LayerStatus::Skipped);
+        assert_eq!(skipped.layer_notes()[&Layer::Download], "macOS only");
     }
 
     #[test]
