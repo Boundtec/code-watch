@@ -1,8 +1,6 @@
-use super::{Adapter, Call, CodexWarn, Decision, Policy, Reply, UNCHECKED, pretool};
+use super::{ASK_USER, Adapter, Call, Decision, Policy, Reply, UNCHECKED, WarnAnswer, pretool};
 
 pub struct Codex;
-
-const USER_CAN_ALLOW: &str = "Ask the user before trying again.";
 
 impl Adapter for Codex {
     fn parse(&self, stdin: &[u8]) -> anyhow::Result<Call> {
@@ -21,14 +19,11 @@ impl Adapter for Codex {
                 None,
             ),
             Decision::Ask { reason, .. } => match policy.codex_warn {
-                CodexWarn::Deny => (
-                    Some(pretool::decision(
-                        "deny",
-                        format!("{reason} {USER_CAN_ALLOW}"),
-                    )),
+                WarnAnswer::Deny => (
+                    Some(pretool::decision("deny", format!("{reason} {ASK_USER}"))),
                     None,
                 ),
-                CodexWarn::Allow => (None, Some(reason)),
+                WarnAnswer::Allow => (None, Some(reason)),
             },
         };
         Reply::new(stdout, stderr)

@@ -17,7 +17,9 @@ use serde_json::Value;
 mod claude;
 mod codex;
 mod cursor;
+mod gemini;
 pub mod install;
+pub mod opencode;
 mod pretool;
 
 /// More stdin than this is refused, not truncated, so a hidden tail cannot dodge the check.
@@ -27,6 +29,8 @@ const EXIT_ERROR: u8 = 3;
 const EXIT_BLOCK: u8 = 2;
 /// The only text about an internal failure that the model may read: no flag, path or detail.
 pub const UNCHECKED: &str = "code-watch could not check this command, so it was blocked. Ask the user to check their code-watch setup.";
+/// Appended to a warn deny: the model must not be told how to allow the command itself.
+const ASK_USER: &str = "Ask the user before trying again.";
 const UNCHECKED_ALLOWED: &str = "code-watch could not check this command, so it was not checked.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
@@ -34,6 +38,8 @@ pub enum Agent {
     ClaudeCode,
     Cursor,
     Codex,
+    Gemini,
+    Opencode,
 }
 
 /// What to do when the adapter cannot reach a verdict (bad input, internal error).
@@ -43,9 +49,9 @@ pub enum FailMode {
     Open,
 }
 
-/// How a warn finding is answered to Codex, which cannot ask the user.
+/// How a warn finding is answered to an agent that cannot ask the user (Codex, Gemini CLI, OpenCode).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
-pub enum CodexWarn {
+pub enum WarnAnswer {
     Deny,
     Allow,
 }
@@ -61,7 +67,9 @@ pub enum CursorClean {
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
     pub fail: FailMode,
-    pub codex_warn: CodexWarn,
+    pub codex_warn: WarnAnswer,
+    pub gemini_warn: WarnAnswer,
+    pub opencode_warn: WarnAnswer,
     pub cursor_clean: CursorClean,
 }
 
@@ -120,6 +128,8 @@ fn adapter_for(agent: Agent) -> &'static dyn Adapter {
         Agent::ClaudeCode => &claude::ClaudeCode,
         Agent::Cursor => &cursor::Cursor,
         Agent::Codex => &codex::Codex,
+        Agent::Gemini => &gemini::Gemini,
+        Agent::Opencode => &opencode::Opencode,
     }
 }
 
@@ -321,7 +331,9 @@ mod tests {
         panic::set_hook(Box::new(|_| {}));
         let policy = |fail| Policy {
             fail,
-            codex_warn: CodexWarn::Deny,
+            codex_warn: WarnAnswer::Deny,
+            gemini_warn: WarnAnswer::Deny,
+            opencode_warn: WarnAnswer::Deny,
             cursor_clean: CursorClean::Ask,
         };
         let closed = handle(&Panics, Ok(vec![]), &policy(FailMode::Closed), None);

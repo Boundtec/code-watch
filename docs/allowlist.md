@@ -1,6 +1,6 @@
 # Allowlists
 
-An allowlist entry hides a finding of the rules layer (or, later, the OSV layer) from the verdict. It never turns a
+An allowlist entry hides a finding of the rules layer or the OSV layer from the verdict. It never turns a
 layer off, and hidden findings stay visible: `--json` lists them under `suppressed` (schema stays 1) and the human
 output ends with `N findings suppressed by allowlists`.
 
@@ -56,4 +56,4 @@ host or path cannot be widened by a repo file.
 | repo file malformed, unknown key, newer schema, over 64 KiB, a symlink or a FIFO or other non-regular file | ignored; `allowlist/repo-file-invalid` is added (warn) |
 | an entry names a rule id this build does not have (or `*`) | a warning line and `allowlist_warnings` in `--json`; nothing is suppressed by it |
 
-`allowlist/*` findings, `repo/unscanned-target` and LLM findings can never be allowed.
+`allowlist/*` findings, `repo/unscanned-target`, `osv/unparsed-lockfile`, `osv/unchecked-packages` and LLM findings can never be allowed.
