@@ -9,11 +9,16 @@ output ends with `N findings suppressed by allowlists`.
 | File | Where | Can allow |
 |---|---|---|
 | User (decides) | `$XDG_CONFIG_HOME/code-watch/allow.toml`, else `~/.config/code-watch/allow.toml` | any rule, including `block` ones |
-| Per repo (advisory) | `.code-watch.toml` at the repo root | `warn` and `info` findings; a `block` finding only if the user file also lists that rule id |
+| Per repo (advisory) | `.code-watch.toml` at the repo root | `warn` and `info` findings of repo rules (`repo/*`); never a `block` finding and never a `command/*` rule |
 
-A cloned repo is untrusted, so it cannot allow itself past a block. When it tries, the finding stays and
-`allowlist/repo-block-override-refused` is added. `check <command>` reads the repo file only when the working
-directory is inside a git work tree (a `.git` directory or file above it); elsewhere only the user file applies.
+A repository file is untrusted: a cloned repo, or an agent writing files in it, could otherwise allow itself past the
+guard. A repo entry that would hide a `block` finding leaves the finding and adds `allowlist/repo-block-override-refused`;
+one that would hide a `command/*` finding leaves the finding and adds `allowlist/repo-command-override-refused` (only
+when it matches an actual finding, so a clean command stays clean). The agent adapters and the clone-time scan
+(`scan --user-allow-only`, what `install-hook` installs) read the user file only; hooks installed earlier call plain
+`scan .`, so run `install-hook` again. `check <command>` reads the repo file only to report such an attempt, and only
+when the working directory is inside a git work tree; `scan <dir>` run by hand still honours `repo/*` warnings from
+`<dir>/.code-watch.toml`.
 
 ```toml
 schema = 1
@@ -39,9 +44,8 @@ For `command/pipe-to-shell` the whole command must also hold exactly one `curl` 
 other mention of `curl` or `wget` leaves the finding without a domain, so a `domain` entry does not match it. Findings
 of other rules (base64 into a shell, quarantine removal) never have a domain.
 
-Listing a rule in the user file also lets repo files allow it, whatever the narrowers of the user entry: a user entry
-with `path = "vendor/**"` for a `block` rule still unlocks every repo entry for that rule. That is the delegation: the
-user file says "this rule may be decided by repos".
+A repo entry never lifts a block, whatever the user file lists: there is no delegation, so a user entry narrowed to one
+host or path cannot be widened by a repo file.
 
 ## Errors and warnings
 
