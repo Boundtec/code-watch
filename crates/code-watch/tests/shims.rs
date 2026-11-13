@@ -193,7 +193,7 @@ fn two_code_watch_copies_with_their_own_shim_dirs_do_not_exec_each_other() {
 }
 
 #[test]
-fn a_nested_shim_of_the_same_tool_runs_the_real_one_without_checking_again() {
+fn a_preset_nested_marker_changes_nothing_the_command_is_still_checked() {
     let w = World::new();
     let bin = w.copy_of_binary("cw");
     w.install_shims(&bin, "shims");
@@ -201,17 +201,35 @@ fn a_nested_shim_of_the_same_tool_runs_the_real_one_without_checking_again() {
     fs::create_dir_all(w.p("cfg/code-watch")).unwrap();
     fs::write(w.p("cfg/code-watch/allow.toml"), "not toml [[").unwrap();
     let path = ["shims", "bin"];
-    let checked = w.run("shims/curl", &[b"-V"], &path, &[]);
-    assert_eq!(checked.status.code(), Some(3));
-    let nested = w.run(
-        "shims/curl",
-        &[b"-V"],
-        &path,
-        &[("CODE_WATCH_SHIM", "curl")],
-    );
-    assert_eq!(nested.status.code(), Some(0), "{}", stderr(&nested));
-    let other = w.run("shims/curl", &[b"-V"], &path, &[("CODE_WATCH_SHIM", "git")]);
-    assert_eq!(other.status.code(), Some(3));
+    for marker in ["curl", "git", "1"] {
+        let out = w.run(
+            "shims/curl",
+            &[b"-V"],
+            &path,
+            &[("CODE_WATCH_SHIM", marker)],
+        );
+        assert_eq!(out.status.code(), Some(3), "{marker}: {}", stderr(&out));
+        assert!(stderr(&out).contains("CODE_WATCH_FAIL_OPEN"), "{marker}");
+    }
+    assert_eq!(w.argv_seen("bin", "curl"), None);
+}
+
+#[test]
+fn a_command_the_check_blocks_stops_with_exit_two_and_the_real_tool_never_runs() {
+    let w = World::new();
+    let bin = w.copy_of_binary("cw");
+    w.install_shims(&bin, "shims");
+    w.fake_tool("bin", "git", 0);
+    let args: [&[u8]; 4] = [
+        b"config",
+        b"alias.x",
+        b"!sh -c \"$(echo aGk= | base64 -d)\"",
+        b"--global",
+    ];
+    let out = w.run("shims/git", &args, &["shims", "bin"], &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("command/base64-into-shell"));
+    assert_eq!(w.argv_seen("bin", "git"), None);
 }
 
 #[test]
@@ -308,14 +326,14 @@ fn install_over_a_foreign_file_or_foreign_link_writes_nothing() {
 }
 
 #[test]
-fn the_real_tool_is_started_under_its_own_name_and_marked_as_nested() {
+fn the_real_tool_is_started_under_its_own_name_with_nothing_added_to_its_environment() {
     let w = World::new();
     let bin = w.copy_of_binary("cw");
     w.install_shims(&bin, "shims");
     w.fake_tool("bin", "git", 0);
     w.run("shims/git", &[b"status"], &["shims", "bin"], &[]);
     let env = fs::read_to_string(w.p("bin/git.argv.env")).unwrap();
-    assert_eq!(env, "git");
+    assert_eq!(env, "");
 
     fs::remove_file(w.p("bin/git")).unwrap();
     symlink("/bin/sh", w.p("bin/git")).unwrap();
@@ -336,4 +354,77 @@ fn a_relative_path_entry_is_never_searched() {
     let out = w.run("shims/git", &[b"status"], &["shims"], &[("PATH", &path)]);
     assert_eq!(out.status.code(), Some(3));
     assert_eq!(w.argv_seen("relbin", "git"), None);
+}
+
+#[test]
+fn a_copy_or_hard_link_of_the_binary_named_like_the_tool_is_skipped_not_run_forever() {
+    let w = World::new();
+    let bin = w.copy_of_binary("cw");
+    w.install_shims(&bin, "shims");
+    fs::create_dir(w.p("copy")).unwrap();
+    fs::create_dir(w.p("link")).unwrap();
+    {
+        let _guard = locked();
+        fs::copy(&bin, w.p("copy/git")).unwrap();
+    }
+    fs::hard_link(&bin, w.p("link/git")).unwrap();
+    w.fake_tool("bin", "git", 0);
+    let out = w.run(
+        "shims/git",
+        &[b"status"],
+        &["shims", "copy", "link", "bin"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(w.argv_seen("bin", "git").is_some());
+    let out = w.run("shims/git", &[b"status"], &["shims", "copy", "link"], &[]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(stderr(&out).contains("no git found on PATH"));
+}
+
+#[test]
+fn install_refuses_a_directory_others_can_write_and_replaces_shims_in_place() {
+    let w = World::new();
+    let bin = w.copy_of_binary("cw");
+    fs::create_dir(w.p("open")).unwrap();
+    fs::set_permissions(w.p("open"), fs::Permissions::from_mode(0o777)).unwrap();
+    let out = output(
+        Command::new(&bin)
+            .args(["shims", "install"])
+            .arg(w.p("open")),
+    );
+    assert_eq!(out.status.code(), Some(3));
+    assert!(stderr(&out).contains("writable by its group or by everyone"));
+    assert!(fs::symlink_metadata(w.p("open/git")).is_err());
+
+    w.install_shims(&bin, "shims");
+    w.install_shims(&bin, "shims");
+    assert_eq!(fs::read_dir(w.p("shims")).unwrap().count(), 7);
+}
+
+#[test]
+fn status_reports_each_shim_and_exits_one_after_the_binary_moved() {
+    let w = World::new();
+    let bin = w.copy_of_binary("cw");
+    w.install_shims(&bin, "shims");
+    let status = |binary: &Path| {
+        output(
+            Command::new(binary)
+                .args(["shims", "status"])
+                .arg(w.p("shims")),
+        )
+    };
+    let ok = status(&bin);
+    assert_eq!(ok.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&ok.stdout).contains("git: ok"));
+
+    let newer = w.copy_of_binary("cw-new");
+    let elsewhere = status(&newer);
+    assert_eq!(elsewhere.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&elsewhere.stdout).contains("git: points elsewhere"));
+
+    fs::remove_file(&bin).unwrap();
+    let dangling = status(&newer);
+    assert_eq!(dangling.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&dangling.stdout).contains("git: dangling"));
 }

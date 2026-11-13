@@ -2,9 +2,9 @@
 //! started under one of those names it checks its own argv, then execs the real tool.
 
 use std::ffi::{OsStr, OsString};
-use std::fs;
-use std::io::{self, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -17,9 +17,8 @@ const BINARY_NAME: &str = "code-watch";
 const EXIT_BLOCK: u8 = 2;
 const EXIT_ERROR: u8 = 3;
 const FAIL_OPEN_VAR: &str = "CODE_WATCH_FAIL_OPEN";
-/// Set to the tool name on the exec, so a shim of the same tool met further down the chain
-/// runs the real tool without checking the same command twice. Other tools are still checked.
-const NESTED_VAR: &str = "CODE_WATCH_SHIM";
+/// How much of a binary `Me::is` compares, besides its size, to spot a copy of it.
+const HEAD_BYTES: u64 = 4096;
 
 /// The guarded tool name when the binary was started through a shim.
 pub fn invoked_as(argv0: &OsStr) -> Option<&'static str> {
@@ -59,18 +58,53 @@ fn gate(checked: anyhow::Result<Report>, fail_open: bool) -> Gate {
     }
 }
 
-/// The first executable called `name` on `path` that is not a code-watch binary or a link to
-/// one (any copy), so shims can never find each other.
-fn find_real(name: &str, path: &OsStr) -> Option<PathBuf> {
+/// This binary as the shim can recognise it again: the same file (hard link or symlink), or a
+/// copy with the same size and first bytes.
+struct Me {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    head: Vec<u8>,
+}
+
+fn head_of(path: &Path) -> io::Result<Vec<u8>> {
+    let mut head = Vec::new();
+    File::open(path)?.take(HEAD_BYTES).read_to_end(&mut head)?;
+    Ok(head)
+}
+
+impl Me {
+    fn of(exe: &Path) -> io::Result<Self> {
+        let meta = fs::metadata(exe)?;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            head: head_of(exe)?,
+        })
+    }
+
+    fn is(&self, candidate: &Path) -> bool {
+        let Ok(meta) = fs::metadata(candidate) else {
+            return false;
+        };
+        (meta.dev() == self.dev && meta.ino() == self.ino)
+            || (meta.len() == self.len && head_of(candidate).is_ok_and(|h| h == self.head))
+            || fs::canonicalize(candidate)
+                .is_ok_and(|real| real.file_name() == Some(OsStr::new(BINARY_NAME)))
+    }
+}
+
+/// The first executable called `name` on `path` that is not this binary, a link or copy of it,
+/// or any file called code-watch, so shims can never find each other or themselves.
+fn find_real(name: &str, path: &OsStr, me: &Me) -> Option<PathBuf> {
     std::env::split_paths(path)
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(name))
         .find(|candidate| {
-            let executable = fs::metadata(candidate)
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
-            executable
-                && fs::canonicalize(candidate)
-                    .is_ok_and(|real| real.file_name() != Some(OsStr::new(BINARY_NAME)))
+            fs::metadata(candidate)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                && !me.is(candidate)
         })
 }
 
@@ -90,35 +124,35 @@ fn stderr(message: &str) {
 /// Checks the command, then replaces this process with the real tool. Only returns on a stop.
 pub fn run(name: &'static str, args: Vec<OsString>) -> ExitCode {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let Some(real) = find_real(name, &path) else {
+    let me = match std::env::current_exe().and_then(|exe| Me::of(&exe)) {
+        Ok(me) => me,
+        Err(e) => {
+            stderr(&format!("could not identify the code-watch binary: {e}"));
+            return ExitCode::from(EXIT_ERROR);
+        }
+    };
+    let Some(real) = find_real(name, &path, &me) else {
         stderr(&format!(
             "no {name} found on PATH outside the code-watch shims"
         ));
         return ExitCode::from(EXIT_ERROR);
     };
-    let nested = std::env::var_os(NESTED_VAR).is_some_and(|v| v == name);
-    if !nested {
-        let fail_open = std::env::var_os(FAIL_OPEN_VAR).is_some_and(|v| v == "1");
-        let cwd = std::env::current_dir().ok();
-        let checked = crate::check_command(
-            cwd.as_deref(),
-            &command_text(name, &args),
-            crate::user_dir().as_deref(),
-        );
-        match gate(checked, fail_open) {
-            Gate::Run { note: Some(note) } => stderr(&note),
-            Gate::Run { note: None } => {}
-            Gate::Stop { code, message } => {
-                stderr(&message);
-                return ExitCode::from(code);
-            }
+    let fail_open = std::env::var_os(FAIL_OPEN_VAR).is_some_and(|v| v == "1");
+    let cwd = std::env::current_dir().ok();
+    let checked = crate::check_command(
+        cwd.as_deref(),
+        &command_text(name, &args),
+        crate::user_dir().as_deref(),
+    );
+    match gate(checked, fail_open) {
+        Gate::Run { note: Some(note) } => stderr(&note),
+        Gate::Run { note: None } => {}
+        Gate::Stop { code, message } => {
+            stderr(&message);
+            return ExitCode::from(code);
         }
     }
-    let err = Command::new(&real)
-        .arg0(name)
-        .args(&args)
-        .env(NESTED_VAR, name)
-        .exec();
+    let err = Command::new(&real).arg0(name).args(&args).exec();
     stderr(&format!("could not run {}: {err}", real.display()));
     ExitCode::from(EXIT_ERROR)
 }
@@ -133,8 +167,31 @@ fn exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
+/// Why `dir` cannot hold shims, if it cannot: anyone but its owner could replace them, or the
+/// owner is not the user running this.
+fn dir_problem(mode: u32, owner: u32, user: u32) -> Option<&'static str> {
+    if mode & 0o022 != 0 {
+        Some("is writable by its group or by everyone")
+    } else if owner != user {
+        Some("is owned by another user")
+    } else {
+        None
+    }
+}
+
+/// Points `dir/name` at `exe` in one step, so there is no moment without the shim.
+fn link_atomically(dir: &Path, name: &str, exe: &Path) -> anyhow::Result<()> {
+    let link = dir.join(name);
+    let staged = dir.join(format!(".{name}.code-watch-new"));
+    if fs::symlink_metadata(&staged).is_ok_and(|m| m.file_type().is_symlink()) {
+        fs::remove_file(&staged)?;
+    }
+    symlink(exe, &staged).with_context(|| format!("could not write {}", staged.display()))?;
+    fs::rename(&staged, &link).with_context(|| format!("could not write {}", link.display()))
+}
+
 /// Links every guarded tool name in `dir` to `exe`. Writes nothing when a name is taken by
-/// something that is not one of our shims.
+/// something that is not one of our shims or when `dir` could be changed by someone else.
 pub fn install(dir: &Path, exe: &Path) -> anyhow::Result<String> {
     if exe.file_name() != Some(OsStr::new(BINARY_NAME)) {
         bail!(
@@ -143,6 +200,14 @@ pub fn install(dir: &Path, exe: &Path) -> anyhow::Result<String> {
         );
     }
     fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    let meta = fs::metadata(dir)?;
+    if let Some(problem) = dir_problem(
+        meta.permissions().mode(),
+        meta.uid(),
+        rustix::process::geteuid().as_raw(),
+    ) {
+        bail!("{} {problem}; nothing was written", dir.display());
+    }
     let foreign: Vec<&str> = NAMES
         .iter()
         .copied()
@@ -156,17 +221,34 @@ pub fn install(dir: &Path, exe: &Path) -> anyhow::Result<String> {
         );
     }
     for name in NAMES {
-        let link = dir.join(name);
-        if exists(&link) {
-            fs::remove_file(&link)?;
-        }
-        symlink(exe, &link).with_context(|| format!("could not write {}", link.display()))?;
+        link_atomically(dir, name, exe)?;
     }
     Ok(format!(
-        "shims for {} written in {}. Put that directory first on PATH (the shims run `code-watch check` and then the real tool).",
+        "shims for {} written in {}. Put that directory first on PATH (the shims run `code-watch check` and then the real tool). Run `shims install` again after upgrading code-watch.",
         NAMES.join(", "),
         dir.display()
     ))
+}
+
+/// One line per guarded tool, and whether all of them are shims that point at `exe`.
+pub fn status(dir: &Path, exe: &Path) -> (String, bool) {
+    let mut all_ok = true;
+    let lines: Vec<String> = NAMES
+        .iter()
+        .map(|name| {
+            let link = dir.join(name);
+            let state = match fs::symlink_metadata(&link) {
+                Err(_) => "missing",
+                Ok(m) if !m.file_type().is_symlink() => "not a shim",
+                Ok(_) if fs::metadata(&link).is_err() => "dangling",
+                Ok(_) if fs::canonicalize(&link).is_ok_and(|t| t == exe) => "ok",
+                Ok(_) => "points elsewhere",
+            };
+            all_ok &= state == "ok";
+            format!("{name}: {state}")
+        })
+        .collect();
+    (lines.join("\n"), all_ok)
 }
 
 /// Removes the shims `install` wrote and leaves everything else in `dir`.
@@ -253,6 +335,13 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// A stand-in for the running binary, with content no other fixture shares.
+    fn me_at(path: &Path) -> Me {
+        fs::write(path, "#!/bin/sh\n# the running binary\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        Me::of(path).unwrap()
+    }
+
     #[test]
     fn find_real_skips_code_watch_copies_directories_and_non_executables() {
         let dir = tempfile::tempdir().unwrap();
@@ -260,14 +349,75 @@ mod tests {
         for p in [&a, &b, &c, &d] {
             fs::create_dir(p).unwrap();
         }
-        script(&a.join(BINARY_NAME));
+        let me = me_at(&a.join(BINARY_NAME));
         symlink(a.join(BINARY_NAME), a.join("git")).unwrap();
         fs::write(b.join("git"), "no exec bit").unwrap();
         fs::create_dir(c.join("git")).unwrap();
         script(&d.join("git"));
         let path = std::env::join_paths([&a, &b, &c, &d, &d]).unwrap();
-        assert_eq!(find_real("git", &path), Some(d.join("git")));
-        assert_eq!(find_real("npm", &path), None);
-        assert_eq!(find_real("git", OsStr::new("relative/dir")), None);
+        assert_eq!(find_real("git", &path, &me), Some(d.join("git")));
+        assert_eq!(find_real("npm", &path, &me), None);
+        assert_eq!(find_real("git", OsStr::new("relative/dir"), &me), None);
+    }
+
+    #[test]
+    fn find_real_skips_a_hard_link_and_a_renamed_copy_of_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let [a, b, c] = ["a", "b", "c"].map(|n| dir.path().join(n));
+        for p in [&a, &b, &c] {
+            fs::create_dir(p).unwrap();
+        }
+        let me = me_at(&dir.path().join("running"));
+        fs::hard_link(dir.path().join("running"), a.join("git")).unwrap();
+        fs::copy(dir.path().join("running"), b.join("git")).unwrap();
+        script(&c.join("git"));
+        let path = std::env::join_paths([&a, &b, &c]).unwrap();
+        assert_eq!(find_real("git", &path, &me), Some(c.join("git")));
+    }
+
+    #[test]
+    fn a_copy_that_differs_after_the_first_bytes_is_not_mistaken_for_the_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = me_at(&dir.path().join("running"));
+        let other = dir.path().join("git");
+        let mut text = fs::read(dir.path().join("running")).unwrap();
+        text.extend_from_slice(b"more");
+        fs::write(&other, text).unwrap();
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!me.is(&other));
+    }
+
+    #[test]
+    fn a_directory_others_can_write_or_another_user_owns_is_refused() {
+        assert_eq!(dir_problem(0o755, 1000, 1000), None);
+        assert_eq!(dir_problem(0o700, 1000, 1000), None);
+        assert!(dir_problem(0o775, 1000, 1000).is_some());
+        assert!(dir_problem(0o757, 1000, 1000).is_some());
+        assert!(dir_problem(0o755, 0, 1000).is_some());
+    }
+
+    #[test]
+    fn status_names_ok_dangling_elsewhere_missing_and_not_a_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("code-watch");
+        script(&exe);
+        let exe = fs::canonicalize(&exe).unwrap();
+        let shims = dir.path().join("shims");
+        fs::create_dir(&shims).unwrap();
+        symlink(&exe, shims.join("git")).unwrap();
+        symlink(dir.path().join("gone"), shims.join("npm")).unwrap();
+        symlink("/bin/sh", shims.join("pnpm")).unwrap();
+        fs::write(shims.join("yarn"), "x").unwrap();
+        let (text, ok) = status(&shims, &exe);
+        assert!(!ok);
+        for line in [
+            "git: ok",
+            "npm: dangling",
+            "pnpm: points elsewhere",
+            "yarn: not a shim",
+            "pip: missing",
+        ] {
+            assert!(text.lines().any(|l| l == line), "{line} in {text}");
+        }
     }
 }

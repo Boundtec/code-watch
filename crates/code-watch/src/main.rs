@@ -56,9 +56,12 @@ enum Cmd {
         /// Cursor cannot stay silent: answer a clean command with an ask (default, Cursor's prompt decides) or an allow
         #[arg(long, value_enum, default_value_t = adapter::CursorClean::Ask)]
         cursor_clean: adapter::CursorClean,
-        /// Gemini CLI and OpenCode cannot ask: answer a warning with a deny (default) or let it run and say so on stderr
+        /// Gemini CLI cannot ask: answer a warning with a deny (default) or let it run and say so on stderr
         #[arg(long, value_enum, default_value_t = adapter::WarnAnswer::Deny)]
         gemini_warn: adapter::WarnAnswer,
+        /// OpenCode cannot ask: answer a warning with a deny (default) or let it run and say so on stderr
+        #[arg(long, value_enum, default_value_t = adapter::WarnAnswer::Deny)]
+        opencode_warn: adapter::WarnAnswer,
     },
     /// Print the settings snippet that connects an agent to `adapter` (edits nothing); for opencode,
     /// write the plugin to <PATH> or print it with --print
@@ -72,6 +75,9 @@ enum Cmd {
         /// opencode only: let commands through when the plugin cannot run the check
         #[arg(long)]
         fail_open: bool,
+        /// opencode only: let a warning run and say so on stderr (default: deny it)
+        #[arg(long, value_enum)]
+        opencode_warn: Option<adapter::WarnAnswer>,
     },
     /// Guard git, npm, pnpm, yarn, pip, brew and curl through PATH shims
     Shims {
@@ -88,6 +94,8 @@ enum ShimsCmd {
     Install { dir: PathBuf },
     /// Remove the shims code-watch wrote in <DIR> and nothing else
     Uninstall { dir: PathBuf },
+    /// Show whether each shim in <DIR> points at this binary (exit 1 if any does not)
+    Status { dir: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -123,6 +131,7 @@ fn real_main() -> ExitCode {
             codex_warn,
             cursor_clean,
             gemini_warn,
+            opencode_warn,
             ..
         } => {
             let policy = adapter::Policy {
@@ -134,6 +143,7 @@ fn real_main() -> ExitCode {
                 codex_warn: *codex_warn,
                 cursor_clean: *cursor_clean,
                 gemini_warn: *gemini_warn,
+                opencode_warn: *opencode_warn,
             };
             return adapter::run(*agent, policy, user_dir().as_deref());
         }
@@ -142,7 +152,10 @@ fn real_main() -> ExitCode {
             path,
             print,
             fail_open,
-        } => return install_adapter(*agent, path.as_deref(), *print, *fail_open),
+            opencode_warn,
+        } => {
+            return install_adapter(*agent, path.as_deref(), *print, *fail_open, *opencode_warn);
+        }
         Cmd::Shims { action } => return shims(action),
         _ => {}
     }
@@ -222,12 +235,22 @@ fn check_command(
 }
 
 fn shims(action: &ShimsCmd) -> ExitCode {
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(anyhow::Error::from);
     let done = match action {
-        ShimsCmd::Install { dir } => std::env::current_exe()
-            .and_then(std::fs::canonicalize)
-            .map_err(anyhow::Error::from)
-            .and_then(|exe| shim::install(dir, &exe)),
+        ShimsCmd::Install { dir } => exe.and_then(|exe| shim::install(dir, &exe)),
         ShimsCmd::Uninstall { dir } => shim::uninstall(dir),
+        ShimsCmd::Status { dir } => {
+            return match exe {
+                Ok(exe) => {
+                    let (text, all_ok) = shim::status(dir, &exe);
+                    println!("{text}");
+                    ExitCode::from(if all_ok { 0 } else { 1 })
+                }
+                Err(e) => fail(&format!("{e:#}")),
+            };
+        }
     };
     match done {
         Ok(message) => {
@@ -239,9 +262,14 @@ fn shims(action: &ShimsCmd) -> ExitCode {
 }
 
 /// OpenCode has no settings file for hooks: the plugin itself is written or printed.
-fn install_opencode(path: Option<&Path>, print: bool, fail_open: bool) -> anyhow::Result<()> {
+fn install_opencode(
+    path: Option<&Path>,
+    print: bool,
+    fail_open: bool,
+    warn: adapter::WarnAnswer,
+) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let text = adapter::opencode::render(&exe, fail_open)?;
+    let text = adapter::opencode::render(&exe, fail_open, warn)?;
     match (path, print) {
         (Some(path), _) => {
             let done = adapter::opencode::install(path, &text)?;
@@ -258,15 +286,17 @@ fn install_adapter(
     path: Option<&Path>,
     print: bool,
     fail_open: bool,
+    opencode_warn: Option<adapter::WarnAnswer>,
 ) -> ExitCode {
     if agent == adapter::Agent::Opencode {
-        return match install_opencode(path, print, fail_open) {
+        let warn = opencode_warn.unwrap_or(adapter::WarnAnswer::Deny);
+        return match install_opencode(path, print, fail_open, warn) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&format!("{e:#}")),
         };
     }
-    if path.is_some() || print || fail_open {
-        return fail("only opencode takes a path, --print or --fail-open");
+    if path.is_some() || print || fail_open || opencode_warn.is_some() {
+        return fail("only opencode takes a path, --print, --fail-open or --opencode-warn");
     }
     let printed = std::env::current_exe()
         .map_err(anyhow::Error::from)
