@@ -109,7 +109,7 @@ fn real_main() -> ExitCode {
     let report = match run(&cli) {
         Ok(Outcome::Report(report)) => report,
         Ok(Outcome::Message(message)) => {
-            println!("code-watch: {message}");
+            println!("code-watch: {}", render::terminal_safe(&message));
             return ExitCode::SUCCESS;
         }
         Err(e) => return fail(&format!("{e:#}")),
@@ -131,7 +131,11 @@ fn real_main() -> ExitCode {
 }
 
 fn fail(message: &str) -> ExitCode {
-    let _ = writeln!(io::stderr(), "code-watch: {message}");
+    let _ = writeln!(
+        io::stderr(),
+        "code-watch: {}",
+        render::terminal_safe(message)
+    );
     ExitCode::from(EXIT_ERROR)
 }
 
