@@ -73,6 +73,12 @@ followed; the script given to `osascript` through a file or standard input is no
 rule cannot see it. The macOS-only rules run only on macOS; elsewhere `check` lists them under `skipped_rules` in
 `--json` and in the human footer.
 
+## Before an install
+
+`npm`, `pnpm`, `yarn`, `pip` and `brew` installs are shown before they run: the install scripts of the project and its
+dependencies, source builds, global packages and unknown Homebrew taps. A script that downloads or decodes and runs
+code blocks; any other script warns. Only files on disk are read. Details in [docs/install-layer.md](docs/install-layer.md).
+
 ## Allowlists
 
 `~/.config/code-watch/allow.toml` (or `$XDG_CONFIG_HOME`) decides which findings are hidden; a repo's own

@@ -9,7 +9,7 @@ output ends with `N findings suppressed by allowlists`.
 | File | Where | Can allow |
 |---|---|---|
 | User (decides) | `$XDG_CONFIG_HOME/code-watch/allow.toml`, else `~/.config/code-watch/allow.toml` | any rule, including `block` ones |
-| Per repo (advisory) | `.code-watch.toml` at the repo root | `warn` and `info` findings of repo rules (`repo/*`); never a `block` finding and never a `command/*` rule |
+| Per repo (advisory) | `.code-watch.toml` at the repo root | `warn` and `info` findings of repo rules (`repo/*`); never a `block` finding and never a `command/*` or `install/*` rule |
 
 A repository file is untrusted: a cloned repo, or an agent writing files in it, could otherwise allow itself past the
 guard. A repo entry that would hide a `block` finding leaves the finding and adds `allowlist/repo-block-override-refused`;
@@ -28,13 +28,13 @@ schema = 1
 rule = "repo/npm-lifecycle-script"   # required: an exact rule id, no wildcard
 path = "packages/**/package.json"    # optional glob on the finding's file, relative to the scanned root
 domain = "example.org"               # optional: the host a command finding is about
-package = "left-pad"                 # optional: the package an OSV finding is about
+package = "left-pad"                 # optional glob: the package an OSV or install finding is about (`@scope/*`)
 reason = "internal build step"       # optional, echoed in --json
 ```
 
 All narrowers on an entry must match. `path` uses `*` within one directory (it does not cross `/`; use `**`), and a
 finding with no file never matches a path entry. `domain` and `package` compare against fields the rule itself sets,
-case-insensitively and exactly: `example.org` does not cover `cdn.example.org`, and the finding's excerpt is never
+case-insensitively (`package` is a glob, `domain` is exact): `example.org` does not cover `cdn.example.org`, and the finding's excerpt is never
 consulted.
 
 A finding has a `domain` only when it is about a download and the command is unambiguous: the finding is

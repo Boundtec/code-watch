@@ -186,7 +186,7 @@ Each slice is about one worker-day, one reviewable PR, with its tests and its RE
 | 4 | Git hook | `install-hook` / `uninstall-hook`, global template dir, `post-checkout` scan on clone |
 | 5 | Command layer | `shlex`-based parsing, `curl \| sh`, base64 into shell, quarantine removal, `osascript` password, LaunchAgents writes, lookalike-domain check (`idna`, `psl`, `unicode-security`, `strsim`) |
 | 6 | Lockfiles + OSV | parsers per ecosystem behind one `PackageSource` trait, OSV client behind a trait with a fake, offline cache with injected clock |
-| 7 | Install layer | `npm/pnpm/yarn install`, `pip install`, `brew install` unknown tap: shows what will run before it runs |
+| 7 | Install layer | `npm/pnpm/yarn install`, `pip install`, `brew install` unknown tap: shows what will run before it runs. Built as `install/` (read-only, offline, ids `install/*`, `Layer::Rules`); see `docs/install-layer.md`. The pnpm 10 lockfile has no `requiresBuild`, so installed manifests are read |
 | 8 | Downloads layer | `.dmg` / `.pkg` quarantine, `codesign` / `spctl` shell-out behind a trait with a fake, macOS only |
 | 9 | LLM layer | provider trait, openai_compat + anthropic + local, `LlmFindings` newtype, the "only adds" property test, prompt-injection fixtures, `docs/llm-layer.md` |
 | 10 | Adapters 1 | `adapter` subcommand, Claude Code, Cursor, Codex CLI, with fixtures of each agent's stdin JSON |

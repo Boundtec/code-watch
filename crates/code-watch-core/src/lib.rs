@@ -5,6 +5,7 @@ pub mod allow;
 pub mod command;
 pub mod engine;
 pub mod finding;
+pub mod install;
 mod names;
 pub mod osv;
 pub mod render;

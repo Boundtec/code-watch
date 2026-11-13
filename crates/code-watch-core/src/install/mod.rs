@@ -1,0 +1,210 @@
+//! The before-an-install layer: shows what an `npm`, `pnpm`, `yarn`, `pip` or `brew` install
+//! would run, reading only what is on disk. It never runs a package manager, never touches the
+//! network and never writes; anything it cannot read is reported as `install/unchecked`.
+
+mod brew;
+mod node;
+mod pip;
+mod read;
+
+use std::path::{Path, PathBuf};
+
+use crate::finding::{Evidence, Finding, Layer, Severity};
+
+pub const RULE_UNCHECKED: &str = "install/unchecked";
+
+struct Spec {
+    id: &'static str,
+    title: &'static str,
+    remediation: &'static str,
+}
+
+const SPECS: &[Spec] = &[
+    Spec {
+        id: "install/lifecycle-script-fetch-run",
+        title: "An install script downloads and runs code",
+        remediation: "Do not install here; read the script first.",
+    },
+    Spec {
+        id: "install/lifecycle-script",
+        title: "The install runs a script automatically",
+        remediation: "Read the script before installing, or install with --ignore-scripts.",
+    },
+    Spec {
+        id: "install/dependency-scripts",
+        title: "Dependencies run install scripts",
+        remediation: "Read what these packages run before installing, or install with --ignore-scripts.",
+    },
+    Spec {
+        id: "install/dependency-scripts-blocked",
+        title: "Dependency install scripts are blocked by pnpm unless allowed",
+        remediation: "Allow a package's build only after reading what it runs.",
+    },
+    Spec {
+        id: "install/dependency-scripts-unknown",
+        title: "The lockfile does not say which dependencies run install scripts",
+        remediation: "Install with --ignore-scripts, or use a lockfile that records them.",
+    },
+    Spec {
+        id: "install/no-scripts",
+        title: "Install scripts are turned off, nothing runs on install",
+        remediation: "",
+    },
+    Spec {
+        id: "install/no-script-found",
+        title: "No install script found",
+        remediation: "",
+    },
+    Spec {
+        id: "install/global-package",
+        title: "A global install runs a package's own install scripts",
+        remediation: "Install global tools only from authors you trust; allow a package you trust in the user allowlist.",
+    },
+    Spec {
+        id: "install/pip-build-code",
+        title: "pip builds and runs project code to install this",
+        remediation: "Read setup.py or the build backend first, or install wheels only with --only-binary :all:.",
+    },
+    Spec {
+        id: "install/pip-wheels-only",
+        title: "pip installs wheels only, no project code is built",
+        remediation: "",
+    },
+    Spec {
+        id: "install/brew-unknown-tap",
+        title: "brew runs formula code from a tap outside homebrew",
+        remediation: "Read the formula before installing it.",
+    },
+    Spec {
+        id: RULE_UNCHECKED,
+        title: "The install could not be checked",
+        remediation: "Look at what the install runs yourself, or ask the user.",
+    },
+];
+
+pub const RULE_IDS: &[&str] = &[
+    "install/lifecycle-script-fetch-run",
+    "install/lifecycle-script",
+    "install/dependency-scripts",
+    "install/dependency-scripts-blocked",
+    "install/dependency-scripts-unknown",
+    "install/no-scripts",
+    "install/no-script-found",
+    "install/global-package",
+    "install/pip-build-code",
+    "install/pip-wheels-only",
+    "install/brew-unknown-tap",
+    RULE_UNCHECKED,
+];
+
+/// What the install layer borrows from the rest of the engine, so it keeps no rules of its own.
+pub struct Judge<'a> {
+    /// Whether a script's text is blocked by the command layer (fetches or decodes and runs).
+    pub script_blocks: &'a dyn Fn(&str) -> bool,
+    /// Whether the repo rule for `setup.py` flags this file's text.
+    pub setup_py_flagged: &'a dyn Fn(&str) -> bool,
+}
+
+pub(crate) fn finding(
+    id: &str,
+    severity: Severity,
+    file: Option<String>,
+    line: Option<usize>,
+    excerpt: &str,
+    package: Option<String>,
+) -> Finding {
+    let spec = SPECS
+        .iter()
+        .find(|s| s.id == id)
+        .expect("known install rule id");
+    Finding {
+        rule_id: spec.id.into(),
+        severity,
+        layer: Layer::Rules,
+        title: spec.title.into(),
+        evidence: Evidence::new(file, line, excerpt),
+        remediation: spec.remediation.into(),
+        domain: None,
+        package,
+        advisories: Vec::new(),
+    }
+}
+
+pub(crate) fn unchecked(file: &str, why: &str) -> Finding {
+    finding(
+        RULE_UNCHECKED,
+        Severity::Warn,
+        Some(file.into()),
+        None,
+        why,
+        None,
+    )
+}
+
+/// `path` as the user would write it: relative to `cwd` when it lies under it.
+pub(crate) fn shown(path: &Path, cwd: &Path) -> String {
+    path.strip_prefix(cwd)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Whether `word` is `name` or a versioned form of an interpreter or pip (`python3.12`, `pip3.9`).
+fn versioned(word: &str, name: &str) -> bool {
+    word.strip_prefix(name)
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+fn basename(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
+
+/// Checks each simple command of a command line, in order, for an install. Each entry holds the
+/// words of one command starting at the program. A `cd <dir>` before an install moves where it
+/// is judged. `uv pip`, `bun`, `npx`, `npm exec` and `brew bundle` are not recognised.
+pub fn analyze(commands: &[Vec<String>], cwd: &Path, judge: &Judge) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut here: PathBuf = cwd.to_path_buf();
+    for words in commands {
+        let words = unparenthesised(words);
+        let Some(program) = words.first().map(|w| basename(w)) else {
+            continue;
+        };
+        let args = &words[1..];
+        match program {
+            "cd" => {
+                if let Some(dir) = args.iter().find(|a| !a.starts_with('-') && *a != "-") {
+                    here = here.join(dir);
+                }
+            }
+            "npm" | "pnpm" | "yarn" => {
+                findings.extend(node::analyze(program, args, &here, cwd, judge))
+            }
+            "brew" => findings.extend(brew::analyze(args)),
+            p if versioned(p, "pip") => findings.extend(pip::analyze(args, &here, cwd, judge)),
+            p if versioned(p, "python") => {
+                if let [flag, module, rest @ ..] = args
+                    && flag == "-m"
+                    && module == "pip"
+                {
+                    findings.extend(pip::analyze(rest, &here, cwd, judge));
+                }
+            }
+            _ => {}
+        }
+    }
+    findings
+}
+
+/// `(cd x && npm i)` reaches us as `(cd` and `i)`; the parentheses are not part of the words.
+fn unparenthesised(words: &[String]) -> Vec<String> {
+    let mut out = words.to_vec();
+    if let Some(first) = out.first_mut() {
+        *first = first.trim_start_matches('(').to_string();
+    }
+    if let Some(last) = out.last_mut() {
+        *last = last.trim_end_matches(')').to_string();
+    }
+    out.retain(|w| !w.is_empty());
+    out
+}

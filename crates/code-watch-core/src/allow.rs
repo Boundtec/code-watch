@@ -54,7 +54,7 @@ struct Entry {
     rule: String,
     path: Option<GlobMatcher>,
     domain: Option<String>,
-    package: Option<String>,
+    package: Option<GlobMatcher>,
     reason: Option<String>,
 }
 
@@ -179,7 +179,7 @@ impl Allowlists {
             return Decision::Keep;
         };
         // A repo file is writable by the agent being guarded, so it never allows a command rule.
-        if f.rule_id.starts_with("command/") {
+        if f.rule_id.starts_with("command/") || f.rule_id.starts_with("install/") {
             Decision::RefuseCommand
         } else if f.severity < Severity::Block {
             Decision::Suppress(Source::Repo, e.reason.clone())
@@ -202,6 +202,7 @@ fn suppressible(f: &Finding) -> bool {
         && f.rule_id != "repo/unscanned-target"
         && f.rule_id != crate::osv::RULE_UNPARSED
         && f.rule_id != crate::osv::RULE_UNCHECKED
+        && f.rule_id != crate::install::RULE_UNCHECKED
 }
 
 impl Entry {
@@ -215,7 +216,10 @@ impl Entry {
                     .is_some_and(|file| g.is_match(file))
             })
             && same(self.domain.as_deref(), f.domain.as_deref())
-            && same(self.package.as_deref(), f.package.as_deref())
+            && self
+                .package
+                .as_ref()
+                .is_none_or(|g| f.package.as_deref().is_some_and(|p| g.is_match(p)))
     }
 }
 
@@ -260,11 +264,22 @@ fn parse(text: &str, path: &str) -> Result<Vec<Entry>, AllowError> {
                         .map_err(|e| invalid(format!("path {p:?}: {e}")))
                 })
                 .transpose()?;
+            let package_matcher = raw
+                .package
+                .as_deref()
+                .map(|p| {
+                    GlobBuilder::new(p)
+                        .case_insensitive(true)
+                        .build()
+                        .map(|g| g.compile_matcher())
+                        .map_err(|e| invalid(format!("package {p:?}: {e}")))
+                })
+                .transpose()?;
             Ok(Entry {
                 rule: raw.rule,
                 path: path_matcher,
                 domain: raw.domain,
-                package: raw.package,
+                package: package_matcher,
                 reason: raw.reason.as_deref().map(clean_text),
             })
         })

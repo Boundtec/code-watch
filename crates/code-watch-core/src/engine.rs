@@ -8,7 +8,8 @@ use ignore::WalkBuilder;
 
 use crate::allow::Allowlists;
 use crate::command;
-use crate::finding::Finding;
+use crate::finding::{Finding, Severity};
+use crate::install;
 use crate::osv::{self, Cache, OsvClient, OsvMode, RULE_IDS};
 use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{HEAD_BYTES, RuleError, RuleSet, Target};
@@ -250,6 +251,7 @@ impl Engine {
             .map(|r| r.id.clone())
             .chain(rust_rules)
             .chain(RULE_IDS.iter().map(|id| id.to_string()))
+            .chain(crate::install::RULE_IDS.iter().map(|id| id.to_string()))
             .collect()
     }
 
@@ -272,6 +274,14 @@ impl Engine {
     /// Like `check_command`, then hides the findings `allow` allows; they stay listed in the report.
     pub fn check_command_with(&self, command: &str, allow: &Allowlists) -> Report {
         let macos = cfg!(target_os = "macos");
+        let findings = self.command_findings(command, macos);
+        let applied = allow.apply(findings, &self.known_rule_ids());
+        Report::from_rules(applied.kept)
+            .with_skipped_rules(command::skipped_rules(macos))
+            .with_allowlist(applied.suppressed, applied.warnings)
+    }
+
+    fn command_findings(&self, command: &str, macos: bool) -> Vec<Finding> {
         let views = command::unquoted_views(command);
         let mut findings: Vec<_> = self
             .rules
@@ -283,10 +293,34 @@ impl Engine {
         findings.extend(command::analyze(command, macos));
         self.add_parsed_pipe_to_shell(command, &mut findings);
         command::stamp_fetch_domain(&mut findings, command);
-        let applied = allow.apply(findings, &self.known_rule_ids());
-        Report::from_rules(applied.kept)
-            .with_skipped_rules(command::skipped_rules(macos))
-            .with_allowlist(applied.suppressed, applied.warnings)
+        findings
+    }
+
+    /// What the installs among `commands` (each the words of one simple command, from the
+    /// program on) would run, judged against `cwd`. Script texts are judged by the command rules.
+    pub fn install_findings(&self, commands: &[Vec<String>], cwd: &Path) -> Vec<Finding> {
+        // A script that downloads and runs (pipe-to-shell is only a warning for a typed command)
+        // or decodes and runs is a block here: nobody typed it.
+        let script_blocks = |text: &str| {
+            self.command_findings(text, cfg!(target_os = "macos"))
+                .iter()
+                .any(|f| f.severity == Severity::Block || f.rule_id == "command/pipe-to-shell")
+        };
+        let setup_py_flagged = |text: &str| {
+            self.rules
+                .rules()
+                .iter()
+                .filter(|r| r.id == "repo/setup-py-install-hook")
+                .any(|r| !r.check_file(Path::new("setup.py"), text).is_empty())
+        };
+        install::analyze(
+            commands,
+            cwd,
+            &install::Judge {
+                script_blocks: &script_blocks,
+                setup_py_flagged: &setup_py_flagged,
+            },
+        )
     }
 }
 
