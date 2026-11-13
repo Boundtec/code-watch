@@ -92,6 +92,14 @@ the public-registry packages they pin. Only package names, versions and ecosyste
 hours in `~/.cache/code-watch/osv/`; `scan --offline` uses only that cache and `scan --no-osv` turns the layer off.
 A lookup that fails is reported, never treated as clean. Details in [docs/osv.md](docs/osv.md).
 
+## Optional LLM review
+
+`scan` can also ask a model (OpenAI-compatible, Anthropic, or a local one such as Ollama) to read manifests, install
+scripts and flagged files and report extra concerns. It is configured in `~/.config/code-watch/config.toml`, off by
+default, and it only adds findings (at most `warn`): it cannot remove or lower anything the rules found. With a remote
+provider, the text of those files leaves your machine, and the clone hook does not use it unless you set
+`clone_hook = true`. Details in [docs/llm-layer.md](docs/llm-layer.md).
+
 ## Agent hooks
 
 `code-watch adapter <agent>` answers an agent's pre-command hook with the same check as `code-watch check`; a block is a
@@ -129,8 +137,8 @@ sandboxes or launchers that reset `PATH`.
 
 ## Layers
 
-Rules and the OSV layer need no key. The optional LLM layer is not built yet; every report says which layers ran,
-which were skipped (and why) and which are off.
+Rules and the OSV layer need no key. The optional LLM layer is off until you configure it; every report says which
+layers ran, which were skipped (and why) and which are off.
 
 ## License
 

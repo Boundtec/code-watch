@@ -4,6 +4,7 @@ use serde::Serialize;
 
 use crate::allow::Suppressed;
 use crate::finding::{Evidence, Finding, Layer, Severity};
+use crate::llm::LlmOutcome;
 use crate::names::display_as_wire_name;
 use crate::osv::OsvStatus;
 
@@ -76,13 +77,7 @@ impl Report {
     /// file that could not be read never produces a clean verdict.
     pub fn from_scan(mut findings: Vec<Finding>, skipped: Vec<Skipped>) -> Self {
         findings.extend(skipped.iter().map(unscanned_finding));
-        findings.sort_by(|a, b| {
-            b.severity
-                .cmp(&a.severity)
-                .then_with(|| a.rule_id.cmp(&b.rule_id))
-                .then_with(|| a.evidence.file.cmp(&b.evidence.file))
-                .then_with(|| a.evidence.line.cmp(&b.evidence.line))
-        });
+        sort_findings(&mut findings);
         let layers = BTreeMap::from([
             (Layer::Rules, LayerStatus::Ran),
             (Layer::Osv, LayerStatus::Off),
@@ -109,6 +104,23 @@ impl Report {
             OsvStatus::Skipped(why) => {
                 self.layers.insert(Layer::Osv, LayerStatus::Skipped);
                 self.layer_notes.insert(Layer::Osv, why);
+            }
+        }
+        self
+    }
+
+    /// Adds what the LLM layer found, or records why it did not run. The findings are only
+    /// appended: nothing the other layers found can be removed, replaced or lowered here.
+    pub fn with_llm(mut self, outcome: LlmOutcome) -> Self {
+        match outcome {
+            LlmOutcome::Ran(found) => {
+                self.findings.extend(found.into_findings());
+                sort_findings(&mut self.findings);
+                self.layers.insert(Layer::Llm, LayerStatus::Ran);
+            }
+            LlmOutcome::Skipped(why) => {
+                self.layers.insert(Layer::Llm, LayerStatus::Skipped);
+                self.layer_notes.insert(Layer::Llm, why);
             }
         }
         self
@@ -164,6 +176,16 @@ impl Report {
             Some(Severity::Info) | None => Verdict::Allow,
         }
     }
+}
+
+fn sort_findings(findings: &mut [Finding]) {
+    findings.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+            .then_with(|| a.evidence.file.cmp(&b.evidence.file))
+            .then_with(|| a.evidence.line.cmp(&b.evidence.line))
+    });
 }
 
 fn unscanned_finding(s: &Skipped) -> Finding {

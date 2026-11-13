@@ -44,3 +44,5 @@ Install also refuses if `post-checkout` in our template folder exists and was no
 Uninstall only acts when `init.templateDir` is exactly ours; otherwise it says so and changes nothing. It removes our template folder and the empty `code-watch` folder above it. If you had no
 global git config file, git leaves an empty one after install and uninstall. Tested with git 2.48, which removes the
 empty `[init]` section on unset.
+
+The clone-time scan does not use the optional LLM layer unless `clone_hook = true` is set in the config; see [llm-layer.md](llm-layer.md).
