@@ -52,6 +52,9 @@ enum Cmd {
         /// Codex cannot ask: answer a warning with a deny (default) or let it run and say so on stderr
         #[arg(long, value_enum, default_value_t = adapter::CodexWarn::Deny)]
         codex_warn: adapter::CodexWarn,
+        /// Cursor cannot stay silent: answer a clean command with an ask (default, Cursor's prompt decides) or an allow
+        #[arg(long, value_enum, default_value_t = adapter::CursorClean::Ask)]
+        cursor_clean: adapter::CursorClean,
     },
     /// Print the settings snippet that connects an agent to `adapter` (edits nothing)
     InstallAdapter { agent: adapter::Agent },
@@ -86,6 +89,7 @@ fn real_main() -> ExitCode {
             agent,
             fail_open,
             codex_warn,
+            cursor_clean,
             ..
         } => {
             let policy = adapter::Policy {
@@ -95,6 +99,7 @@ fn real_main() -> ExitCode {
                     adapter::FailMode::Closed
                 },
                 codex_warn: *codex_warn,
+                cursor_clean: *cursor_clean,
             };
             return adapter::run(*agent, policy, user_dir().as_deref());
         }
@@ -180,6 +185,12 @@ fn install_adapter(agent: adapter::Agent) -> ExitCode {
         .and_then(|exe| adapter::install::snippet(agent, &exe))
         .and_then(|(value, file)| {
             let _ = writeln!(io::stderr(), "code-watch: merge this into {file}:");
+            if agent == adapter::Agent::Cursor {
+                let _ = writeln!(
+                    io::stderr(),
+                    "code-watch: clean commands still go through Cursor's approval prompt (--cursor-clean ask); add --cursor-clean allow to the command if you run Cursor in auto-run mode"
+                );
+            }
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         });

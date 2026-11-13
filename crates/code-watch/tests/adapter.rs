@@ -123,12 +123,24 @@ fn codex_warn_flag_does_not_soften_a_block() {
 }
 
 #[test]
-fn cursor_answers_allow_ask_and_deny_with_both_messages() {
+fn cursor_answers_a_clean_command_with_ask_by_default_and_allow_on_request() {
     let r = run("cursor", &[], &fixture("cursor", "allow"));
+    assert_eq!(
+        (r.code, r.reply()),
+        (Some(0), Some(json!({"permission": "ask"})))
+    );
+    let flags = ["--cursor-clean", "allow"];
+    let r = run("cursor", &flags, &fixture("cursor", "allow"));
     assert_eq!(
         (r.code, r.reply()),
         (Some(0), Some(json!({"permission": "allow"})))
     );
+    let r = run("cursor", &flags, &fixture("cursor", "block"));
+    assert_eq!(r.reply().unwrap()["permission"], "deny");
+}
+
+#[test]
+fn cursor_answers_ask_and_deny_with_both_messages() {
     for (name, permission) in [("warn", "ask"), ("block", "deny")] {
         let r = run("cursor", &[], &fixture("cursor", name));
         assert_eq!(r.code, Some(0));
@@ -177,7 +189,7 @@ fn bad_input_follows_the_fail_mode_for_every_agent() {
             );
             let allowed = open.reply();
             assert!(
-                allowed.is_none() || allowed == Some(json!({"permission": "allow"})),
+                allowed.is_none() || allowed == Some(json!({"permission": "ask"})),
                 "{agent} {input:?}: {allowed:?}"
             );
         }
@@ -249,6 +261,13 @@ fn the_repo_allowlist_of_the_cwd_turns_a_warning_into_allow_like_check() {
         "cwd": repo.path()})
     .to_string();
     let r = adapter("cursor", &[], cursor.as_bytes(), cfg.path());
+    assert_eq!(r.reply(), Some(json!({"permission": "ask"})));
+    let r = adapter(
+        "cursor",
+        &["--cursor-clean", "allow"],
+        cursor.as_bytes(),
+        cfg.path(),
+    );
     assert_eq!(r.reply(), Some(json!({"permission": "allow"})));
 
     let check = Command::cargo_bin("code-watch")
@@ -298,7 +317,14 @@ fn install_adapter_prints_only_the_snippet_on_stdout() {
         assert_eq!(out.status.code(), Some(0), "{agent}");
         let value: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert!(value.to_string().contains(agent), "{agent}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("merge this into"));
+        assert!(!value.to_string().contains("\"args\""), "{agent}");
+        let note = String::from_utf8_lossy(&out.stderr);
+        assert!(note.contains("merge this into"));
+        assert_eq!(
+            note.contains("--cursor-clean ask"),
+            agent == "cursor",
+            "{agent}"
+        );
     }
 }
 

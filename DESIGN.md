@@ -144,7 +144,7 @@ No async runtime anywhere. `cargo-deny` runs in CI to keep the license list hone
 
 Update 2026-11-13: Codex CLI parses `ask` for `PreToolUse` but does not support it yet, so its adapter answers a warning
 with a deny (`--codex-warn allow` reports it instead); Claude Code hooks accept `onFailure: "block"` (v2.1.295+) and a
-`defer` decision; Cursor has no "no opinion" reply, so a clean command is an explicit `allow`.
+`defer` decision; Cursor has no "no opinion" reply, so a clean command is an `ask` unless `--cursor-clean allow`.
 
 All five let the adapter block before a shell command runs except where noted. Each adapter is `code-watch adapter <name>`:
 read the JSON on stdin, extract the command, run `code-watch check`, translate the verdict back.

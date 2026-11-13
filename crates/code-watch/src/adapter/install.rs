@@ -16,8 +16,7 @@ pub fn snippet(agent: Agent, exe: &Path) -> anyhow::Result<(Value, &'static str)
                 "matcher": "Bash",
                 "hooks": [{
                     "type": "command",
-                    "command": exe_text,
-                    "args": ["adapter", "claude-code"],
+                    "command": line("claude-code")?,
                     "onFailure": "block",
                 }],
             }]}}),
@@ -55,20 +54,45 @@ mod tests {
             let (value, file) = snippet(agent, exe).unwrap();
             let text = value.to_string();
             assert!(text.contains("/opt/my tools/code-watch"), "{name}");
+            assert!(!text.contains("\"args\""), "{name}");
             assert!(text.contains(name), "{name}");
             assert!(file.starts_with("~/."));
         }
     }
 
     #[test]
-    fn a_shell_style_command_quotes_a_path_with_spaces() {
-        let (value, _) = snippet(Agent::Cursor, Path::new("/opt/my tools/code-watch")).unwrap();
-        let cmd = value["hooks"]["beforeShellExecution"][0]["command"]
-            .as_str()
-            .unwrap();
+    fn the_command_is_one_shell_quoted_string_with_the_agent_name() {
+        let exe = Path::new("/opt/my tools/code-watch");
+        let command = |agent, name: &str| {
+            let (value, _) = snippet(agent, exe).unwrap();
+            let node = match agent {
+                Agent::Cursor => &value["hooks"]["beforeShellExecution"][0],
+                _ => &value["hooks"]["PreToolUse"][0]["hooks"][0],
+            };
+            (
+                shlex::split(node["command"].as_str().unwrap()).unwrap(),
+                name.to_string(),
+            )
+        };
+        for (agent, name) in [
+            (Agent::ClaudeCode, "claude-code"),
+            (Agent::Cursor, "cursor"),
+            (Agent::Codex, "codex"),
+        ] {
+            let (words, name) = command(agent, name);
+            assert_eq!(
+                words,
+                ["/opt/my tools/code-watch", "adapter", name.as_str()]
+            );
+        }
+    }
+
+    #[test]
+    fn the_claude_code_snippet_keeps_on_failure_block() {
+        let (value, _) = snippet(Agent::ClaudeCode, Path::new("/x")).unwrap();
         assert_eq!(
-            shlex::split(cmd).unwrap(),
-            ["/opt/my tools/code-watch", "adapter", "cursor"]
+            value["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"],
+            "block"
         );
     }
 }

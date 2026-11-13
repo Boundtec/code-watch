@@ -10,7 +10,7 @@ It edits nothing: merge the snippet into your existing `hooks` object yourself.
 
 | Verdict | Claude Code | Cursor | Codex CLI |
 |---|---|---|---|
-| clean | empty reply (Claude Code's own permission flow decides) | `{"permission":"allow"}` | empty reply |
+| clean | empty reply (Claude Code's own permission flow decides) | `ask` (`--cursor-clean allow`: `allow`) | empty reply |
 | warn | `permissionDecision: "ask"` | `permission: "ask"` | `deny` that says how to allow it (`--codex-warn allow`: empty reply, reason on stderr) |
 | block | `permissionDecision: "deny"` | `permission: "deny"` | `deny` |
 
@@ -24,11 +24,10 @@ Hook `PreToolUse`, matcher `Bash`, in `~/.claude/settings.json`. The snippet set
 
 ## Cursor
 
-Hook `beforeShellExecution` in `~/.cursor/hooks.json`, with `"version": 1` and `failClosed: true`. Cursor's hook
-documentation has no "no opinion" reply: anything that is not a valid permission blocks the action. A clean command is
-therefore answered `{"permission":"allow"}`, which the documentation describes as approving the command; it does not say
-whether that also skips Cursor's own approval prompt. If it does, code-watch auto-approves clean commands in Cursor.
-To limit that, set a `matcher` regex in `hooks.json` so the hook only sees the commands you want it to judge.
+Hook `beforeShellExecution` in `~/.cursor/hooks.json`, with `"version": 1` and `failClosed: true`. Cursor has no "no
+opinion" reply (anything that is not a valid permission blocks), and an `allow` may skip Cursor's own approval prompt, so
+a clean command is answered `ask` by default and still goes through Cursor's prompt. If you run Cursor in auto-run
+mode, add `--cursor-clean allow` to the hook command.
 
 ## Codex CLI
 
@@ -41,7 +40,7 @@ stderr.
 
 Empty or invalid input, a missing command field, input over 1 MiB, a broken user allowlist or an internal error follow
 the fail mode. **`--fail-closed` is the default**: the command is denied with a message that says why and names
-`--fail-open`. With `--fail-open` the command is allowed (the empty reply, or Cursor's allow) and the reason goes to
+`--fail-open`. With `--fail-open` the command is allowed (the empty reply, or Cursor's `--cursor-clean` answer) and the reason goes to
 stderr. A fail-closed adapter is loud when an agent changes its hook format; a fail-open one stops guarding quietly.
 
 A `cwd` that is missing, not a directory or absent is treated as outside a repository: only the user allowlist applies.

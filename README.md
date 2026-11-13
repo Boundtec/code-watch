@@ -91,7 +91,7 @@ leaves your git config as it was. It refuses rather than overwrite a template di
 deny and a warning is an ask. `code-watch install-adapter <agent>` prints the settings snippet to merge in.
 
 - **Claude Code**: `PreToolUse` on `Bash` in `~/.claude/settings.json`; clean commands get the empty reply.
-- **Cursor**: `beforeShellExecution` in `~/.cursor/hooks.json`; Cursor has no "no opinion" reply, so a clean command is an explicit allow.
+- **Cursor**: `beforeShellExecution` in `~/.cursor/hooks.json`; Cursor has no "no opinion" reply, so a clean command is an `ask` (Cursor's own prompt decides; `--cursor-clean allow` for auto-run mode).
 - **Codex CLI**: `PreToolUse` on `Bash` in `~/.codex/hooks.json`; Codex cannot ask, so a warning is denied with the allowlist entry that lets it through (`--codex-warn allow` to only report it).
 
 Commands the adapter cannot check are denied (`--fail-open` to allow them). Details in [docs/adapters.md](docs/adapters.md).

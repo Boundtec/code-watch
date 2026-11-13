@@ -42,10 +42,19 @@ pub enum CodexWarn {
     Allow,
 }
 
+/// How a clean command is answered to Cursor, which has no "no opinion" reply: `ask` leaves
+/// the decision to Cursor's own prompt, `allow` approves it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+pub enum CursorClean {
+    Ask,
+    Allow,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
     pub fail: FailMode,
     pub codex_warn: CodexWarn,
+    pub cursor_clean: CursorClean,
 }
 
 /// What the agent called: a shell command to check, or something else to leave alone.
@@ -266,6 +275,7 @@ mod tests {
         let policy = |fail| Policy {
             fail,
             codex_warn: CodexWarn::Deny,
+            cursor_clean: CursorClean::Ask,
         };
         let closed = handle(&Panics, Ok(vec![]), &policy(FailMode::Closed), None);
         let open = handle(&Panics, Ok(vec![]), &policy(FailMode::Open), None);
