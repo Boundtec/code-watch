@@ -1,0 +1,3 @@
+echo $(echo $(echo $(echo hi)))
+cat <(cat <(cat <(cat f)))
+sh -c "sh -c \"sh -c 'sh -c true'\""
