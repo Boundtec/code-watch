@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, Read};
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
 
@@ -28,10 +29,8 @@ fn read_target(path: &Path) -> Result<String, SkipReason> {
     if len > MAX_FILE_BYTES {
         return Err(SkipReason::TooLarge);
     }
-    fs::read_to_string(path).map_err(|e| match e.kind() {
-        io::ErrorKind::InvalidData => SkipReason::NotUtf8,
-        _ => SkipReason::Unreadable,
-    })
+    let bytes = fs::read(path).map_err(|_| SkipReason::Unreadable)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn read_head(path: &Path) -> Vec<u8> {
@@ -53,20 +52,33 @@ fn is_executable(_: &fs::Metadata) -> bool {
     false
 }
 
+/// A symlink that does not resolve inside the scanned root: the walker must not read through
+/// it, and the scan reports it afterwards instead of dropping it.
+fn leaves_root(root: &Path, link: &Path) -> bool {
+    link.canonicalize()
+        .map_or(true, |target| !target.starts_with(root))
+}
+
+/// The path a walk error belongs to, when the walker said.
+fn error_target(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            error_target(err)
+        }
+        _ => None,
+    }
+}
+
 /// The path a walk error belongs to, relative to the scanned root, or "." when the walker did
 /// not say.
 fn error_path(err: &ignore::Error, root: &Path) -> String {
-    match err {
-        ignore::Error::WithPath { path, .. } => path
-            .strip_prefix(root)
+    error_target(err).map_or(".".into(), |path| {
+        path.strip_prefix(root)
             .unwrap_or(path)
             .to_string_lossy()
-            .into_owned(),
-        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
-            error_path(err, root)
-        }
-        _ => ".".into(),
-    }
+            .into_owned()
+    })
 }
 
 pub struct Engine {
@@ -82,10 +94,12 @@ impl Engine {
         Ok(Self::new(RuleSet::embedded()?))
     }
 
-    /// Scans a repository without executing or following anything in it: symlinks are not
-    /// followed, `.gitignore` is not honoured (ignored files still run on the developer's
-    /// machine) and only `.git` is skipped. A file a rule targets that cannot be read is
-    /// reported in the `skipped` list and as a warning, never silently dropped.
+    /// Scans a repository without executing anything in it. A symlink that resolves inside the
+    /// scanned root is followed, because npm and VS Code follow it, and is named by its link
+    /// path; one that resolves outside it is not read but reported. `.gitignore` is not honoured
+    /// (ignored files still run on the developer's machine) and only `.git` is skipped. A file a
+    /// rule targets that cannot be read is reported in the `skipped` list and as a warning,
+    /// never silently dropped.
     pub fn scan_dir(&self, dir: &Path) -> Result<Report, ScanError> {
         self.scan_dir_with(dir, &Allowlists::empty())
     }
@@ -95,9 +109,27 @@ impl Engine {
         if !dir.is_dir() {
             return Err(ScanError::NotADirectory(dir.display().to_string()));
         }
+        let root = dir
+            .canonicalize()
+            .map_err(|_| ScanError::NotADirectory(dir.display().to_string()))?;
+        let escaped = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
         let walker = WalkBuilder::new(dir)
             .standard_filters(false)
-            .filter_entry(|e| e.file_name() != ".git")
+            .follow_links(true)
+            .filter_entry({
+                let escaped = Arc::clone(&escaped);
+                let root = root.clone();
+                move |e| {
+                    if e.file_name() == ".git" {
+                        return false;
+                    }
+                    if e.path_is_symlink() && leaves_root(&root, e.path()) {
+                        escaped.lock().unwrap().push(e.path().to_path_buf());
+                        return false;
+                    }
+                    true
+                }
+            })
             .build();
         let mut findings = Vec::new();
         let mut skipped = Vec::new();
@@ -105,6 +137,12 @@ impl Engine {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
+                    let dangling =
+                        error_target(&err).filter(|p| p.is_symlink() && p.canonicalize().is_err());
+                    if let Some(link) = dangling {
+                        escaped.lock().unwrap().push(link.to_path_buf());
+                        continue;
+                    }
                     skipped.push(Skipped {
                         path: error_path(&err, dir),
                         reason: SkipReason::WalkError,
@@ -116,12 +154,7 @@ impl Engine {
                 continue;
             }
             let rel = entry.path().strip_prefix(dir).unwrap_or(entry.path());
-            let wanted: Vec<_> = self
-                .rules
-                .rules()
-                .iter()
-                .filter(|r| r.target() == Target::Repo && r.applies_to(rel))
-                .collect();
+            let wanted = self.repo_rules_for(rel);
             if wanted.is_empty() {
                 continue;
             }
@@ -152,9 +185,34 @@ impl Engine {
                 }),
             }
         }
+        let escaped = std::mem::take(&mut *escaped.lock().unwrap());
+        for link in escaped {
+            let rel = link.strip_prefix(dir).unwrap_or(&link);
+            let resolved = fs::metadata(&link);
+            let reason = match &resolved {
+                Ok(_) => SkipReason::SymlinkOutsideRepo,
+                Err(_) => SkipReason::Unreadable,
+            };
+            let is_dir = resolved.is_ok_and(|m| m.is_dir());
+            let read_by_text_rule = self.repo_rules_for(rel).iter().any(|r| !r.is_binary_rule());
+            if is_dir || read_by_text_rule {
+                skipped.push(Skipped {
+                    path: rel.to_string_lossy().into_owned(),
+                    reason,
+                });
+            }
+        }
         let applied = allow.apply(findings, &self.known_rule_ids());
         Ok(Report::from_scan(applied.kept, skipped)
             .with_allowlist(applied.suppressed, applied.warnings))
+    }
+
+    fn repo_rules_for(&self, rel: &Path) -> Vec<&crate::rules::Rule> {
+        self.rules
+            .rules()
+            .iter()
+            .filter(|r| r.target() == Target::Repo && r.applies_to(rel))
+            .collect()
     }
 
     fn known_rule_ids(&self) -> HashSet<String> {
@@ -497,22 +555,106 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn link(target: &Path, at: &Path) {
+        std::os::unix::fs::symlink(target, at).unwrap();
+    }
+
+    const POSTINSTALL: &str = r#"{"scripts":{"postinstall":"echo hi"}}"#;
+
+    #[cfg(unix)]
     #[test]
-    fn symlinks_are_not_followed() {
-        let outside = tempfile::tempdir().unwrap();
-        fs::write(
-            outside.path().join("package.json"),
-            r#"{"scripts":{"postinstall":"echo hi"}}"#,
-        )
-        .unwrap();
+    fn a_file_link_inside_the_root_is_read_and_named_by_the_link() {
         let repo = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(
-            outside.path().join("package.json"),
-            repo.path().join("package.json"),
+        fs::create_dir(repo.path().join("data")).unwrap();
+        fs::write(repo.path().join("data/a.txt"), POSTINSTALL).unwrap();
+        link(Path::new("data/a.txt"), &repo.path().join("package.json"));
+        let report = scan(repo.path());
+        let hit = &report.findings()[0];
+        assert_eq!(hit.rule_id, "repo/npm-lifecycle-script");
+        assert_eq!(hit.evidence.file.as_deref(), Some("package.json"));
+        assert!(report.skipped().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_link_inside_the_root_is_followed() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir(repo.path().join("x")).unwrap();
+        fs::write(
+            repo.path().join("x/tasks.json"),
+            r#"{"tasks":[{"runOptions":{"runOn":"folderOpen"}}]}"#,
         )
         .unwrap();
-        let report = Engine::embedded().unwrap().scan_dir(repo.path()).unwrap();
-        assert!(report.findings().is_empty());
+        link(Path::new("x"), &repo.path().join(".vscode"));
+        let report = scan(repo.path());
+        let files: Vec<_> = report
+            .findings()
+            .iter()
+            .filter(|f| f.rule_id == "repo/vscode-folderopen-task")
+            .filter_map(|f| f.evidence.file.as_deref())
+            .collect();
+        assert_eq!(files, [".vscode/tasks.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_link_leaving_the_root_is_reported_not_dropped() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("package.json"), POSTINSTALL).unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        link(
+            &outside.path().join("package.json"),
+            &repo.path().join("package.json"),
+        );
+        let report = scan(repo.path());
+        assert_unscanned(&report, "package.json", SkipReason::SymlinkOutsideRepo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_link_leaving_the_root_is_reported_not_dropped() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("tasks.json"), "{}").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        link(outside.path(), &repo.path().join(".vscode"));
+        let report = scan(repo.path());
+        assert_unscanned(&report, ".vscode", SkipReason::SymlinkOutsideRepo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_targeted_link_is_reported_and_an_untargeted_one_is_not() {
+        let repo = tempfile::tempdir().unwrap();
+        link(Path::new("missing"), &repo.path().join("package.json"));
+        link(Path::new("missing"), &repo.path().join("notes.txt"));
+        let report = scan(repo.path());
+        assert_unscanned(&report, "package.json", SkipReason::Unreadable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_loop_is_reported() {
+        let repo = tempfile::tempdir().unwrap();
+        link(Path::new("b"), &repo.path().join("a"));
+        link(Path::new("a"), &repo.path().join("b"));
+        link(Path::new("loop"), &repo.path().join("package.json"));
+        link(Path::new("package.json"), &repo.path().join("loop"));
+        let report = scan(repo.path());
+        assert_ne!(report.verdict(), crate::report::Verdict::Allow);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_is_itself_a_symlink_still_follows_inside_links() {
+        let real = tempfile::tempdir().unwrap();
+        fs::write(real.path().join("a.txt"), POSTINSTALL).unwrap();
+        link(Path::new("a.txt"), &real.path().join("package.json"));
+        let holder = tempfile::tempdir().unwrap();
+        let root_link = holder.path().join("repo");
+        link(real.path(), &root_link);
+        let report = scan(&root_link);
+        assert_eq!(report.findings()[0].rule_id, "repo/npm-lifecycle-script");
+        assert!(report.skipped().is_empty());
     }
 
     fn scan(dir: &Path) -> Report {
@@ -563,10 +705,15 @@ mod tests {
     }
 
     #[test]
-    fn a_non_utf8_target_is_reported() {
+    fn a_non_utf8_byte_does_not_stop_the_text_rules() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("package.json"), [0xff, 0xfe, b'{', b'}']).unwrap();
-        assert_unscanned(&scan(dir.path()), "package.json", SkipReason::NotUtf8);
+        let mut script = b"echo aGk= | base64 -d | sh\n# \xff\n".to_vec();
+        script.push(0xfe);
+        fs::write(dir.path().join("install.sh"), script).unwrap();
+        let report = scan(dir.path());
+        assert!(report.skipped().is_empty());
+        assert_eq!(report.findings()[0].rule_id, "repo/base64-into-shell");
+        assert_eq!(report.verdict(), crate::report::Verdict::Block);
     }
 
     #[test]
@@ -643,13 +790,5 @@ mod tests {
             .map(|f| f.rule_id.as_str())
             .collect();
         assert_eq!(ids, ["repo/base64-into-shell"]);
-    }
-
-    #[test]
-    fn unreadable_text_is_still_skipped_when_it_is_not_a_known_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("setup.py"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
-        let report = Engine::embedded().unwrap().scan_dir(dir.path()).unwrap();
-        assert_eq!(report.skipped().len(), 1);
     }
 }

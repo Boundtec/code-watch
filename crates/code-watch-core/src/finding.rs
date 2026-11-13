@@ -45,10 +45,16 @@ impl Evidence {
 
 /// Trims, truncates and replaces invisible characters, for any text taken from untrusted input.
 pub(crate) fn clean_text(text: &str) -> String {
-    text.trim()
+    sanitize(text.trim())
         .chars()
-        .map(|c| if is_invisible(c) { '?' } else { c })
         .take(MAX_EXCERPT_CHARS)
+        .collect()
+}
+
+/// Replaces invisible characters without trimming or truncating, for text that is printed whole.
+pub(crate) fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| if is_invisible(c) { '?' } else { c })
         .collect()
 }
 

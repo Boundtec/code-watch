@@ -27,7 +27,7 @@ match = { kind = "json_pointer", files = ["**/package.json"], pointers = ["/scri
 | `json_pointer` | repo files | `files` (globs), `pointers` (RFC 6901) | a pointer exists in the JSON file |
 | `file_regex` | repo files | `files`, `pattern` | the pattern matches; one finding per file, at the first match |
 | `all_regex` | repo files | `files`, `patterns` (list) | every pattern matches somewhere in the same file; the finding points at the first pattern's line |
-| `binary_file` | repo files | `files`, `formats` (`elf`, `mach_o`, `pe`) | the file starts with that format's magic bytes; the file is also scanned as text when it is valid UTF-8 (a script starting with `MZ` is not a PE file); a recognised binary is never reported as unreadable. PE needs the DOS header's `e_lfanew` to point at `PE\0\0`, and fat Mach-O needs an architecture count of 1 to 20 (a Java class file has the same `cafebabe` magic) |
+| `binary_file` | repo files | `files`, `formats` (`elf`, `mach_o`, `pe`) | the file starts with that format's magic bytes; the file is also scanned as text, with invalid UTF-8 decoded lossily (a script starting with `MZ` is not a PE file); a recognised binary is never reported as unreadable. PE needs the DOS header's `e_lfanew` to point at `PE\0\0`, and fat Mach-O needs an architecture count of 1 to 20 (a Java class file has the same `cafebabe` magic) |
 | `executable_file` | repo files | `files` | the file has a unix execute bit (never fires on non-unix hosts) |
 | `command_regex` | a command string | `pattern` | the pattern matches the command |
 
@@ -58,6 +58,14 @@ them out" is expressed: each half alone does not fire.
 | `repo/committed-binary` | warn | an ELF, Mach-O or PE file in the repo |
 | `repo/executable-source` | info | a source, data or text file with the execute bit |
 | `repo/secret-read-and-send` | warn | one script that reads `.ssh`, `.aws`, `.kube`, `.gnupg`, `.npmrc`, `.netrc`, `.git-credentials`, Docker config, the keychain or the whole environment and also makes a network call; warn because legitimate deploy scripts do both |
+
+## What a scan reads
+
+Files up to 1 MiB are decoded as text; bytes that are not valid UTF-8 become U+FFFD and the text rules still run. A symlink
+that resolves inside the scanned directory is followed and named by its link path (npm and VS Code follow it too). A link
+that resolves outside it is never read: a directory link, or a file link a text rule targets, is listed as not scanned
+(`symlink_outside_repo`), and so is a dangling link a text rule targets. The `check` command argument must be valid UTF-8;
+otherwise `code-watch` exits 3.
 
 ## Adding a rule
 
