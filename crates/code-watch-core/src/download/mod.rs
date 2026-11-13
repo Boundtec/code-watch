@@ -89,9 +89,12 @@ pub enum DownloadError {
 pub struct Subject {
     pub path: PathBuf,
     pub kind: Option<Kind>,
+    /// A pipe, socket or device: never opened, because opening one can block with no end.
+    pub special: bool,
 }
 
 /// Resolves the path (so the tools never see `..`, a link or a leading `-`) and names its kind.
+/// Only regular files are opened and only directories are listed as bundles.
 pub fn subject(path: &Path) -> Result<Subject, DownloadError> {
     let unreadable = || DownloadError::Unreadable(path.display().to_string());
     let meta = fs::metadata(path).map_err(|_| unreadable())?;
@@ -100,7 +103,10 @@ pub fn subject(path: &Path) -> Result<Subject, DownloadError> {
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    let kind = if meta.is_dir() {
+    let special = !meta.is_dir() && !meta.is_file();
+    let kind = if special {
+        None
+    } else if meta.is_dir() {
         name.ends_with(".app").then_some(Kind::App)
     } else if name.ends_with(".dmg") {
         Some(Kind::Dmg)
@@ -109,7 +115,11 @@ pub fn subject(path: &Path) -> Result<Subject, DownloadError> {
     } else {
         is_macho(&path).then_some(Kind::MachO)
     };
-    Ok(Subject { path, kind })
+    Ok(Subject {
+        path,
+        kind,
+        special,
+    })
 }
 
 /// Thin and fat Mach-O magics. `0xCAFEBABE` is also a Java class file, so it counts only when
@@ -131,10 +141,21 @@ fn is_macho(path: &Path) -> bool {
     }
 }
 
-/// Runs the checks for one file and returns the findings. A check that could not run is a `warn`
-/// finding, never silence.
+/// Runs the checks for one file and returns the findings. A signature or Gatekeeper check that
+/// could not finish blocks, so a file cannot choose to be slow or odd enough to pass; only the
+/// informational quarantine check may fail as a warning.
 pub fn analyze(subject: &Subject, tools: &dyn MacTools) -> Vec<Finding> {
     let file = subject.path.display().to_string();
+    if subject.special {
+        return vec![finding(
+            RULE_UNCHECKED,
+            Severity::Block,
+            "The file is not a regular file, so it was not checked",
+            &file,
+            "a pipe, socket or device",
+            "Do not open it; get the file from the publisher's own site.",
+        )];
+    }
     let Some(kind) = subject.kind else {
         return vec![finding(
             RULE_OTHER_KIND,
@@ -156,7 +177,7 @@ pub fn analyze(subject: &Subject, tools: &dyn MacTools) -> Vec<Finding> {
             "macOS does not check a file without the mark when it is opened.",
             "Expected for a file that did not come through a browser; the other checks still apply.",
         )),
-        Err(e) => findings.push(unchecked(&file, &e)),
+        Err(e) => findings.push(unchecked(&file, &e, Severity::Warn)),
     }
     let signature = tools.signature(&subject.path, kind);
     let signed_ok = match &signature {
@@ -177,8 +198,8 @@ pub fn analyze(subject: &Subject, tools: &dyn MacTools) -> Vec<Finding> {
             false
         }
         Err(e) => {
-            findings.push(unchecked(&file, e));
-            true
+            findings.push(unchecked(&file, e, Severity::Block));
+            false
         }
     };
     if signed_ok {
@@ -192,7 +213,7 @@ pub fn analyze(subject: &Subject, tools: &dyn MacTools) -> Vec<Finding> {
                 &why,
                 "It is not notarized or its certificate was revoked. Do not open it.",
             )),
-            Err(e) => findings.push(unchecked(&file, &e)),
+            Err(e) => findings.push(unchecked(&file, &e, Severity::Block)),
         }
     }
     findings
@@ -219,14 +240,32 @@ fn unsigned(kind: Kind, file: &str) -> Finding {
     )
 }
 
-fn unchecked(file: &str, why: &ToolError) -> Finding {
+fn unchecked(file: &str, why: &ToolError, severity: Severity) -> Finding {
+    let remediation = if severity == Severity::Block {
+        "The signature check did not finish. Do not open the file until it has been checked."
+    } else {
+        "Check the file by hand; the verdict says nothing about this check."
+    };
     finding(
         RULE_UNCHECKED,
-        Severity::Warn,
+        severity,
         "A check could not run",
         file,
         &why.to_string(),
-        "Check the file by hand; the verdict says nothing about this check.",
+        remediation,
+    )
+}
+
+/// The finding for a platform with no tools: nothing was checked, and the exit code must not
+/// look like a pass.
+pub fn unavailable(subject: &Subject) -> Finding {
+    finding(
+        RULE_UNCHECKED,
+        Severity::Warn,
+        "The download check is not available on this platform",
+        &subject.path.display().to_string(),
+        "macOS only",
+        "Nothing was checked. Verify the file by hand before opening it.",
     )
 }
 
@@ -294,6 +333,7 @@ mod tests {
         Subject {
             path: PathBuf::from("/d/f"),
             kind,
+            special: false,
         }
     }
 
@@ -407,40 +447,83 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_signature_check_warns_and_gatekeeper_still_runs() {
+    fn a_signature_check_that_could_not_finish_blocks_and_gatekeeper_is_not_asked() {
+        let errors = [
+            timed_out(),
+            ToolError::Missing("codesign"),
+            ToolError::Failed("codesign", "exit code 9".into()),
+        ];
+        for error in errors {
+            let fake = Fake {
+                signature: Err(error),
+                ..Fake::good()
+            };
+            assert_eq!(
+                run(&fake, Kind::App),
+                [(RULE_UNCHECKED.into(), Severity::Block)]
+            );
+            assert!(!fake.calls.borrow().contains(&"gatekeeper"));
+        }
+    }
+
+    #[test]
+    fn a_gatekeeper_check_that_could_not_finish_blocks_for_every_error_and_kind() {
+        let errors = [
+            timed_out(),
+            ToolError::Missing("spctl"),
+            ToolError::Failed("spctl", "exit code 1".into()),
+        ];
+        for error in errors {
+            for kind in [Kind::App, Kind::Dmg, Kind::Pkg, Kind::MachO] {
+                let fake = Fake {
+                    gatekeeper: Err(error.clone()),
+                    ..Fake::good()
+                };
+                assert_eq!(run(&fake, kind), [(RULE_UNCHECKED.into(), Severity::Block)]);
+            }
+        }
+    }
+
+    #[test]
+    fn both_checks_timing_out_blocks_with_a_plain_reason() {
         let fake = Fake {
-            signature: Err(ToolError::Missing("codesign")),
-            ..Fake::good()
-        };
-        assert_eq!(
-            run(&fake, Kind::App),
-            [(RULE_UNCHECKED.into(), Severity::Warn)]
-        );
-        assert!(fake.calls.borrow().contains(&"gatekeeper"));
-        let rejected = Fake {
             signature: Err(timed_out()),
-            gatekeeper: Ok(Gatekeeper::Rejected("no".into())),
+            gatekeeper: Err(timed_out()),
             ..Fake::good()
         };
-        assert_eq!(
-            run(&rejected, Kind::App),
-            [
-                (RULE_UNCHECKED.into(), Severity::Warn),
-                (RULE_NOT_ACCEPTED.into(), Severity::Block)
-            ]
+        let found = analyze(&subj(Some(Kind::App)), &fake);
+        assert!(found.iter().any(|f| f.severity == Severity::Block));
+        assert!(found.iter().all(|f| f.rule_id == RULE_UNCHECKED));
+        assert!(
+            found
+                .iter()
+                .any(|f| f.remediation.contains("signature check did not finish"))
         );
     }
 
     #[test]
-    fn a_failed_gatekeeper_check_warns() {
-        let fake = Fake {
-            gatekeeper: Err(ToolError::Failed("spctl", "exit code 1".into())),
-            ..Fake::good()
+    fn a_file_that_is_not_regular_blocks_without_asking_any_tool() {
+        let fake = Fake::good();
+        let special = Subject {
+            special: true,
+            ..subj(None)
         };
+        let found: Vec<_> = analyze(&special, &fake)
+            .into_iter()
+            .map(|f| (f.rule_id, f.severity))
+            .collect();
+        assert_eq!(found, [(RULE_UNCHECKED.into(), Severity::Block)]);
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn no_tools_is_a_warning_finding_not_silence() {
+        let f = unavailable(&subj(None));
         assert_eq!(
-            run(&fake, Kind::Pkg),
-            [(RULE_UNCHECKED.into(), Severity::Warn)]
+            (f.rule_id.as_str(), f.severity),
+            (RULE_UNCHECKED, Severity::Warn)
         );
+        assert!(f.title.contains("not available on this platform"));
     }
 
     #[test]
@@ -547,6 +630,27 @@ mod tests {
             None
         );
         assert_eq!(kind_of(&write(d.path(), "short", &[0xCF, 0xFA])), None);
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_is_never_opened_and_is_marked_special_whatever_its_name() {
+        let d = tempfile::tempdir().unwrap();
+        for name in ["pipe", "x.dmg", "x.pkg"] {
+            let path = d.path().join(name);
+            mkfifo(&path);
+            let s = subject(&path).unwrap();
+            assert!(s.special && s.kind.is_none(), "{name}");
+        }
     }
 
     #[test]

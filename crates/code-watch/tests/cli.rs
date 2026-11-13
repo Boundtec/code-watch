@@ -539,8 +539,10 @@ fn download_off_macos_says_the_layer_was_skipped() {
     let file = dir.path().join("a.dmg");
     fs::write(&file, "x").unwrap();
     let out = code_watch().arg("download").arg(&file).output().unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("download skipped (macOS only)"));
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("download skipped (macOS only)"));
+    assert!(text.contains("download/unchecked"));
 }
 
 #[cfg(target_os = "macos")]

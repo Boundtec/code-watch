@@ -182,6 +182,16 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn every_tool_is_called_by_an_absolute_system_path() {
+        for tool in [XATTR, CODESIGN, SPCTL, PKGUTIL] {
+            assert!(
+                tool.starts_with("/usr/bin/") || tool.starts_with("/usr/sbin/"),
+                "{tool}"
+            );
+        }
+    }
+
     // quarantine
 
     #[test]

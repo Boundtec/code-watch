@@ -69,7 +69,9 @@ fn without_tools_the_layer_is_skipped_with_its_reason_in_text_and_json() {
         .check_download(&d.path().join("a.dmg"), None, &Allowlists::empty())
         .unwrap();
     assert_eq!(r.layers()[&Layer::Download], LayerStatus::Skipped);
-    assert!(r.findings().is_empty());
+    assert_eq!(r.findings().len(), 1);
+    assert_eq!(r.findings()[0].rule_id, "download/unchecked");
+    assert_eq!(r.verdict(), Verdict::Warn);
     assert!(render::to_human(&r).contains("download skipped (macOS only)"));
     let json: serde_json::Value = serde_json::from_str(&render::to_json(&r).unwrap()).unwrap();
     assert_eq!(json["layers"]["download"], "skipped");
@@ -134,6 +136,29 @@ fn another_kind_is_allowed_with_the_layer_listed_as_ran() {
     assert_eq!(r.verdict(), Verdict::Allow);
     assert_eq!(r.findings()[0].severity, Severity::Info);
     assert_eq!(r.layers()[&Layer::Download], LayerStatus::Ran);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pipe_blocks_through_the_engine_and_no_tool_is_asked() {
+    let d = tempfile::tempdir().unwrap();
+    for name in ["pipe", "x.dmg"] {
+        let path = d.path().join(name);
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let accepting = Fake {
+            quarantine: true,
+            signature: Signature::Valid,
+        };
+        let r = engine()
+            .check_download(&path, Some(&accepting), &Allowlists::empty())
+            .unwrap();
+        assert_eq!(r.verdict(), Verdict::Block, "{name}");
+        assert_eq!(r.findings()[0].rule_id, "download/unchecked", "{name}");
+    }
 }
 
 #[cfg(target_os = "macos")]

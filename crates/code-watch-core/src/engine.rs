@@ -268,7 +268,7 @@ impl Engine {
     }
 
     /// Checks a downloaded file. `tools` is `None` where the layer is not available (not macOS):
-    /// the report then says the layer was skipped and why, never that it passed.
+    /// the report then says the layer was skipped and carries a warning finding, never a pass.
     pub fn check_download(
         &self,
         path: &Path,
@@ -276,14 +276,15 @@ impl Engine {
         allow: &Allowlists,
     ) -> Result<Report, DownloadError> {
         let subject = download::subject(path)?;
-        let Some(tools) = tools else {
-            return Ok(Report::from_download(
-                Vec::new(),
+        let (findings, status) = match tools {
+            Some(tools) => (download::analyze(&subject, tools), DownloadStatus::Ran),
+            None => (
+                vec![download::unavailable(&subject)],
                 DownloadStatus::Skipped("macOS only".into()),
-            ));
+            ),
         };
-        let applied = allow.apply(download::analyze(&subject, tools), &self.known_rule_ids());
-        Ok(Report::from_download(applied.kept, DownloadStatus::Ran)
+        let applied = allow.apply(findings, &self.known_rule_ids());
+        Ok(Report::from_download(applied.kept, status)
             .with_allowlist(applied.suppressed, applied.warnings))
     }
 

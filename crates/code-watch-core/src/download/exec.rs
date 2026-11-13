@@ -2,13 +2,14 @@
 
 use std::ffi::OsString;
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_OUTPUT: usize = 64 * 1024;
+const WAIT_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
@@ -67,6 +68,7 @@ impl Exec for ProcessExec {
     fn run(&self, program: &str, args: &[OsString]) -> Result<Output, ExecError> {
         let mut child = Command::new(program)
             .args(args)
+            .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -103,13 +105,29 @@ impl Exec for ProcessExec {
                 Stream::Err => stderr = bytes,
             }
         }
-        let status = child.wait().map_err(|e| ExecError::Io(e.to_string()))?;
+        let Some(status) = wait_until(&mut child, deadline)? else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ExecError::TimedOut);
+        };
         Ok(Output {
             code: status.code(),
             stdout,
             stderr,
             truncated,
         })
+    }
+}
+
+/// A tool can close its pipes and stay alive, so the exit is awaited against the same deadline.
+fn wait_until(child: &mut Child, deadline: Instant) -> Result<Option<ExitStatus>, ExecError> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) if Instant::now() >= deadline => return Ok(None),
+            Ok(None) => thread::sleep(WAIT_POLL),
+            Err(e) => return Err(ExecError::Io(e.to_string())),
+        }
     }
 }
 
@@ -136,6 +154,18 @@ mod tests {
     fn a_process_that_outlives_the_timeout_is_killed_and_reported() {
         let r = exec(100, 1024).run("/bin/sleep", &os(&["30"]));
         assert_eq!(r, Err(ExecError::TimedOut));
+    }
+
+    #[test]
+    fn a_process_that_closes_its_pipes_and_stays_alive_is_killed_at_the_deadline() {
+        let r = exec(100, 1024).run("/bin/sh", &os(&["-c", "exec >&- 2>&-; exec /bin/sleep 30"]));
+        assert_eq!(r, Err(ExecError::TimedOut));
+    }
+
+    #[test]
+    fn the_child_starts_with_an_empty_environment() {
+        let r = exec(5000, 1024).run("/usr/bin/env", &[]).unwrap();
+        assert!(r.stdout.is_empty());
     }
 
     #[test]
