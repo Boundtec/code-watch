@@ -209,7 +209,9 @@ dependencies = [
  "clap",
  "code-watch-core",
  "dirs",
+ "serde",
  "serde_json",
+ "shlex",
  "tempfile",
 ]
 

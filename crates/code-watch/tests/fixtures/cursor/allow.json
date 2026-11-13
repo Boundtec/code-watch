@@ -1,0 +1,1 @@
+{"command":"ls -la","cwd":"/nonexistent-cw-dir","sandbox":false,"hook_event_name":"beforeShellExecution","conversation_id":"c1"}

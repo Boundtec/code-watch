@@ -287,13 +287,22 @@ impl Rule {
         }
     }
 
-    pub fn check_command(&self, command: &str) -> Vec<Finding> {
+    /// Matches the command text, then each unquoted view of it; at most one finding, with the
+    /// original command as evidence.
+    pub fn check_command(&self, command: &str, views: &[String]) -> Vec<Finding> {
         match &self.matcher {
-            Matcher::CommandRegex(regex) if regex.is_match(command) => {
+            Matcher::CommandRegex(regex)
+                if regex.is_match(command) || views.iter().any(|v| regex.is_match(v)) =>
+            {
                 vec![self.finding(Evidence::new(None, None, command))]
             }
             _ => Vec::new(),
         }
+    }
+
+    /// The finding of this command rule for a command that a parsed check, not the pattern, caught.
+    pub fn command_finding(&self, command: &str) -> Finding {
+        self.finding(Evidence::new(None, None, command))
     }
 
     fn finding(&self, evidence: Evidence) -> Finding {

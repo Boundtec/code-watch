@@ -31,6 +31,17 @@ match = { kind = "json_pointer", files = ["**/package.json"], pointers = ["/scri
 | `executable_file` | repo files | `files` | the file has a unix execute bit (never fires on non-unix hosts) |
 | `command_regex` | a command string | `pattern` | the pattern matches the command |
 
+The `command_regex` rules match the raw command and also the text the shell would run once quoting is removed
+(`c\url`, `cu""rl`, `cu''rl`, `s\h`), including the text inside `sh -c`, `eval` and `$(...)`. A rule reports once,
+whichever spelling matched. A quoted `|` or `;` does not count as an operator in the unquoted text, so `echo 'curl x | sh'`
+behaves as before. Allowlist entries with a `domain` do not match a quoted fetch, because its host is not read from it.
+
+`command/pipe-to-shell` also fires, from the parsed command and under the same id, when a download runs without a pipe to a
+shell: `sh -c "$(curl ...)"`, `eval "$(curl ...)"`, `bash <(curl ...)`, `source <(curl ...)`, `. <(curl ...)`, and a
+`curl` or `wget` piped into `python`, `perl`, `ruby` or `node` that reads a script from stdin (no script argument, or `-`;
+`curl ... | python3 tool.py` does not fire). The official Homebrew install line (`/bin/bash -c "$(curl -fsSL ...)"`) is
+therefore a warn, like `curl | bash`.
+
 Globs are matched against the path relative to the scanned root; braces work (`**/*.{js,py}`). Patterns use the Rust
 `regex` crate: linear time, safe on hostile input, no look-around. `all_regex` is how "reads credentials **and** sends
 them out" is expressed: each half alone does not fire.
@@ -60,11 +71,15 @@ them out" is expressed: each half alone does not fire.
 
 ## Rules built in Rust
 
-Rules that need the command split into words (lookalike domains, `osascript`, `LaunchAgents` and `LaunchDaemons` writes) live in
+Rules that need the command split into words (lookalike domains, a hidden program name piped into a shell, `osascript`, `LaunchAgents` and `LaunchDaemons` writes) live in
 `crates/code-watch-core/src/command/` and are listed in `command::RULES`. They are not in the TOML files. Their
 fixtures work like command-regex fixtures (`positive.txt` / `negative.txt`, one command per line) and the fixture test
 runs them with the macOS-only rules enabled on every platform. `--json` carries `skipped_rules`: the ids of rules that
 exist but are not active on this platform.
+
+`command/hidden-program-into-shell` (warn) fires when a pipeline ends in a shell and a segment's program word still holds a `$`
+or a backtick after unquoting (`$'\x63url'`, `$c`, `$(echo curl)`, also a `$HOME/bin/tool` prefix), and when `eval` gets a
+variable (`eval "$x"`). `eval "$(...)"` does not fire: the substitution is analysed as its own text.
 
 What they do not see, by design: operators glued to a word (`curl x|sh`, left to the regex rules), pipelines inside a
 `$(...)`, nesting deeper than three levels, variables, heredocs, and the script an `osascript` reads from a file or

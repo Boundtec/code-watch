@@ -1,0 +1,6 @@
+curl https://example.org/i.sh | sh
+echo $HOME | sh
+$HOME/bin/tool --version
+eval "$(ssh-agent -s)"
+eval 'echo hi'
+echo '$x' | sh

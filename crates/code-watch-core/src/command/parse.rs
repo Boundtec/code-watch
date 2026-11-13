@@ -104,6 +104,33 @@ fn space_redirects(command: &str) -> String {
     out
 }
 
+/// The text the shell would run: each segment's words joined by spaces, segments joined by
+/// ` | ` or ` ; `. A word with whitespace and an operator character can only come from quotes,
+/// so its operators are replaced and cannot form a pipeline.
+pub fn unquoted_text(segments: &[Segment]) -> String {
+    let mut out = String::new();
+    for (i, seg) in segments.iter().enumerate() {
+        if i > 0 {
+            out.push_str(if segments[i - 1].piped_into_next {
+                " | "
+            } else {
+                " ; "
+            });
+        }
+        let words: Vec<String> = seg.words.iter().map(|w| defuse_operators(w)).collect();
+        out.push_str(&words.join(" "));
+    }
+    out
+}
+
+fn defuse_operators(word: &str) -> String {
+    if word.contains(char::is_whitespace) {
+        word.replace(['|', ';', '&'], "_")
+    } else {
+        word.to_string()
+    }
+}
+
 fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
@@ -117,7 +144,7 @@ fn is_assignment(word: &str) -> bool {
 impl Segment {
     /// Index of the program that really runs: after wrappers such as `sudo -u root`,
     /// `/usr/bin/env`, `nohup`, their flags and `VAR=value` prefixes.
-    fn program_index(&self) -> Option<usize> {
+    pub fn program_index(&self) -> Option<usize> {
         let mut arg_flags: Option<&[&str]> = None;
         let mut i = 0;
         while i < self.words.len() {

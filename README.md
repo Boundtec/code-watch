@@ -36,9 +36,10 @@ commands are matched, not run.
 | `repo/vscode-folderopen-task` | block | a VS Code task that runs when the folder opens |
 | `repo/base64-into-shell` | block | base64 decoded straight into a shell in scripts and manifests |
 | `command/base64-into-shell` | block | the same in a command |
-| `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell |
+| `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell or a stdin-reading interpreter, or run through `$(...)` or `<(...)` |
 | `command/quarantine-removal` | warn | `xattr` removing or rewriting the macOS quarantine flag |
 | `command/lookalike-download-domain` | block / warn | `curl` or `wget` fetching from a domain that imitates a well-known one; block when piped into a shell, warn otherwise |
+| `command/hidden-program-into-shell` | warn | a pipeline into a shell whose program name is hidden behind `$` or a backtick (`$c x \| sh`), or `eval` of a variable |
 | `command/osascript-password-prompt` | block | `osascript` showing a dialog that asks for a password (macOS only) |
 | `command/launchagent-write` | block | a write into a `LaunchAgents` or `LaunchDaemons` folder (macOS only) |
 | `repo/setup-py-install-hook` | warn | `setup.py` that runs code at install time |
@@ -90,6 +91,17 @@ leaves your git config as it was. It refuses rather than overwrite a template di
 the public-registry packages they pin. Only package names, versions and ecosystems are sent. Answers are cached for 24
 hours in `~/.cache/code-watch/osv/`; `scan --offline` uses only that cache and `scan --no-osv` turns the layer off.
 A lookup that fails is reported, never treated as clean. Details in [docs/osv.md](docs/osv.md).
+
+## Agent hooks
+
+`code-watch adapter <agent>` answers an agent's pre-command hook with the same check as `code-watch check`; a block is a
+deny and a warning is an ask. `code-watch install-adapter <agent>` prints the settings snippet to merge in.
+
+- **Claude Code**: `PreToolUse` on `Bash` in `~/.claude/settings.json`; clean commands get the empty reply.
+- **Cursor**: `beforeShellExecution` in `~/.cursor/hooks.json`; Cursor has no "no opinion" reply, so a clean command is an `ask` (Cursor's own prompt decides; `--cursor-clean allow` for auto-run mode).
+- **Codex CLI**: `PreToolUse` on `Bash` in `~/.codex/hooks.json`; Codex cannot ask, so a warning is denied with the allowlist entry that lets it through (`--codex-warn allow` to only report it).
+
+Commands the adapter cannot check are denied (`--fail-open` to allow them). Details in [docs/adapters.md](docs/adapters.md).
 
 ## Layers
 
