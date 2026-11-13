@@ -2,7 +2,7 @@
 
 A local guard that checks your machine **before** risky code runs: a repository you just cloned, a shell command an
 agent is about to execute, an install, a download. Open source (Apache-2.0), written in Rust, one binary for macOS and
-Linux.
+Linux. Windows is not supported.
 
 > Status: early. The skeleton ships the engine, the CLI and the first repo and command rules. See
 > [DESIGN.md](DESIGN.md) for the plan.
@@ -26,13 +26,13 @@ commands are matched, not run.
 | 0 | clean |
 | 1 | warn |
 | 2 | block |
-| 3 | error or bad usage |
+| 3 | error or bad usage (including a `check` command that is not valid UTF-8) |
 
 ## Rules
 
 | Id | Severity | Catches |
 |---|---|---|
-| `repo/npm-lifecycle-script` | warn | `preinstall`, `install` or `postinstall` in `package.json` |
+| `repo/npm-lifecycle-script` | warn | `preinstall`, `install`, `postinstall`, `prepare`, `preprepare` or `postprepare` in `package.json` |
 | `repo/vscode-folderopen-task` | block | a VS Code task that runs when the folder opens |
 | `repo/base64-into-shell` | block | base64 decoded straight into a shell in scripts and manifests |
 | `command/base64-into-shell` | block | the same in a command |

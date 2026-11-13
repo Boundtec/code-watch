@@ -193,6 +193,12 @@ fn installing_twice_changes_nothing_the_second_time() {
     assert!(both(&out).contains("already installed"));
     assert_eq!(fs::read(sb.gitconfig()).unwrap(), config);
     assert_eq!(fs::read(sb.template_hook()).unwrap(), hook);
+    let leftovers: Vec<_> = fs::read_dir(sb.template_hook().parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(leftovers, ["post-checkout"]);
 }
 
 #[test]
