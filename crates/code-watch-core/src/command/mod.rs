@@ -122,7 +122,34 @@ const MAX_DEPTH: usize = 3;
 /// Runs the rules that need a parsed command. `macos` says whether the macOS-only rules are
 /// active; the engine passes the build platform, tests pass both.
 pub fn analyze(command: &str, macos: bool) -> Vec<Finding> {
+    analyze_with_commands(command, macos).0
+}
+
+/// A simple command found in the text: its words from the program on, and the directory the
+/// text set for it with `cd`, if any (relative when the text's `cd` was).
+pub struct SimpleCommand {
+    pub words: Vec<String>,
+    pub cwd: Option<String>,
+}
+
+/// `analyze`, plus every simple command it flattened, so a caller that needs them does not
+/// parse the text twice.
+pub fn analyze_with_commands(command: &str, macos: bool) -> (Vec<Finding>, Vec<SimpleCommand>) {
     let flat = analysis::flatten(command);
+    let commands = flat
+        .occurrences
+        .iter()
+        .filter_map(|occ| {
+            let start = occ.simple.program_index()?;
+            Some(SimpleCommand {
+                words: occ.simple.words[start..]
+                    .iter()
+                    .map(|w| w.text.clone())
+                    .collect(),
+                cwd: occ.cwd.clone(),
+            })
+        })
+        .collect();
     let mut findings = Vec::new();
     for occ in &flat.occurrences {
         findings.extend(lookalike(occ, command));
@@ -143,7 +170,7 @@ pub fn analyze(command: &str, macos: bool) -> Vec<Finding> {
         seen.push(key);
         fresh
     });
-    findings
+    (findings, commands)
 }
 
 /// Ids of the rules that exist but are not active on this platform.

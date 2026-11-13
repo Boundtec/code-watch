@@ -88,6 +88,12 @@ download inside them counts as feeding a shell.
 Variables and `cd` that the command text sets itself are followed, and so are programs that run text or code (`ssh`, `docker run ... sh -c`, `python3 -c`, a file a download wrote and a later command runs). Limits: values only known at run time are not followed, and other layers and your own review still apply. The macOS-only rules run only on macOS; elsewhere `check` lists them under `skipped_rules` in
 `--json` and in the human footer.
 
+## Before an install
+
+`npm`, `pnpm`, `yarn`, `pip` and `brew` installs are shown before they run: the install scripts of the project and its
+dependencies, source builds, global packages and unknown Homebrew taps. A script that downloads or decodes and runs
+code blocks; any other script warns. Only files on disk are read. Details in [docs/install-layer.md](docs/install-layer.md).
+
 ## Allowlists
 
 `~/.config/code-watch/allow.toml` (or `$XDG_CONFIG_HOME`) decides which findings are hidden; a repo's own

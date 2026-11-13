@@ -313,13 +313,19 @@ fn simple_command(simple: &ast::SimpleCommand) -> Parsed<Simple> {
     let mut words = Vec::new();
     let mut attached = Attached::default();
     for item in simple.prefix.iter().flat_map(|p| &p.0) {
-        item_into(item, &mut words, &mut attached)?;
+        item_into(item, false, &mut words, &mut attached)?;
     }
     if let Some(name) = &simple.word_or_name {
         words.push(convert_word(name)?);
     }
+    let declaration = words.last().is_some_and(|w| {
+        matches!(
+            w.text.as_str(),
+            "export" | "declare" | "typeset" | "local" | "readonly"
+        )
+    });
     for item in simple.suffix.iter().flat_map(|s| &s.0) {
-        item_into(item, &mut words, &mut attached)?;
+        item_into(item, !declaration, &mut words, &mut attached)?;
     }
     split_env_string(&mut words);
     Ok(Simple { words, attached })
@@ -349,15 +355,25 @@ fn split_env_string(words: &mut Vec<Word>) {
     words.splice(flag..=flag + 1, split);
 }
 
+/// After the name of a command that is not a declaration builtin, a `name=value` word is an argument
+/// as well as an assignment the parser reports (`pip install requests==2.0`); it stays among the
+/// words when it holds no substitution.
 fn item_into(
     item: &ast::CommandPrefixOrSuffixItem,
+    argument: bool,
     words: &mut Vec<Word>,
     attached: &mut Attached,
 ) -> Parsed {
     match item {
         ast::CommandPrefixOrSuffixItem::Word(w) => words.push(convert_word(w)?),
-        ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, _) => {
+        ast::CommandPrefixOrSuffixItem::AssignmentWord(assignment, original) => {
             assignment_into(assignment, attached)?;
+            if argument {
+                let word = convert_word(original)?;
+                if word.subs.is_empty() {
+                    words.push(word);
+                }
+            }
         }
         ast::CommandPrefixOrSuffixItem::IoRedirect(r) => redirect(r, attached)?,
         ast::CommandPrefixOrSuffixItem::ProcessSubstitution(kind, sub) => {

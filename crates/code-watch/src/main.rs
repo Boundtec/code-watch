@@ -337,7 +337,7 @@ fn check_command(
         .filter(|d| use_repo && d.is_dir())
         .and_then(find_repo_root);
     let allow = Allowlists::load(user_dir, repo.as_deref())?;
-    Ok(Engine::embedded()?.check_command_with(command, &allow))
+    Ok(Engine::embedded()?.check_command_in(command, cwd.filter(|d| d.is_dir()), &allow))
 }
 
 fn shims(action: &ShimsCmd) -> ExitCode {

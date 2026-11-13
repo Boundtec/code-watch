@@ -9,6 +9,8 @@ use ignore::WalkBuilder;
 use crate::allow::Allowlists;
 use crate::command;
 use crate::download::{self, DownloadError, DownloadStatus, MacTools};
+use crate::finding::{Finding, Severity};
+use crate::install;
 use crate::llm::{self, LlmMode, LlmOutcome};
 use crate::osv::{self, Cache, OsvClient, OsvMode, RULE_IDS};
 use crate::report::{Report, SkipReason, Skipped};
@@ -274,6 +276,7 @@ impl Engine {
             .chain(rust_rules)
             .chain(RULE_IDS.iter().map(|id| id.to_string()))
             .chain(download::RULE_IDS.iter().map(|id| id.to_string()))
+            .chain(install::RULE_IDS.iter().map(|id| id.to_string()))
             .collect()
     }
 
@@ -303,8 +306,45 @@ impl Engine {
     }
 
     /// Like `check_command`, then hides the findings `allow` allows; they stay listed in the report.
+    /// Without a directory no install can be judged, so none is reported.
     pub fn check_command_with(&self, command: &str, allow: &Allowlists) -> Report {
+        self.check_command_in(command, None, allow)
+    }
+
+    /// Like `check_command_with`, and where `cwd` is known also shows what an install in the
+    /// command (`npm i`, `pip install`, `brew install`) would run, judged against that directory.
+    pub fn check_command_in(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        allow: &Allowlists,
+    ) -> Report {
         let macos = cfg!(target_os = "macos");
+        let (mut findings, commands) = self.command_analysis(command, macos);
+        if let Some(cwd) = cwd {
+            for found in &commands {
+                let here = match &found.cwd {
+                    Some(dir) => cwd.join(dir),
+                    None => cwd.to_path_buf(),
+                };
+                findings.extend(self.install_findings(std::slice::from_ref(&found.words), &here));
+            }
+        }
+        let applied = allow.apply(findings, &self.known_rule_ids());
+        Report::from_rules(applied.kept)
+            .with_skipped_rules(command::skipped_rules(macos))
+            .with_allowlist(applied.suppressed, applied.warnings)
+    }
+
+    fn command_findings(&self, command: &str, macos: bool) -> Vec<Finding> {
+        self.command_analysis(command, macos).0
+    }
+
+    fn command_analysis(
+        &self,
+        command: &str,
+        macos: bool,
+    ) -> (Vec<Finding>, Vec<command::SimpleCommand>) {
         let mut findings: Vec<_> = self
             .rules
             .rules()
@@ -312,12 +352,37 @@ impl Engine {
             .filter(|r| r.target() == Target::Command)
             .flat_map(|r| r.check_command(command))
             .collect();
-        findings.extend(command::analyze(command, macos));
+        let (analysed, commands) = command::analyze_with_commands(command, macos);
+        findings.extend(analysed);
         command::stamp_fetch_domain(&mut findings, command);
-        let applied = allow.apply(findings, &self.known_rule_ids());
-        Report::from_rules(applied.kept)
-            .with_skipped_rules(command::skipped_rules(macos))
-            .with_allowlist(applied.suppressed, applied.warnings)
+        (findings, commands)
+    }
+
+    /// What the installs among `commands` (each the words of one simple command, from the
+    /// program on) would run, judged against `cwd`. Script texts are judged by the command rules.
+    pub fn install_findings(&self, commands: &[Vec<String>], cwd: &Path) -> Vec<Finding> {
+        // A script that downloads and runs (pipe-to-shell is only a warning for a typed command)
+        // or decodes and runs is a block here: nobody typed it.
+        let script_blocks = |text: &str| {
+            self.command_findings(text, cfg!(target_os = "macos"))
+                .iter()
+                .any(|f| f.severity == Severity::Block || f.rule_id == "command/pipe-to-shell")
+        };
+        let setup_py_flagged = |text: &str| {
+            self.rules
+                .rules()
+                .iter()
+                .filter(|r| r.id == "repo/setup-py-install-hook")
+                .any(|r| !r.check_file(Path::new("setup.py"), text).is_empty())
+        };
+        install::analyze(
+            commands,
+            cwd,
+            &install::Judge {
+                script_blocks: &script_blocks,
+                setup_py_flagged: &setup_py_flagged,
+            },
+        )
     }
 }
 

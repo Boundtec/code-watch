@@ -6,6 +6,7 @@ pub mod command;
 pub mod download;
 pub mod engine;
 pub mod finding;
+pub mod install;
 pub mod llm;
 mod names;
 pub mod osv;
