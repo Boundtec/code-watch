@@ -386,15 +386,45 @@ fn gemini_and_opencode_deny_a_warning_and_say_what_lets_it_through() {
 }
 
 #[test]
-fn gemini_warn_allow_gives_no_opinion_and_the_reason_on_stderr_but_never_softens_a_block() {
-    for agent in ["gemini", "opencode"] {
-        let flags = ["--gemini-warn", "allow"];
+fn the_warn_flag_of_gemini_and_opencode_gives_no_opinion_and_the_reason_on_stderr_but_never_softens_a_block()
+ {
+    for (agent, flag) in [("gemini", "--gemini-warn"), ("opencode", "--opencode-warn")] {
+        let flags = [flag, "allow"];
         let r = run(agent, &flags, &fixture(agent, "warn"));
         assert_eq!((r.code, r.reply()), (Some(0), None), "{agent}");
         assert!(r.stderr.contains("code-watch warns about this command"));
         let r = run(agent, &flags, &fixture(agent, "block"));
         deny_reason(&r.reply().unwrap());
     }
+}
+
+#[test]
+fn each_agent_only_listens_to_its_own_warn_flag() {
+    for (agent, other) in [("gemini", "--opencode-warn"), ("opencode", "--gemini-warn")] {
+        let r = run(agent, &[other, "allow"], &fixture(agent, "warn"));
+        deny_reason(&r.reply().unwrap());
+    }
+}
+
+#[test]
+fn the_opencode_warn_choice_is_baked_into_the_plugin_and_refused_for_other_agents() {
+    let install = |args: &[&str]| {
+        Command::cargo_bin("code-watch")
+            .unwrap()
+            .arg("install-adapter")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let printed = install(&["opencode", "--print", "--opencode-warn", "allow"]);
+    let text = String::from_utf8(printed.stdout).unwrap();
+    assert!(text.contains(r#""--opencode-warn","allow"]"#));
+    assert_eq!(
+        install(&["gemini", "--opencode-warn", "allow"])
+            .status
+            .code(),
+        Some(3)
+    );
 }
 
 #[test]

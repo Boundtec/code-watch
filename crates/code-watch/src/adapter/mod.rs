@@ -59,6 +59,7 @@ pub struct Policy {
     pub fail: FailMode,
     pub codex_warn: WarnAnswer,
     pub gemini_warn: WarnAnswer,
+    pub opencode_warn: WarnAnswer,
     pub cursor_clean: CursorClean,
 }
 
@@ -98,7 +99,7 @@ fn adapter_for(agent: Agent) -> &'static dyn Adapter {
         Agent::Cursor => &cursor::Cursor,
         Agent::Codex => &codex::Codex,
         Agent::Gemini => &gemini::Gemini,
-        Agent::Opencode => &gemini::Opencode,
+        Agent::Opencode => &opencode::Opencode,
     }
 }
 
@@ -283,6 +284,7 @@ mod tests {
             fail,
             codex_warn: WarnAnswer::Deny,
             gemini_warn: WarnAnswer::Deny,
+            opencode_warn: WarnAnswer::Deny,
             cursor_clean: CursorClean::Ask,
         };
         let closed = handle(&Panics, Ok(vec![]), &policy(FailMode::Closed), None);

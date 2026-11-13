@@ -94,7 +94,7 @@ and exits. Adapters and shims contain no rules.
 | agent adapters | each one is a tiny `code-watch adapter <agent>` subcommand that reads that agent's hook JSON on stdin, calls `check`, and prints that agent's response format |
 | PATH shims | `code-watch shims install <dir>` links `git`, `npm`, `pnpm`, `yarn`, `pip`, `brew`, `curl` to the binary, which dispatches on argv[0]: it checks its own argv, then execs the first real tool on `PATH` that is not a code-watch binary |
 
-Adding an agent = one new adapter module implementing `trait Adapter { fn parse(stdin) -> Command; fn render(Report) -> Output; }`.
+Adding an agent = one new adapter module implementing `trait Adapter { fn parse(&self, stdin: &[u8]) -> Result<Call>; fn reply(&self, Decision, &Policy) -> Reply; }`.
 
 ### Exit codes and output
 
@@ -145,9 +145,12 @@ No async runtime anywhere. `cargo-deny` runs in CI to keep the license list hone
 Update 2026-11-13 (slice 11): Gemini CLI `BeforeTool` is as listed below, with no `ask` decision (only `allow`,
 `deny`, `block`), so a warning is a deny that says how to allow it; the OpenCode docs now describe a different plugin
 API (`Plugin.define`) without hook details, so the plugin follows the older `tool.execute.before` shape that
-third-party plugins use and is untested against a live OpenCode. Codex CLI parses `ask` for `PreToolUse` but does not support it yet, so its adapter answers a warning
-with a deny (`--codex-warn allow` reports it instead); Claude Code hooks accept `onFailure: "block"` (v2.1.295+) and a
-`defer` decision; Cursor has no "no opinion" reply, so a clean command is an `ask` unless `--cursor-clean allow`.
+third-party plugins use and is untested against a live OpenCode. OpenCode cannot ask either, so a warning is denied
+unless the plugin is installed with `--opencode-warn allow`.
+
+Codex CLI parses `ask` for `PreToolUse` but does not support it yet, so its adapter answers a warning
+with a deny (`--codex-warn allow` reports it instead). Claude Code hooks accept `onFailure: "block"` (v2.1.295+) and a
+`defer` decision. Cursor has no "no opinion" reply, so a clean command is an `ask` unless `--cursor-clean allow`.
 
 All five let the adapter block before a shell command runs except where noted. Each adapter is `code-watch adapter <name>`:
 read the JSON on stdin, extract the command, run `code-watch check`, translate the verdict back.
