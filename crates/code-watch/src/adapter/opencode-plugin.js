@@ -2,6 +2,7 @@
 const ARGV = __ARGV__
 const FAIL_OPEN = __FAIL_OPEN__
 const TIMEOUT_MS = 10000
+const UNCHECKED = __UNCHECKED__
 
 export const CodeWatch = async ({ directory }) => ({
   "tool.execute.before": async (input, output) => {
@@ -28,7 +29,7 @@ export const CodeWatch = async ({ directory }) => ({
       reason = String(reply.reason || "code-watch denied this command")
     } catch (e) {
       if (FAIL_OPEN) return
-      reason = "code-watch could not check this command: " + e.message
+      reason = UNCHECKED
     }
     throw new Error(reason)
   },

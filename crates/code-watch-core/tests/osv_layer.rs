@@ -785,6 +785,30 @@ fn a_repo_file_cannot_allow_a_malicious_package_on_its_own() {
 }
 
 #[test]
+fn a_repo_file_allows_a_known_vulnerability_only_when_the_scan_reads_it() {
+    let repo = lockfile_repo();
+    fs::write(
+        repo.path().join(".code-watch.toml"),
+        "schema = 1\n[[allow]]\nrule = \"osv/known-vulnerability\"\n",
+    )
+    .unwrap();
+    let client =
+        FakeOsv::answering(&["GHSA-1"]).with_record(record("GHSA-1", Some("HIGH"), "lodash", &[]));
+    for (repo_root, hidden) in [(Some(repo.path()), true), (None, false)] {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let allow = Allowlists::load(None, repo_root).unwrap();
+        let report = scan(
+            repo.path(),
+            &allow,
+            OsvMode::Live,
+            &client,
+            &cache(cache_dir.path(), &FakeClock::new()),
+        );
+        assert_eq!(report.findings().is_empty(), hidden, "{repo_root:?}");
+    }
+}
+
+#[test]
 fn the_layer_status_is_ran_skipped_with_a_reason_or_off_in_both_outputs() {
     let repo = lockfile_repo();
     let engine = Engine::embedded().unwrap();

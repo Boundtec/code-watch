@@ -310,6 +310,22 @@ fn cloning_a_repo_with_warnings_prints_them_and_succeeds() {
 }
 
 #[test]
+fn a_clone_cannot_allow_its_own_warnings_through_its_repo_file() {
+    let sb = Sandbox::new();
+    let own_file = (
+        ".code-watch.toml",
+        "schema = 1\n[[allow]]\nrule = \"repo/npm-lifecycle-script\"\n",
+    );
+    let src = sb.source_repo(&[LIFECYCLE, own_file]);
+    assert!(sb.code_watch(&["install-hook"]).status.success());
+    let (out, _) = clone(&sb, &src);
+    let shown = both(&out);
+    assert!(shown.contains("repo/npm-lifecycle-script"), "{shown}");
+    assert!(shown.contains("review them"), "{shown}");
+    assert!(!shown.contains("suppressed"), "{shown}");
+}
+
+#[test]
 fn cloning_a_blocked_repo_prints_the_verdict_and_leaves_the_clone_on_disk() {
     let sb = Sandbox::new();
     let src = sb.source_repo(&[BLOCKER]);
@@ -457,6 +473,27 @@ fn a_repo_local_hooks_path_does_not_block_the_install() {
     sb.isolate(&mut cmd);
     let out = output_of(cmd.current_dir(&repo));
     assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+}
+
+#[test]
+fn an_older_hook_is_replaced_and_the_message_says_so() {
+    let sb = Sandbox::new();
+    assert!(sb.code_watch(&["install-hook"]).status.success());
+    let old = "#!/bin/sh\n# code-watch managed hook\ncode-watch scan .\n";
+    fs::write(sb.template_hook(), old).unwrap();
+    let out = sb.code_watch(&["install-hook"]);
+    assert_eq!(out.status.code(), Some(0), "{}", both(&out));
+    assert!(
+        both(&out).contains("updated from an older version"),
+        "{}",
+        both(&out)
+    );
+    let script = fs::read_to_string(sb.template_hook()).unwrap();
+    assert!(script.contains("# code-watch managed hook v2"));
+    assert!(script.contains("scan --user-allow-only ."));
+    let again = sb.code_watch(&["install-hook"]);
+    assert!(both(&again).contains("hook refreshed"), "{}", both(&again));
+    assert!(!both(&again).contains("older version"));
 }
 
 #[test]

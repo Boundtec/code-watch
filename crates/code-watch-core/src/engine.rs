@@ -306,13 +306,7 @@ mod tests {
     }
 
     fn allow_domain(rule: &str, domain: &str) -> Allowlists {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join(".code-watch.toml"),
-            format!("schema = 1\n[[allow]]\nrule = \"{rule}\"\ndomain = \"{domain}\"\n"),
-        )
-        .unwrap();
-        Allowlists::load(None, Some(dir.path())).unwrap()
+        allow_domain_as_user(rule, domain)
     }
 
     fn check(command: &str, allow: &Allowlists) -> Report {

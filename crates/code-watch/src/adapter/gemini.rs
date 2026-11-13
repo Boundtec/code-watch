@@ -1,6 +1,6 @@
 //! Gemini CLI `BeforeTool`. Its reply, shared with the OpenCode plugin, is JSON with `decision`
 //! and `reason` on stdout, nothing for "no opinion". Gemini has no ask, so a warning is a deny
-//! that says what lets it through, or, with `--gemini-warn allow`, a run with the reason on stderr.
+//! that tells the model to ask the user, or, with `--gemini-warn allow`, a run with the reason on stderr.
 
 use std::path::PathBuf;
 
@@ -8,7 +8,7 @@ use anyhow::{Context, anyhow};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{Adapter, Call, Decision, Policy, Reply, WarnAnswer};
+use super::{ASK_USER, Adapter, Call, Decision, Policy, Reply, UNCHECKED, WarnAnswer};
 
 const SHELL_TOOL: &str = "run_shell_command";
 
@@ -34,12 +34,15 @@ pub(super) fn reply(decision: Decision, warn: WarnAnswer) -> Reply {
     let (stdout, stderr) = match decision {
         Decision::Allow => (None, None),
         Decision::Deny(reason) => (deny(reason), None),
-        Decision::Ask { reason, allow_hint } => match warn {
-            WarnAnswer::Deny => (deny(format!("{reason} {allow_hint}")), None),
+        Decision::Unchecked { closed, .. } => {
+            (closed.then(|| deny(UNCHECKED.into())).flatten(), None)
+        }
+        Decision::Ask { reason, .. } => match warn {
+            WarnAnswer::Deny => (deny(format!("{reason} {ASK_USER}")), None),
             WarnAnswer::Allow => (None, Some(reason)),
         },
     };
-    Reply { stdout, stderr }
+    Reply::new(stdout, stderr)
 }
 
 impl Adapter for Gemini {

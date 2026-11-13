@@ -192,6 +192,14 @@ fn two_code_watch_copies_with_their_own_shim_dirs_do_not_exec_each_other() {
     assert_eq!(out.status.code(), Some(3));
 }
 
+/// What the agent reads after an internal failure names no flag, variable, path or parse detail.
+fn assert_unchecked_text(text: &str) {
+    assert!(text.contains("could not check this command"), "{text}");
+    for forbidden in ["CODE_WATCH_FAIL_OPEN", "allow.toml", "not toml", "/"] {
+        assert!(!text.contains(forbidden), "{forbidden:?} in {text}");
+    }
+}
+
 #[test]
 fn a_preset_nested_marker_changes_nothing_the_command_is_still_checked() {
     let w = World::new();
@@ -209,7 +217,7 @@ fn a_preset_nested_marker_changes_nothing_the_command_is_still_checked() {
             &[("CODE_WATCH_SHIM", marker)],
         );
         assert_eq!(out.status.code(), Some(3), "{marker}: {}", stderr(&out));
-        assert!(stderr(&out).contains("CODE_WATCH_FAIL_OPEN"), "{marker}");
+        assert_unchecked_text(&stderr(&out));
     }
     assert_eq!(w.argv_seen("bin", "curl"), None);
 }
@@ -266,7 +274,7 @@ fn an_internal_error_stops_the_tool_unless_fail_open_is_set() {
     let path = ["shims", "bin"];
     let closed = w.run("shims/git", &[b"status"], &path, &[]);
     assert_eq!(closed.status.code(), Some(3));
-    assert!(stderr(&closed).contains("CODE_WATCH_FAIL_OPEN"));
+    assert_unchecked_text(&stderr(&closed));
     assert_eq!(w.argv_seen("bin", "git"), None);
     let open = w.run(
         "shims/git",
@@ -276,6 +284,7 @@ fn an_internal_error_stops_the_tool_unless_fail_open_is_set() {
     );
     assert_eq!(open.status.code(), Some(0), "{}", stderr(&open));
     assert!(stderr(&open).contains("running it"));
+    assert_unchecked_text(&stderr(&open));
     assert!(w.argv_seen("bin", "git").is_some());
 }
 

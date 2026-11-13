@@ -60,6 +60,7 @@ pub fn render(exe: &Path, fail_open: bool, warn: WarnAnswer) -> anyhow::Result<S
     // The path goes in last: a path that contains a placeholder must not be rewritten.
     Ok(TEMPLATE
         .replace("__FAIL_OPEN__", if fail_open { "true" } else { "false" })
+        .replace("__UNCHECKED__", &serde_json::to_string(super::UNCHECKED)?)
         .replace("__ARGV__", &serde_json::to_string(&argv)?))
 }
 
@@ -126,6 +127,13 @@ mod tests {
         assert!(text.contains("Bun.spawn(ARGV,"));
         assert!(text.contains("const FAIL_OPEN = false"));
         assert!(!text.contains("__"));
+    }
+
+    #[test]
+    fn the_plugin_tells_the_model_only_the_fixed_unchecked_text() {
+        let text = render(Path::new("/x"), false, WarnAnswer::Deny).unwrap();
+        assert!(text.contains(&serde_json::to_string(super::super::UNCHECKED).unwrap()));
+        assert!(!text.contains("e.message") && !text.contains("__"));
     }
 
     #[test]
