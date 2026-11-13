@@ -383,3 +383,43 @@ fn hostile_allowlist_text_never_puts_control_bytes_in_the_output() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn an_escape_sequence_in_a_directory_name_never_reaches_the_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let hostile = "evil\u{1b}]0;pwned\u{7}";
+    fs::create_dir(dir.path().join(hostile)).unwrap();
+    fs::write(
+        dir.path().join(hostile).join("package.json"),
+        r#"{"scripts":{"postinstall":"echo hi"}}"#,
+    )
+    .unwrap();
+    let human = code_watch().arg("scan").arg(dir.path()).output().unwrap();
+    assert_eq!(human.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("evil?]0;pwned?/package.json"), "{text:?}");
+    assert!(!text.contains('\u{1b}') && !text.contains('\u{7}'));
+    let json = code_watch()
+        .args(["--json", "scan"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        v["findings"][0]["evidence"]["file"],
+        format!("{hostile}/package.json")
+    );
+}
+
+#[test]
+fn an_error_message_naming_a_hostile_path_is_cleaned() {
+    let out = code_watch()
+        .args(["scan", "no\u{1b}[31mwhere"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no?[31mwhere"), "{err:?}");
+    assert!(!err.contains('\u{1b}'));
+}
