@@ -520,16 +520,21 @@ fn download_of_another_kind_is_allowed_and_json_names_the_layer() {
         .arg(&file)
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(0));
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(
-        json["layers"]["download"],
-        if cfg!(target_os = "macos") {
-            "ran"
-        } else {
-            "skipped"
-        }
-    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(json["layers"]["download"], "ran");
+    } else {
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(json["layers"]["download"], "skipped");
+        assert!(
+            json["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["rule_id"] == "download/unchecked")
+        );
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
