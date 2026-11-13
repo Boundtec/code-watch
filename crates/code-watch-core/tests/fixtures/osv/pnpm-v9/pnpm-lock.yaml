@@ -1,0 +1,12 @@
+lockfileVersion: '9.0'
+packages:
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-x}
+  '@scope/pkg@2.0.0':
+    resolution: {integrity: sha512-y}
+  gitdep@https://codeload.github.com/x/gitdep/tar.gz/abc:
+    resolution: {tarball: https://codeload.github.com/x/gitdep/tar.gz/abc}
+  repo@1.0.0:
+    resolution: {commit: abc, repo: https://github.com/x/repo.git, type: git}
+snapshots:
+  left-pad@1.3.0: {}

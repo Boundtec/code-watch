@@ -6,6 +6,7 @@ pub mod command;
 pub mod engine;
 pub mod finding;
 mod names;
+pub mod osv;
 pub mod render;
 pub mod report;
 pub mod rules;
