@@ -59,19 +59,50 @@ fn one(ids: BTreeSet<String>, members: &[&Vuln]) -> Vuln {
 enum Fix {
     Version(String),
     NoSingle,
+    /// Every fix of some advisory is a Go pseudo-version: a commit, not a release.
+    Untagged,
     Unknown,
+}
+
+/// A Go pseudo-version ends in a 14-digit timestamp and a 12-hex-digit commit, as in
+/// `0.0.0-20230101120000-0123456789ab`.
+fn is_pseudo_version(v: &str) -> bool {
+    let mut parts = v.rsplitn(3, '-');
+    let (Some(commit), Some(stamp)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    commit.len() == 12
+        && commit.bytes().all(|b| b.is_ascii_hexdigit())
+        && stamp
+            .rsplit('.')
+            .next()
+            .is_some_and(|t| t.len() == 14 && t.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Go modules are installed as `v1.2.3`; OSV writes the version without the `v`.
+fn display_version(ecosystem: Ecosystem, v: &str) -> String {
+    if ecosystem == Ecosystem::Go && !v.starts_with('v') {
+        format!("v{v}")
+    } else {
+        v.to_owned()
+    }
 }
 
 /// The lowest version above the installed one that is past a fix of every advisory: per
 /// advisory the first fixed version above it, then the highest of those. It assumes a version
-/// past a fix stays fixed, which is how OSV ranges are written in practice.
+/// past a fix stays fixed, which is how OSV ranges are written in practice. Go pseudo-versions
+/// are skipped while a tagged release fixes the advisory.
 fn common_fix(ecosystem: Ecosystem, installed: &str, vulns: &[Vuln]) -> Fix {
     let mut needed: Option<&str> = None;
     for v in vulns {
         let mut first: Option<&str> = None;
+        let mut untagged = false;
         for f in &v.fixed {
             match compare(ecosystem, f, installed) {
                 None => return Fix::Unknown,
+                Some(Ordering::Greater) if ecosystem == Ecosystem::Go && is_pseudo_version(f) => {
+                    untagged = true;
+                }
                 Some(Ordering::Greater) => {
                     let lower =
                         first.is_none_or(|c| compare(ecosystem, f, c) == Some(Ordering::Less));
@@ -83,7 +114,11 @@ fn common_fix(ecosystem: Ecosystem, installed: &str, vulns: &[Vuln]) -> Fix {
             }
         }
         let Some(first) = first else {
-            return Fix::NoSingle;
+            return if untagged {
+                Fix::Untagged
+            } else {
+                Fix::NoSingle
+            };
         };
         if needed.is_none_or(|n| compare(ecosystem, first, n) == Some(Ordering::Greater)) {
             needed = Some(first);
@@ -148,10 +183,16 @@ fn finding(pkg: &Package, vulns: &[Vuln]) -> Finding {
         format!("Remove {name} and anything that installed it; treat this machine as exposed.")
     } else {
         match (common_fix(pkg.ecosystem, &pkg.version, vulns), n) {
-            (Fix::Version(v), 1) => format!("Upgrade {name} to {} and re-lock.", clean_text(&v)),
+            (Fix::Version(v), 1) => format!(
+                "Upgrade {name} to {} and re-lock.",
+                clean_text(&display_version(pkg.ecosystem, &v))
+            ),
             (Fix::Version(v), _) => format!(
                 "Upgrade {name} to {}, the lowest version that fixes all {n}, and re-lock.",
-                clean_text(&v)
+                clean_text(&display_version(pkg.ecosystem, &v))
+            ),
+            (Fix::Untagged, _) => format!(
+                "It is fixed in an untagged commit, not in a release. Replace {name} or read the advisory at https://osv.dev/{first}."
             ),
             (Fix::NoSingle, 1) => format!(
                 "No fixed version is listed. Replace {name} or read the advisory at https://osv.dev/{first}."

@@ -6,8 +6,9 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use code_watch_core::osv::{
-    Cache, Clock, DEFAULT_TTL, Discovered, Ecosystem, MAX_BATCH, OsvClient, OsvError, OsvMode,
-    OsvRecord, OsvStatus, Package, Query, QueryAnswer, Unparsed, UnparsedReason, run,
+    Cache, Clock, DEFAULT_TTL, Discovered, Ecosystem, MAX_BATCH, NotLookedUp, OsvClient, OsvError,
+    OsvMode, OsvRecord, OsvStatus, Package, Query, QueryAnswer, Unparsed, UnparsedReason, run,
+    run_within,
 };
 use code_watch_core::{Allowlists, Engine, Finding, LayerStatus, OsvSetup, Severity, render};
 
@@ -36,6 +37,7 @@ struct FakeOsv {
     records: BTreeMap<String, Result<OsvRecord, OsvError>>,
     batches: RefCell<Vec<Vec<Query>>>,
     record_calls: RefCell<Vec<String>>,
+    on_record: Option<Box<dyn Fn()>>,
 }
 
 impl FakeOsv {
@@ -45,7 +47,14 @@ impl FakeOsv {
             records: BTreeMap::new(),
             batches: RefCell::default(),
             record_calls: RefCell::default(),
+            on_record: None,
         }
+    }
+
+    /// Runs `f` on every advisory fetch, to move an injected clock.
+    fn on_record(mut self, f: impl Fn() + 'static) -> Self {
+        self.on_record = Some(Box::new(f));
+        self
     }
 
     /// Answers every query with the given advisory ids.
@@ -89,6 +98,9 @@ impl OsvClient for FakeOsv {
 
     fn record(&self, id: &str) -> Result<OsvRecord, OsvError> {
         self.record_calls.borrow_mut().push(id.to_owned());
+        if let Some(f) = &self.on_record {
+            f();
+        }
         self.records
             .get(id)
             .cloned()
@@ -126,7 +138,7 @@ fn pkg(name: &str, version: &str, file: &str, line: Option<usize>) -> Package {
 fn packages(list: Vec<Package>) -> Discovered {
     Discovered {
         packages: list,
-        unparsed: vec![],
+        ..Discovered::default()
     }
 }
 
@@ -649,6 +661,7 @@ fn an_unreadable_lockfile_is_a_warning_and_the_rest_still_runs() {
                 file: "yarn.lock".into(),
                 reason: UnparsedReason::Malformed,
             }],
+            ..Discovered::default()
         },
         OsvMode::Live,
         &client,
@@ -1187,4 +1200,279 @@ fn a_fix_below_the_installed_version_is_not_a_target() {
         "{}",
         findings[0].remediation
     );
+}
+
+#[test]
+fn entries_that_never_reach_osv_are_a_warning_naming_the_file_and_the_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(
+        Discovered {
+            not_looked_up: vec![NotLookedUp {
+                file: "web/package-lock.json".into(),
+                count: 3,
+            }],
+            ..Discovered::default()
+        },
+        OsvMode::Live,
+        &FakeOsv::answering(&[]),
+        &cache(dir.path(), &FakeClock::new()),
+    );
+    assert_eq!(ids(&out.findings), ["osv/unchecked-packages"]);
+    let f = &out.findings[0];
+    assert_eq!(f.severity, Severity::Warn);
+    assert_eq!(f.evidence.file.as_deref(), Some("web/package-lock.json"));
+    assert!(
+        f.evidence
+            .excerpt
+            .contains("3 entries not looked up (non-public source or unrecognised entry)"),
+        "{}",
+        f.evidence.excerpt
+    );
+    assert_eq!(out.status, OsvStatus::Ran);
+}
+
+#[test]
+fn a_mirror_resolved_lockfile_is_not_reported_as_checked_and_clean() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(
+        repo.path().join("package-lock.json"),
+        r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/a":{"version":"1.0.0","resolved":"https://artifactory.example.com/api/npm/a/-/a-1.0.0.tgz"}}}"#,
+    )
+    .unwrap();
+    let user = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let report = scan(
+        repo.path(),
+        &write_user_allow(user.path(), ""),
+        OsvMode::Live,
+        &FakeOsv::answering(&[]),
+        &cache(cache_dir.path(), &FakeClock::new()),
+    );
+    let findings = report.findings();
+    assert_eq!(ids(findings), ["osv/unchecked-packages"]);
+    assert!(
+        findings[0]
+            .evidence
+            .excerpt
+            .contains("1 entry not looked up")
+    );
+}
+
+fn go_pkg(version: &str) -> Package {
+    Package {
+        ecosystem: Ecosystem::Go,
+        name: "golang.org/x/net".into(),
+        version: version.into(),
+        file: "go.mod".into(),
+        line: Some(3),
+    }
+}
+
+fn go_record(fixed: &[&str]) -> OsvRecord {
+    let events: Vec<_> = fixed
+        .iter()
+        .map(|f| serde_json::json!({ "fixed": f }))
+        .collect();
+    rec(serde_json::json!({
+        "id": "GO-1",
+        "database_specific": { "severity": "HIGH" },
+        "affected": [{
+            "package": { "ecosystem": "Go", "name": "golang.org/x/net" },
+            "ranges": [{ "type": "SEMVER", "events": events }],
+        }],
+    }))
+}
+
+#[test]
+fn a_go_fix_keeps_the_v_and_skips_a_pseudo_version_when_a_release_fixes_it() {
+    let client = FakeOsv::answering(&["GO-1"]).with_record(go_record(&[
+        "0.57.1-0.20230101120000-0123456789ab",
+        "0.58.1",
+    ]));
+    let findings = run_one(&client, vec![go_pkg("v0.57.0")]);
+    assert!(
+        findings[0]
+            .remediation
+            .contains("Upgrade golang.org/x/net to v0.58.1 "),
+        "{}",
+        findings[0].remediation
+    );
+}
+
+#[test]
+fn a_go_advisory_fixed_only_in_a_pseudo_version_says_untagged_commit() {
+    let client = FakeOsv::answering(&["GO-1"])
+        .with_record(go_record(&["0.0.0-20240101120000-0123456789ab"]));
+    let findings = run_one(&client, vec![go_pkg("v0.0.0-20230101000000-aaaaaaaaaaaa")]);
+    let text = &findings[0].remediation;
+    assert!(text.contains("fixed in an untagged commit"), "{text}");
+    assert!(!text.contains("Upgrade"), "{text}");
+}
+
+fn three_package_client(clock: &FakeClock) -> FakeOsv {
+    let tick = clock.clone();
+    let mut client = FakeOsv::new(Box::new(|qs| {
+        Ok(qs
+            .iter()
+            .map(|q| QueryAnswer {
+                ids: vec![format!("ID-{}", q.name)],
+                next_page_token: None,
+            })
+            .collect())
+    }))
+    .on_record(move || tick.advance(Duration::from_secs(20)));
+    for n in ["a", "b", "c"] {
+        client = client.with_record(semver_record(
+            &format!("ID-{n}"),
+            &[],
+            "HIGH",
+            n,
+            &["9.0.0"],
+        ));
+    }
+    client
+}
+
+#[test]
+fn when_the_time_budget_passes_the_rest_is_unchecked_and_the_next_run_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::new();
+    let list = || {
+        vec![
+            pkg("a", "1.0.0", "f", None),
+            pkg("b", "1.0.0", "f", None),
+            pkg("c", "1.0.0", "f", None),
+        ]
+    };
+    let client = three_package_client(&clock);
+    let out = run_within(
+        packages(list()),
+        OsvMode::Live,
+        &client,
+        &cache(dir.path(), &clock),
+        &clock,
+        Duration::from_secs(30),
+    );
+    assert_eq!(client.record_calls.borrow().len(), 2);
+    assert_eq!(
+        ids(&out.findings),
+        [
+            "osv/known-vulnerability",
+            "osv/known-vulnerability",
+            "osv/unchecked-packages"
+        ]
+    );
+    let unchecked = out.findings.last().unwrap();
+    assert!(
+        unchecked
+            .evidence
+            .excerpt
+            .contains("1 not checked (the time limit for OSV lookups passed)"),
+        "{}",
+        unchecked.evidence.excerpt
+    );
+    assert_eq!(out.status, OsvStatus::Ran);
+
+    let second = three_package_client(&clock);
+    let out = run_within(
+        packages(list()),
+        OsvMode::Live,
+        &second,
+        &cache(dir.path(), &clock),
+        &clock,
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        second.queries(),
+        1,
+        "only the unchecked package is asked again"
+    );
+    assert_eq!(ids(&out.findings), ["osv/known-vulnerability"; 3]);
+}
+
+#[test]
+fn no_budget_means_no_request_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::new();
+    let client = FakeOsv::answering(&[]);
+    let out = run_within(
+        packages(vec![pkg("a", "1.0.0", "f", None)]),
+        OsvMode::Live,
+        &client,
+        &cache(dir.path(), &clock),
+        &clock,
+        Duration::ZERO,
+    );
+    assert_eq!(client.queries(), 0);
+    assert!(matches!(out.status, OsvStatus::Skipped(_)));
+}
+
+#[test]
+fn advisory_records_fetched_before_the_deadline_are_not_fetched_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::new();
+    let tick = clock.clone();
+    let first = FakeOsv::answering(&["A", "B"])
+        .with_record(semver_record("A", &[], "HIGH", "x", &["9.0.0"]))
+        .with_record(semver_record("B", &[], "HIGH", "x", &["9.0.0"]))
+        .on_record(move || tick.advance(Duration::from_secs(40)));
+    let out = run_within(
+        packages(vec![pkg("x", "1.0.0", "f", None)]),
+        OsvMode::Live,
+        &first,
+        &cache(dir.path(), &clock),
+        &clock,
+        Duration::from_secs(30),
+    );
+    assert_eq!(ids(&out.findings), ["osv/unchecked-packages"]);
+    let second = FakeOsv::answering(&["A", "B"])
+        .with_record(semver_record("A", &[], "HIGH", "x", &["9.0.0"]))
+        .with_record(semver_record("B", &[], "HIGH", "x", &["9.0.0"]));
+    let out = run(
+        packages(vec![pkg("x", "1.0.0", "f", None)]),
+        OsvMode::Live,
+        &second,
+        &cache(dir.path(), &clock),
+    );
+    assert_eq!(ids(&out.findings), ["osv/known-vulnerability"]);
+    assert_eq!(*second.record_calls.borrow(), ["B"]);
+}
+
+#[test]
+fn a_mal_id_in_the_batch_answer_blocks_even_when_its_record_cannot_be_fetched() {
+    let client =
+        FakeOsv::answering(&["MAL-2024-1"]).with_record_error("MAL-2024-1", OsvError::Status(503));
+    let findings = run_one(&client, vec![pkg("x", "1.0.0", "f", Some(4))]);
+    let mut got: Vec<_> = findings
+        .iter()
+        .map(|f| (f.rule_id.as_str(), f.severity))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            ("osv/malicious-package", Severity::Block),
+            ("osv/unchecked-packages", Severity::Warn),
+        ]
+    );
+    let blocked = findings
+        .iter()
+        .find(|f| f.severity == Severity::Block)
+        .unwrap();
+    assert_eq!(blocked.package.as_deref(), Some("x"));
+    assert_eq!(blocked.evidence.file.as_deref(), Some("f"));
+}
+
+#[test]
+fn a_cache_temp_file_name_left_behind_does_not_stop_the_cache_from_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::new();
+    let c = cache(dir.path(), &clock);
+    let p = pkg("x", "1.0.0", "f", None);
+    c.put(&p, &[]);
+    let stored = cache_files(dir.path()).remove(0);
+    fs::remove_file(&stored).unwrap();
+    fs::create_dir(stored.with_extension("tmp")).unwrap();
+    c.put(&p, &[]);
+    assert_eq!(c.get(&p), Some(vec![]));
 }

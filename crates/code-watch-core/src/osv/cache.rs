@@ -1,12 +1,13 @@
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::advisory::Vuln;
+use super::advisory::{OsvRecord, Vuln};
 use super::package::Package;
 
 const CACHE_SCHEMA: u32 = 2;
@@ -36,7 +37,15 @@ struct Entry {
     vulns: Vec<Vuln>,
 }
 
-/// One JSON file per (ecosystem, name, version) under `dir`. The file name is a hash of the
+#[derive(Serialize, Deserialize)]
+struct RecordEntry {
+    schema: u32,
+    id: String,
+    fetched_at: u64,
+    record: OsvRecord,
+}
+
+/// One JSON file per (ecosystem, name, version), and one per advisory record, under `dir`. The file name is a hash of the
 /// key, so a hostile package name can never reach outside `dir`, and the cache never deletes:
 /// a stale or damaged entry is ignored and overwritten by the next fetch.
 pub struct Cache {
@@ -50,13 +59,25 @@ impl Cache {
         Self { dir, ttl, clock }
     }
 
-    fn path(&self, p: &Package) -> PathBuf {
-        let key = format!("{}\0{}\0{}", p.ecosystem.osv_name(), p.name, p.version);
+    fn path(&self, key: &str) -> PathBuf {
         let hex: String = Sha256::digest(key.as_bytes())
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
         self.dir.join(format!("{hex}.json"))
+    }
+
+    fn package_path(&self, p: &Package) -> PathBuf {
+        self.path(&format!(
+            "{}\0{}\0{}",
+            p.ecosystem.osv_name(),
+            p.name,
+            p.version
+        ))
+    }
+
+    fn record_path(&self, id: &str) -> PathBuf {
+        self.path(&format!("record\0{id}"))
     }
 
     fn now_secs(&self) -> u64 {
@@ -66,26 +87,45 @@ impl Cache {
             .map_or(0, |d| d.as_secs())
     }
 
-    /// The advisories cached for `p`, only while the entry is younger than the TTL. A missing,
-    /// stale, future-dated, damaged, foreign or newer-schema file is `None`.
-    pub fn get(&self, p: &Package) -> Option<Vec<Vuln>> {
-        let path = self.path(p);
-        let meta = fs::symlink_metadata(&path).ok()?;
+    fn is_fresh(&self, fetched_at: u64) -> bool {
+        self.now_secs()
+            .checked_sub(fetched_at)
+            .is_some_and(|age| age < self.ttl.as_secs())
+    }
+
+    fn load(path: &Path) -> Option<String> {
+        let meta = fs::symlink_metadata(path).ok()?;
         if !meta.is_file() || meta.len() > MAX_CACHE_FILE_BYTES {
             return None;
         }
         let mut text = String::new();
-        fs::File::open(&path).ok()?.read_to_string(&mut text).ok()?;
-        let entry: Entry = serde_json::from_str(&text).ok()?;
+        fs::File::open(path).ok()?.read_to_string(&mut text).ok()?;
+        Some(text)
+    }
+
+    /// Writes through a uniquely named temp file in the same directory, so two scans filling the
+    /// cache at once never share a half-written file. A failed write is ignored: the cache only
+    /// saves a lookup.
+    fn store(&self, path: &Path, text: &str) {
+        let _ = fs::create_dir_all(&self.dir).and_then(|()| {
+            let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
+            tmp.write_all(text.as_bytes())?;
+            tmp.persist(path).map_err(|e| e.error)?;
+            Ok(())
+        });
+    }
+
+    /// The advisories cached for `p`, only while the entry is younger than the TTL. A missing,
+    /// stale, future-dated, damaged, foreign or newer-schema file is `None`.
+    pub fn get(&self, p: &Package) -> Option<Vec<Vuln>> {
+        let entry: Entry = serde_json::from_str(&Self::load(&self.package_path(p))?).ok()?;
         let same_key = entry.ecosystem == p.ecosystem.osv_name()
             && entry.name == p.name
             && entry.version == p.version;
-        let age = self.now_secs().checked_sub(entry.fetched_at)?;
-        (entry.schema == CACHE_SCHEMA && same_key && age < self.ttl.as_secs())
+        (entry.schema == CACHE_SCHEMA && same_key && self.is_fresh(entry.fetched_at))
             .then_some(entry.vulns)
     }
 
-    /// Stores `vulns` for `p`. A failed write is ignored: the cache only saves a lookup.
     pub fn put(&self, p: &Package, vulns: &[Vuln]) {
         let entry = Entry {
             schema: CACHE_SCHEMA,
@@ -95,16 +135,28 @@ impl Cache {
             fetched_at: self.now_secs(),
             vulns: vulns.to_vec(),
         };
-        let Ok(text) = serde_json::to_string(&entry) else {
-            return;
+        if let Ok(text) = serde_json::to_string(&entry) {
+            self.store(&self.package_path(p), &text);
+        }
+    }
+
+    /// The advisory record cached for `id`, under the same freshness rules as `get`. It lets a
+    /// lookup that ran out of time resume where it stopped.
+    pub fn get_record(&self, id: &str) -> Option<OsvRecord> {
+        let entry: RecordEntry = serde_json::from_str(&Self::load(&self.record_path(id))?).ok()?;
+        (entry.schema == CACHE_SCHEMA && entry.id == id && self.is_fresh(entry.fetched_at))
+            .then_some(entry.record)
+    }
+
+    pub fn put_record(&self, record: &OsvRecord) {
+        let entry = RecordEntry {
+            schema: CACHE_SCHEMA,
+            id: record.id.clone(),
+            fetched_at: self.now_secs(),
+            record: record.clone(),
         };
-        let path = self.path(p);
-        let tmp = path.with_extension("tmp");
-        let written = fs::create_dir_all(&self.dir)
-            .and_then(|()| fs::write(&tmp, text))
-            .and_then(|()| fs::rename(&tmp, &path));
-        if written.is_err() {
-            let _ = fs::remove_file(&tmp);
+        if let Ok(text) = serde_json::to_string(&entry) {
+            self.store(&self.record_path(&record.id), &text);
         }
     }
 }

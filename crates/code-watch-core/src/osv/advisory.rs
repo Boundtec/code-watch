@@ -5,7 +5,7 @@ use super::python::normalise;
 use crate::finding::Severity;
 
 /// The parts of an OSV record the layer reads. Unknown fields are ignored: the schema grows.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OsvRecord {
     pub id: String,
     #[serde(default)]
@@ -18,27 +18,27 @@ pub struct OsvRecord {
     pub affected: Vec<Affected>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DatabaseSpecific {
     pub severity: Option<String>,
     #[serde(default)]
     pub cwe_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Affected {
     pub package: Option<AffectedPackage>,
     #[serde(default)]
     pub ranges: Vec<Range>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AffectedPackage {
     pub ecosystem: String,
     pub name: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Range {
     #[serde(rename = "type", default)]
     pub kind: String,
@@ -46,7 +46,7 @@ pub struct Range {
     pub events: Vec<Event>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Event {
     pub fixed: Option<String>,
 }
@@ -69,6 +69,20 @@ const MALICIOUS_CWE: &str = "CWE-506";
 
 /// Range types whose `fixed` events are versions; a `GIT` range lists commit hashes.
 const VERSION_RANGES: [&str; 2] = ["ECOSYSTEM", "SEMVER"];
+
+impl Vuln {
+    /// What a `MAL-` id alone says when its record could not be fetched.
+    pub(crate) fn malicious_id(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            aliases: Vec::new(),
+            summary: String::new(),
+            severity: Severity::Block,
+            malicious: true,
+            fixed: Vec::new(),
+        }
+    }
+}
 
 impl OsvRecord {
     pub fn for_package(&self, ecosystem: Ecosystem, name: &str) -> Vuln {

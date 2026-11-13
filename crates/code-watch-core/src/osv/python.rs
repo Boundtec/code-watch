@@ -4,7 +4,7 @@ use pep508_rs::pep440_rs::Operator;
 use pep508_rs::{PackageName, Requirement, VersionOrUrl};
 use serde::Deserialize;
 
-use super::package::{Ecosystem, Package, PackageSource, ParseError};
+use super::package::{Ecosystem, FormatVersion, Package, PackageSource, ParseError, Parsed};
 
 const PYPI_INDEX: &str = "https://pypi.org/simple";
 
@@ -22,34 +22,42 @@ fn pypi(file: &str, name: &str, version: &str) -> Option<Package> {
     ))
 }
 
-/// `requirements.txt`: only exact `==` pins are packages; ranges, URLs, editable installs and
+/// Requirements files: `requirements.txt`, `requirements-dev.txt`, `dev-requirements.txt` and
+/// anything under a `requirements/` directory. Only exact `==` pins are packages; ranges, URLs, editable installs and
 /// option lines name no single version.
 pub struct Requirements;
 
 impl PackageSource for Requirements {
-    fn file_names(&self) -> &'static [&'static str] {
-        &["requirements.txt"]
+    fn globs(&self) -> &'static [&'static str] {
+        &[
+            "**/requirements*.txt",
+            "**/*requirements.txt",
+            "**/requirements/*.txt",
+        ]
     }
 
-    fn parse(&self, file: &str, text: &str) -> Result<Vec<Package>, ParseError> {
-        Ok(logical_lines(text)
-            .into_iter()
-            .filter_map(|(line_no, line)| {
-                let req = Requirement::<pep508_rs::VerbatimUrl>::from_str(&line).ok()?;
-                let Some(VersionOrUrl::VersionSpecifier(specs)) = &req.version_or_url else {
-                    return None;
-                };
-                let mut specs = specs.iter();
-                let (Some(spec), None) = (specs.next(), specs.next()) else {
-                    return None;
-                };
-                if *spec.operator() != Operator::Equal {
-                    return None;
-                }
-                let version = spec.version().to_string();
-                pypi(file, req.name.as_ref(), &version).map(|p| p.at_line(line_no))
-            })
-            .collect())
+    fn parse(&self, file: &str, text: &str) -> Result<Parsed, ParseError> {
+        Ok(Parsed::new(
+            logical_lines(text)
+                .into_iter()
+                .filter_map(|(line_no, line)| {
+                    let req = Requirement::<pep508_rs::VerbatimUrl>::from_str(&line).ok()?;
+                    let Some(VersionOrUrl::VersionSpecifier(specs)) = &req.version_or_url else {
+                        return None;
+                    };
+                    let mut specs = specs.iter();
+                    let (Some(spec), None) = (specs.next(), specs.next()) else {
+                        return None;
+                    };
+                    if *spec.operator() != Operator::Equal {
+                        return None;
+                    }
+                    let version = spec.version().to_string();
+                    pypi(file, req.name.as_ref(), &version).map(|p| p.at_line(line_no))
+                })
+                .collect(),
+            0,
+        ))
     }
 }
 
@@ -99,6 +107,14 @@ fn strip_comment(line: &str) -> &str {
 struct Lock {
     #[serde(default)]
     package: Vec<LockPackage>,
+    metadata: Option<PoetryMetadata>,
+    version: Option<FormatVersion>,
+}
+
+#[derive(Deserialize)]
+struct PoetryMetadata {
+    #[serde(rename = "lock-version")]
+    lock_version: Option<FormatVersion>,
 }
 
 #[derive(Deserialize)]
@@ -109,47 +125,62 @@ struct LockPackage {
 }
 
 /// `poetry.lock`: a package with a `[package.source]` table is git, local or from a private
-/// index, so only source-less entries (PyPI) are kept.
+/// index, so only source-less entries (PyPI) are kept; the ones that are not a local directory
+/// are counted as not looked up.
 pub struct PoetryLock;
 
 impl PackageSource for PoetryLock {
-    fn file_names(&self) -> &'static [&'static str] {
-        &["poetry.lock"]
+    fn globs(&self) -> &'static [&'static str] {
+        &["**/poetry.lock"]
     }
 
-    fn parse(&self, file: &str, text: &str) -> Result<Vec<Package>, ParseError> {
+    fn parse(&self, file: &str, text: &str) -> Result<Parsed, ParseError> {
         let lock: Lock = toml::from_str(text).map_err(ParseError::of)?;
-        Ok(lock
-            .package
-            .iter()
-            .filter(|p| p.source.is_none())
-            .filter_map(|p| pypi(file, &p.name, p.version.as_deref()?))
-            .collect())
+        if let Some(v) = lock.metadata.as_ref().and_then(|m| m.lock_version.as_ref()) {
+            FormatVersion::require(Some(v), &[1, 2], "poetry lockfile")?;
+        }
+        let mut out = Parsed::default();
+        for p in &lock.package {
+            match &p.source {
+                None => out
+                    .packages
+                    .extend(p.version.as_deref().and_then(|v| pypi(file, &p.name, v))),
+                Some(s) if s.get("type").and_then(toml::Value::as_str) == Some("directory") => {}
+                Some(_) => out.not_looked_up += 1,
+            }
+        }
+        Ok(out)
     }
 }
 
 /// `uv.lock`: only packages whose source is the public PyPI index. The project itself is
-/// `virtual` or `editable`, so it never matches.
+/// `virtual` or `editable`; git, URL and other-index packages are counted as not looked up.
 pub struct UvLock;
 
 impl PackageSource for UvLock {
-    fn file_names(&self) -> &'static [&'static str] {
-        &["uv.lock"]
+    fn globs(&self) -> &'static [&'static str] {
+        &["**/uv.lock"]
     }
 
-    fn parse(&self, file: &str, text: &str) -> Result<Vec<Package>, ParseError> {
+    fn parse(&self, file: &str, text: &str) -> Result<Parsed, ParseError> {
         let lock: Lock = toml::from_str(text).map_err(ParseError::of)?;
-        Ok(lock
-            .package
-            .iter()
-            .filter(|p| {
-                p.source
-                    .as_ref()
-                    .and_then(|s| s.get("registry"))
-                    .and_then(toml::Value::as_str)
-                    .is_some_and(|r| r.trim_end_matches('/') == PYPI_INDEX)
-            })
-            .filter_map(|p| pypi(file, &p.name, p.version.as_deref()?))
-            .collect())
+        FormatVersion::require(lock.version.as_ref(), &[1], "uv lockfile")?;
+        let mut out = Parsed::default();
+        for p in &lock.package {
+            let Some(source) = p.source.as_ref() else {
+                continue;
+            };
+            match source.get("registry").and_then(toml::Value::as_str) {
+                Some(r) if r.trim_end_matches('/') == PYPI_INDEX => out
+                    .packages
+                    .extend(p.version.as_deref().and_then(|v| pypi(file, &p.name, v))),
+                Some(_) => out.not_looked_up += 1,
+                None if ["git", "url"].iter().any(|k| source.get(k).is_some()) => {
+                    out.not_looked_up += 1;
+                }
+                None => {}
+            }
+        }
+        Ok(out)
     }
 }

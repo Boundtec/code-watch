@@ -2,18 +2,18 @@ use std::str::FromStr;
 
 use gomod_parser::{GoMod, Replacement};
 
-use super::package::{Ecosystem, Package, PackageSource, ParseError};
+use super::package::{Ecosystem, Package, PackageSource, ParseError, Parsed};
 
 /// `go.mod` require lines, direct and indirect. `go.sum` is not a source: it keeps versions
 /// the build does not use and would raise findings for code that never runs.
 pub struct GoModFile;
 
 impl PackageSource for GoModFile {
-    fn file_names(&self) -> &'static [&'static str] {
-        &["go.mod"]
+    fn globs(&self) -> &'static [&'static str] {
+        &["**/go.mod"]
     }
 
-    fn parse(&self, file: &str, text: &str) -> Result<Vec<Package>, ParseError> {
+    fn parse(&self, file: &str, text: &str) -> Result<Parsed, ParseError> {
         let go_mod = GoMod::from_str(text).map_err(ParseError::of)?;
         let mut out = Vec::new();
         for dep in &go_mod.require {
@@ -30,6 +30,6 @@ impl PackageSource for GoModFile {
             let line = text[..dep.module.path_span.start].matches('\n').count() + 1;
             out.push(Package::new(Ecosystem::Go, name, version, file).at_line(line));
         }
-        Ok(out)
+        Ok(Parsed::new(out, 0))
     }
 }

@@ -87,7 +87,7 @@ leaves your git config as it was. It refuses rather than overwrite a template di
 
 ## Known vulnerabilities
 
-`scan` also reads the lockfiles (npm, pnpm, yarn, pip, poetry, uv, cargo, go) and asks [OSV](https://osv.dev) about
+`scan` also reads the lockfiles (npm, pnpm, yarn, `requirements*.txt` and `requirements/*.txt`, poetry, uv, cargo, go) and asks [OSV](https://osv.dev) about
 the public-registry packages they pin. Only package names, versions and ecosystems are sent. Answers are cached for 24
 hours in `~/.cache/code-watch/osv/`; `scan --offline` uses only that cache and `scan --no-osv` turns the layer off.
 A lookup that fails is reported, never treated as clean. Details in [docs/osv.md](docs/osv.md).

@@ -34,6 +34,8 @@ pub enum OsvError {
     Status(u16),
     BadResponse,
     Partial,
+    /// The time budget for the whole layer passed before every lookup was made.
+    OutOfTime,
 }
 
 impl fmt::Display for OsvError {
@@ -44,6 +46,7 @@ impl fmt::Display for OsvError {
             OsvError::Status(code) => write!(f, "OSV answered HTTP {code}"),
             OsvError::BadResponse => f.write_str("OSV sent an answer that could not be read"),
             OsvError::Partial => f.write_str("OSV answered only part of a batch"),
+            OsvError::OutOfTime => f.write_str("the time limit for OSV lookups passed"),
         }
     }
 }
@@ -57,20 +60,28 @@ pub trait OsvClient {
 
 pub struct UreqOsv {
     agent: ureq::Agent,
+    base: String,
 }
 
 impl Default for UreqOsv {
     fn default() -> Self {
+        Self::with_base(OSV_BASE)
+    }
+}
+
+impl UreqOsv {
+    pub(crate) fn with_base(base: &str) -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(TIMEOUT))
             .user_agent(concat!("code-watch/", env!("CARGO_PKG_VERSION")))
             .build()
             .new_agent();
-        Self { agent }
+        Self {
+            agent,
+            base: base.to_owned(),
+        }
     }
-}
 
-impl UreqOsv {
     fn read(
         result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     ) -> Result<String, OsvError> {
@@ -98,7 +109,7 @@ impl OsvClient for UreqOsv {
         let body = batch_body(queries);
         let text = Self::read(
             self.agent
-                .post(format!("{OSV_BASE}/v1/querybatch"))
+                .post(format!("{}/v1/querybatch", self.base))
                 .header("content-type", "application/json")
                 .send(body),
         )?;
@@ -109,7 +120,11 @@ impl OsvClient for UreqOsv {
         if !is_safe_id(id) {
             return Err(OsvError::BadResponse);
         }
-        let text = Self::read(self.agent.get(format!("{OSV_BASE}/v1/vulns/{id}")).call())?;
+        let text = Self::read(
+            self.agent
+                .get(format!("{}/v1/vulns/{id}", self.base))
+                .call(),
+        )?;
         serde_json::from_str(&text).map_err(|_| OsvError::BadResponse)
     }
 }
@@ -263,5 +278,43 @@ mod tests {
             map_error(ureq::Error::BodyExceedsLimit(1)),
             OsvError::BadResponse
         );
+    }
+
+    /// Serves one canned raw HTTP response per connection from a thread the test owns, and
+    /// returns the base URL.
+    fn serve(responses: Vec<&'static str>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            for response in responses {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = conn.write_all(response.as_bytes());
+            }
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn http_failures_become_named_errors_not_clean_answers() {
+        let (base, server) = serve(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{\"results\":[",
+            "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"results\":[",
+        ]);
+        let client = UreqOsv::with_base(&base);
+        let q = [query("a", None)];
+        assert_eq!(client.query_batch(&q), Err(OsvError::Status(429)));
+        assert!(client.query_batch(&q).is_err(), "a body cut short");
+        assert_eq!(client.query_batch(&q), Err(OsvError::BadResponse));
+        server.join().unwrap();
     }
 }

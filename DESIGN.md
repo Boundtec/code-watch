@@ -138,6 +138,8 @@ Licenses are all Apache-2.0-compatible. Downloads are all-time / last 90 days. L
 | HTTP client for OSV + LLM | `ureq` | 3.5.2 | 2026-11-12 | 265 M / 86 M | MIT OR Apache-2.0 | blocking, small, no async runtime in a CLI that exits in milliseconds; `reqwest` (0.13.5, 2026-09-08, 905 M) works but pulls `tokio`. TLS via rustls |
 | Tests | `assert_cmd` 2.2.2, `insta` 1.49.0 (Apache-2.0), `tempfile` 3.27.0, `rstest` 0.28.0 | | | | | all current |
 
+Two transitive crates are not plain MIT/Apache-2.0: `version-ranges` 0.1.3 (MPL-2.0, file-level copyleft, via `pep508_rs`) and `webpki-roots` 1.0.12 (CDLA-Permissive-2.0, the bundled TLS roots, via `ureq`). Both are usable from an Apache-2.0 binary; the MPL one is the weaker fit and is the reason to replace `pep508_rs` with the small line parser if it ever gets in the way. They are named in `NOTICE`; the `cargo-deny` licence exceptions come with the CI slice.
+
 No async runtime anywhere. `cargo-deny` runs in CI to keep the license list honest.
 
 ## 3. Agent hook APIs (read 2026-11-12, re-read 2026-11-13)

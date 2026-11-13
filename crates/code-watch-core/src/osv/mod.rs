@@ -19,6 +19,9 @@ mod yarn;
 pub use advisory::{OsvRecord, Vuln};
 pub use cache::{Cache, Clock, DEFAULT_TTL, SystemClock};
 pub use client::{MAX_BATCH, OsvClient, OsvError, Query, QueryAnswer, UreqOsv};
-pub use discover::{Discovered, Unparsed, UnparsedReason, discover};
-pub use layer::{OsvMode, OsvOutcome, OsvStatus, RULE_IDS, RULE_UNCHECKED, RULE_UNPARSED, run};
+pub use discover::{Discovered, NotLookedUp, Unparsed, UnparsedReason, discover};
+pub use layer::{
+    OsvMode, OsvOutcome, OsvStatus, RULE_IDS, RULE_UNCHECKED, RULE_UNPARSED, TIME_BUDGET, run,
+    run_within,
+};
 pub use package::{Ecosystem, Package, PackageSource, ParseError};

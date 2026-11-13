@@ -3,18 +3,19 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use super::package::{
-    Ecosystem, Package, PackageSource, ParseError, is_public_npm_url, looks_like_version,
+    Ecosystem, FormatVersion, Package, PackageSource, ParseError, Parsed, is_public_npm_url,
+    looks_like_version,
 };
 
 /// `yarn.lock`, both the v1 text format and the berry YAML format.
 pub struct YarnLock;
 
 impl PackageSource for YarnLock {
-    fn file_names(&self) -> &'static [&'static str] {
-        &["yarn.lock"]
+    fn globs(&self) -> &'static [&'static str] {
+        &["**/yarn.lock"]
     }
 
-    fn parse(&self, file: &str, text: &str) -> Result<Vec<Package>, ParseError> {
+    fn parse(&self, file: &str, text: &str) -> Result<Parsed, ParseError> {
         if text.contains("\n__metadata:") || text.starts_with("__metadata:") {
             berry(file, text)
         } else {
@@ -23,14 +24,29 @@ impl PackageSource for YarnLock {
     }
 }
 
-fn classic(file: &str, text: &str) -> Result<Vec<Package>, ParseError> {
+fn classic(file: &str, text: &str) -> Result<Parsed, ParseError> {
+    if let Some(v) = text
+        .lines()
+        .find_map(|l| l.strip_prefix("# yarn lockfile v"))
+        .filter(|v| v.trim() != "1")
+    {
+        return Err(ParseError::unknown_format(format!(
+            "yarn lockfile format version {} is not recognised",
+            v.trim()
+        )));
+    }
     let lock = yarn_lock_parser::parse_str(text).map_err(ParseError::of)?;
-    Ok(lock
+    let (public, other): (Vec<_>, Vec<_>) = lock
         .entries
         .iter()
-        .filter(|e| is_public_npm_url(e.resolved) && looks_like_version(e.version))
-        .map(|e| Package::new(Ecosystem::Npm, e.name, e.version, file))
-        .collect())
+        .partition(|e| is_public_npm_url(e.resolved) && looks_like_version(e.version));
+    Ok(Parsed::new(
+        public
+            .iter()
+            .map(|e| Package::new(Ecosystem::Npm, e.name, e.version, file))
+            .collect(),
+        other.len(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -39,27 +55,44 @@ struct BerryEntry {
     resolution: Option<String>,
 }
 
-/// Berry resolutions read `name@npm:version`; `workspace:`, `patch:` and `github:` ones do not
-/// match and are dropped.
-fn berry(file: &str, text: &str) -> Result<Vec<Package>, ParseError> {
+#[derive(Deserialize)]
+struct Metadata {
+    version: Option<FormatVersion>,
+}
+
+/// Berry resolutions read `name@npm:version`; `patch:`, `github:` and alias ones do not match
+/// and are counted as not looked up. `workspace:` entries are the project's own packages.
+fn berry(file: &str, text: &str) -> Result<Parsed, ParseError> {
     let lock: BTreeMap<String, serde_norway::Value> =
         serde_norway::from_str(text).map_err(ParseError::of)?;
-    let mut out = Vec::new();
+    let metadata: Metadata = lock
+        .get("__metadata")
+        .cloned()
+        .and_then(|v| serde_norway::from_value(v).ok())
+        .unwrap_or(Metadata { version: None });
+    FormatVersion::require(metadata.version.as_ref(), &[4, 5, 6, 7, 8], "yarn lockfile")?;
+    let mut out = Parsed::default();
     for (key, value) in lock {
         if key == "__metadata" {
             continue;
         }
-        let Ok(entry) = serde_norway::from_value::<BerryEntry>(value) else {
+        let entry = serde_norway::from_value::<BerryEntry>(value).ok();
+        let Some((resolution, version)) = entry.and_then(|e| Some((e.resolution?, e.version?)))
+        else {
+            out.not_looked_up += 1;
             continue;
         };
-        let (Some(resolution), Some(version)) = (entry.resolution, entry.version) else {
+        if resolution.contains("@workspace:") {
             continue;
-        };
-        let Some((name, resolved)) = resolution.split_once("@npm:") else {
-            continue;
-        };
-        if !name.is_empty() && resolved == version && looks_like_version(&version) {
-            out.push(Package::new(Ecosystem::Npm, name, &version, file));
+        }
+        match resolution.split_once("@npm:") {
+            Some((name, resolved))
+                if !name.is_empty() && resolved == version && looks_like_version(&version) =>
+            {
+                out.packages
+                    .push(Package::new(Ecosystem::Npm, name, &version, file));
+            }
+            _ => out.not_looked_up += 1,
         }
     }
     Ok(out)

@@ -315,3 +315,171 @@ fn an_unreadable_lockfile_is_reported() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     assert_unparsed(&d, "Cargo.lock", UnparsedReason::Unreadable);
 }
+
+fn names(d: &Discovered) -> Vec<&str> {
+    let mut out: Vec<_> = d.packages.iter().map(|p| p.name.as_str()).collect();
+    out.sort();
+    out
+}
+
+fn skipped_entries(d: &Discovered) -> Vec<(&str, usize)> {
+    d.not_looked_up
+        .iter()
+        .map(|n| (n.file.as_str(), n.count))
+        .collect()
+}
+
+#[test]
+fn pnpm_v5_keys_are_read_and_the_ones_from_other_sources_are_counted() {
+    let lock = r#"lockfileVersion: 5.4
+packages:
+  /lodash/4.17.20:
+    resolution: {integrity: sha512-a}
+  /@babel/core/7.0.0:
+    resolution: {integrity: sha512-b}
+  /react-dom/17.0.0_react@17.0.0:
+    resolution: {integrity: sha512-c}
+  /gitdep/1.0.0:
+    resolution: {tarball: https://example.com/gitdep.tgz}
+  registry.example.com/private/1.0.0:
+    resolution: {integrity: sha512-d}
+"#;
+    let (_dir, d) = lockfile_in_tempdir("pnpm-lock.yaml", lock.as_bytes());
+    assert_eq!(d.unparsed, []);
+    assert_eq!(names(&d), ["@babel/core", "lodash", "react-dom"]);
+    let versions: Vec<_> = d.packages.iter().map(|p| p.version.as_str()).collect();
+    assert_eq!(versions, ["7.0.0", "4.17.20", "17.0.0"]);
+    assert_eq!(skipped_entries(&d), [("pnpm-lock.yaml", 2)]);
+}
+
+#[test]
+fn npm_entries_resolved_from_a_mirror_are_counted_not_dropped_silently() {
+    let lock = r#"{"lockfileVersion":3,"packages":{"":{},
+"node_modules/a":{"version":"1.0.0","resolved":"https://registry.npmjs.org/a/-/a-1.0.0.tgz"},
+"node_modules/b":{"version":"2.0.0","resolved":"https://artifactory.example.com/api/npm/b/-/b-2.0.0.tgz"},
+"node_modules/c":{"version":"3.0.0","resolved":"https://nexus.example.com/repository/npm/c/-/c-3.0.0.tgz"},
+"packages/ws":{"version":"1.0.0"},
+"node_modules/ws":{"resolved":"packages/ws","link":true}}}"#;
+    let (_dir, d) = lockfile_in_tempdir("package-lock.json", lock.as_bytes());
+    assert_eq!(names(&d), ["a"]);
+    assert_eq!(skipped_entries(&d), [("package-lock.json", 2)]);
+}
+
+#[test]
+fn an_npm_v1_alias_is_counted_as_not_looked_up() {
+    let lock = r#"{"lockfileVersion":1,"dependencies":{
+"real":{"version":"1.0.0","resolved":"https://registry.npmjs.org/real/-/real-1.0.0.tgz"},
+"alias":{"version":"npm:other@1.0.0","resolved":"https://registry.npmjs.org/other/-/other-1.0.0.tgz"}}}"#;
+    let (_dir, d) = lockfile_in_tempdir("package-lock.json", lock.as_bytes());
+    assert_eq!(names(&d), ["real"]);
+    assert_eq!(skipped_entries(&d), [("package-lock.json", 1)]);
+}
+
+#[test]
+fn a_cargo_alternative_registry_and_git_entry_are_counted_but_workspace_crates_are_not() {
+    let lock = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+
+[[package]]
+name = "public"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "internal"
+version = "2.0.0"
+source = "registry+https://crates.example.com/index"
+
+[[package]]
+name = "forked"
+version = "3.0.0"
+source = "git+https://example.com/forked.git#0123456789abcdef0123456789abcdef01234567"
+"#;
+    let (_dir, d) = lockfile_in_tempdir("Cargo.lock", lock.as_bytes());
+    assert_eq!(d.unparsed, []);
+    assert_eq!(names(&d), ["public"]);
+    assert_eq!(skipped_entries(&d), [("Cargo.lock", 2)]);
+}
+
+#[test]
+fn a_lockfile_format_version_that_is_not_recognised_is_reported_never_read_as_empty() {
+    let cases: [(&str, &str); 6] = [
+        (
+            "package-lock.json",
+            r#"{"lockfileVersion":9,"packages":{}}"#,
+        ),
+        ("pnpm-lock.yaml", "lockfileVersion: '7.0'\npackages: {}\n"),
+        ("pnpm-lock.yaml", "packages: {}\n"),
+        ("pnpm-lock.yaml", "lockfileVersion: 4\npackages: {}\n"),
+        ("yarn.lock", "__metadata:\n  version: 99\n"),
+        ("uv.lock", "version = 7\n"),
+    ];
+    for (name, text) in cases {
+        let (_dir, d) = lockfile_in_tempdir(name, text.as_bytes());
+        assert_unparsed(&d, name, UnparsedReason::UnknownFormat);
+    }
+}
+
+#[test]
+fn the_known_format_versions_are_still_read() {
+    let cases: [(&str, &str); 5] = [
+        (
+            "package-lock.json",
+            r#"{"lockfileVersion":2,"packages":{}}"#,
+        ),
+        ("package-lock.json", r#"{"packages":{}}"#),
+        ("pnpm-lock.yaml", "lockfileVersion: 5.3\npackages: {}\n"),
+        ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+        ("yarn.lock", "__metadata:\n  version: 6\n"),
+    ];
+    for (name, text) in cases {
+        let (_dir, d) = lockfile_in_tempdir(name, text.as_bytes());
+        assert_eq!(d, Discovered::default(), "{name}: {text}");
+    }
+}
+
+#[test]
+fn requirements_files_are_matched_by_one_glob_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let read = [
+        "requirements.txt",
+        "requirements-dev.txt",
+        "dev-requirements.txt",
+        "requirements/prod.txt",
+        "svc/requirements.txt",
+    ];
+    let ignored = ["requirements.md", "notes.txt", "other/base.txt", "req.txt"];
+    fs::create_dir_all(dir.path().join("requirements")).unwrap();
+    fs::create_dir_all(dir.path().join("svc")).unwrap();
+    fs::create_dir_all(dir.path().join("other")).unwrap();
+    for (i, f) in read.iter().chain(&ignored).enumerate() {
+        fs::write(dir.path().join(f), format!("pkg{i}==1.0\n")).unwrap();
+    }
+    let d = discover(dir.path());
+    let mut files: Vec<_> = d.packages.iter().map(|p| p.file.as_str()).collect();
+    files.sort();
+    let mut want = read.to_vec();
+    want.sort();
+    assert_eq!(files, want);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_is_reported_so_its_lockfiles_are_not_silently_missed() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::copy(
+        fixture("npm-one").join("package-lock.json"),
+        locked.join("package-lock.json"),
+    )
+    .unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let d = discover(dir.path());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_unparsed(&d, "locked", UnparsedReason::WalkError);
+}

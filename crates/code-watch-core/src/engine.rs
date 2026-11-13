@@ -56,7 +56,7 @@ fn is_executable(_: &fs::Metadata) -> bool {
 
 /// The path a walk error belongs to, relative to the scanned root, or "." when the walker did
 /// not say.
-fn error_path(err: &ignore::Error, root: &Path) -> String {
+pub(crate) fn error_path(err: &ignore::Error, root: &Path) -> String {
     match err {
         ignore::Error::WithPath { path, .. } => path
             .strip_prefix(root)
