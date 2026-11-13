@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use code_watch_core::allow::find_repo_root;
+use code_watch_core::download::{MacOsTools, MacTools};
 use code_watch_core::osv::{Cache, DEFAULT_TTL, OsvMode, SystemClock, UreqOsv};
 use code_watch_core::{Allowlists, Engine, OsvSetup, Report, render};
 
@@ -48,6 +49,8 @@ enum Cmd {
         #[arg(long)]
         offline: bool,
     },
+    /// Check a downloaded .dmg, .pkg, .app or executable before opening it (macOS only; read-only)
+    Download { path: PathBuf },
     /// Check a shell command before it runs
     Check {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -267,6 +270,13 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
                 cache: &cache,
             };
             Outcome::Report(engine.scan_dir_osv(dir, &allow, Some(&setup))?)
+        }
+        Cmd::Download { path } => {
+            // A download folder is untrusted: no repo allowlist, only the user's own file.
+            let allow = Allowlists::load(user_dir.as_deref(), None)?;
+            let tools = cfg!(target_os = "macos").then(MacOsTools::default);
+            let tools = tools.as_ref().map(|t| t as &dyn MacTools);
+            Outcome::Report(Engine::embedded()?.check_download(path, tools, &allow)?)
         }
         Cmd::Check { command } => {
             let cwd = std::env::current_dir().ok();

@@ -36,7 +36,7 @@ One core, thin entry points. Everything that decides lives in the core; adapters
 | 2 Known vulnerabilities | `osv` | `Repo` | lockfile parsers to package list, OSV batch query, offline cache |
 | 3 Before install | `install` | `Install` | resolves what will run (lifecycle scripts, unknown tap) before it runs |
 | 4 Before a command | `command` | `Command` | `curl \| sh` lookalike domains, base64 into a shell, quarantine removal, `osascript` password prompt, LaunchAgents writes |
-| 5 Downloads | `download` | `Download` | quarantine, signature, notarization (macOS only) |
+| 5 Downloads | `download` | `Download` | quarantine, signature, notarization (macOS only); built: `code-watch download`, [docs/downloads.md](docs/downloads.md) |
 
 macOS-only checks are compiled everywhere and registered only when `cfg!(target_os = "macos")`; on Linux they are absent
 and `--json` lists them under `skipped_layers`.
@@ -187,7 +187,7 @@ Each slice is about one worker-day, one reviewable PR, with its tests and its RE
 | 5 | Command layer | `shlex`-based parsing, `curl \| sh`, base64 into shell, quarantine removal, `osascript` password, LaunchAgents writes, lookalike-domain check (`idna`, `psl`, `unicode-security`, `strsim`) |
 | 6 | Lockfiles + OSV | parsers per ecosystem behind one `PackageSource` trait, OSV client behind a trait with a fake, offline cache with injected clock |
 | 7 | Install layer | `npm/pnpm/yarn install`, `pip install`, `brew install` unknown tap: shows what will run before it runs |
-| 8 | Downloads layer | `.dmg` / `.pkg` quarantine, `codesign` / `spctl` shell-out behind a trait with a fake, macOS only |
+| 8 | Downloads layer | done: `.dmg` / `.pkg` / `.app` / Mach-O; `xattr`, `codesign`, `pkgutil` and `spctl` shell-outs behind `MacTools` and `Exec` traits with fakes, macOS only |
 | 9 | LLM layer | provider trait, openai_compat + anthropic + local, `LlmFindings` newtype, the "only adds" property test, prompt-injection fixtures, `docs/llm-layer.md` |
 | 10 | Adapters 1 | `adapter` subcommand, Claude Code, Cursor, Codex CLI, with fixtures of each agent's stdin JSON |
 | 11 | Adapters 2 + shims | Gemini CLI, OpenCode plugin, PATH shims (symlinks to the binary that dispatch on argv[0]), `docs/adding-an-adapter.md` |
