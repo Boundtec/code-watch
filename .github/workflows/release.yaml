@@ -1,0 +1,111 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yaml
+      - install.sh
+      - deny.toml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, toolchain pinned below
+        with:
+          toolchain: 1.94.0
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Build
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p code-watch
+      - name: Check the binary is static
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          bin="target/${{ matrix.target }}/release/code-watch"
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          if ldd "$bin" 2>&1 | grep -Evq 'not a dynamic executable|statically linked'; then
+            echo "binary is dynamically linked" >&2
+            exit 1
+          fi
+      - name: Archive
+        id: archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          version=$(cargo pkgid -p code-watch | sed 's/.*[#@]//')
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match crate version ${version}" >&2
+            exit 1
+          fi
+          name="code-watch-${version}-${TARGET}"
+          mkdir "dist" "dist/${name}"
+          cp "target/${TARGET}/release/code-watch" LICENSE NOTICE README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          test -s "dist/${name}.tar.gz"
+          echo "path=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: ${{ steps.archive.outputs.path }}
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -eu
+          test "$(find . -name "*.tar.gz" | wc -l)" -eq 4
+          sha256sum ./*.tar.gz | sed 's# \./# #' > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        working-directory: dist
+        run: gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes ./*.tar.gz SHA256SUMS
