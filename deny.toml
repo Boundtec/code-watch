@@ -1,0 +1,42 @@
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = [
+    # Weak copyleft (file-level), unmodified; reaches the binary through dirs. Named in NOTICE.
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    # Weak copyleft: reaches the binary only through pep508_rs. Named in NOTICE.
+    { allow = ["MPL-2.0"], crate = "version-ranges" },
+    # Bundled Mozilla roots for the TLS client. Named in NOTICE.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    # Permissive; build-time only (psm build script), not in the binary, so not in NOTICE.
+    { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "ar_archive_writer" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

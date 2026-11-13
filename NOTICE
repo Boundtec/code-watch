@@ -8,4 +8,5 @@ Redistributions must retain this NOTICE file.
 
 This product bundles or links third-party crates under licences other than MIT and Apache-2.0:
 - version-ranges (MPL-2.0), a dependency of pep508_rs. Its source is available at https://github.com/pubgrub-rs/pubgrub.
+- option-ext (MPL-2.0), a dependency of dirs. Its source is available at https://github.com/samuelcolvin/option-ext.
 - webpki-roots (CDLA-Permissive-2.0), the Mozilla root certificates used by the TLS client.
