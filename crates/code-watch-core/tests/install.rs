@@ -557,6 +557,35 @@ fn an_unknown_pnpm_version_may_run_and_an_old_one_runs_everything() {
 }
 
 #[test]
+fn the_pnpm_version_named_to_corepack_beats_package_manager() {
+    let none = "packages:\n  - \".\"\n";
+    let over_10 = pnpm_tree(none, PNPM_10, true);
+    for cmd in ["corepack pnpm@9 install", "corepack pnpm@9.1.0 install"] {
+        let f = run(cmd, over_10.path());
+        let d = one(&f, "install/dependency-scripts");
+        assert_eq!(d.severity, Severity::Warn, "{cmd}");
+        assert!(d.evidence.excerpt.contains("will run"), "{cmd}");
+        assert!(
+            !ids(&f).contains(&"install/dependency-scripts-blocked"),
+            "{cmd}"
+        );
+    }
+    let over_9 = pnpm_tree(none, r#"{"packageManager":"pnpm@9.15.0"}"#, true);
+    let f = run("corepack pnpm@10.2.0 install", over_9.path());
+    assert_eq!(
+        one(&f, "install/dependency-scripts-blocked").severity,
+        Severity::Info
+    );
+    assert!(!ids(&f).contains(&"install/dependency-scripts"));
+    let f = run("corepack pnpm@latest install", over_10.path());
+    assert!(ids(&f).contains(&"install/dependency-scripts-blocked"));
+    let f = run("pnpm install", over_10.path());
+    assert!(ids(&f).contains(&"install/dependency-scripts-blocked"));
+    let f = run("pnpm install", over_9.path());
+    assert!(ids(&f).contains(&"install/dependency-scripts"));
+}
+
+#[test]
 fn a_pnpm_lock_that_is_not_installed_cannot_say_and_an_older_flag_is_read() {
     let bare = pnpm_tree(PNPM_WORKSPACE, PNPM_10, false);
     assert!(ids(&run("pnpm install", bare.path())).contains(&"install/dependency-scripts-unknown"));

@@ -370,6 +370,7 @@ pub(super) fn analyze(
     here: &Path,
     cwd: &Path,
     judge: &Judge,
+    pinned: Option<&str>,
 ) -> Vec<Finding> {
     let inv = match parse(manager, args, here) {
         Parsed::Install(inv) => inv,
@@ -402,6 +403,7 @@ pub(super) fn analyze(
         judge,
         skip_build: inv.skip_build,
         allows_builds: inv.allows_builds,
+        pinned_major: pinned.and_then(major_of),
     };
     project.repo_code(&mut out);
     // Yarn berry has no --ignore-scripts and does not read .npmrc; elsewhere the command line beats the project's settings.
@@ -533,6 +535,17 @@ struct Project<'a> {
     judge: &'a Judge<'a>,
     skip_build: bool,
     allows_builds: bool,
+    /// The major version named on a `corepack pnpm@<version>` command line; it beats `packageManager`.
+    pinned_major: Option<u32>,
+}
+
+/// The major of a version such as `10.2.0`, `9` or `^9.1`.
+fn major_of(version: &str) -> Option<u32> {
+    version
+        .trim_start_matches(['^', '~', '='])
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
 }
 
 impl Project<'_> {
@@ -1452,7 +1465,7 @@ impl PnpmBuilds {
                     .get("packageManager")
                     .and_then(|v| v.as_str())
                     .and_then(|pm| pm.strip_prefix("pnpm@"))
-                    .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()));
+                    .and_then(major_of);
                 if let Some(pnpm) = json.get("pnpm")
                     && let Ok(v) = serde_norway::to_value(pnpm)
                 {
@@ -1463,6 +1476,9 @@ impl PnpmBuilds {
             Err(why) => {
                 me.manifest_problem = Some(format!("{shown} {why}"));
             }
+        }
+        if p.pinned_major.is_some() {
+            me.major = p.pinned_major;
         }
         me.allow_all = p.allows_builds;
         for (path, name) in [p.file(".npmrc"), p.root_file(".npmrc")] {

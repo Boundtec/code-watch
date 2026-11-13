@@ -320,18 +320,18 @@ pub fn analyze(commands: &[Vec<String>], cwd: &Path, judge: &Judge) -> Vec<Findi
                 }
             }
             "npm" | "pnpm" | "yarn" => {
-                findings.extend(node::analyze(program, args, &here, cwd, judge))
+                findings.extend(node::analyze(program, args, &here, cwd, judge, None))
             }
             "corepack" => {
                 let mut rest = args.iter().skip_while(|a| a.starts_with('-'));
                 // `corepack pnpm@9 install` names the version it pins after the manager.
-                if let Some(manager) = rest
-                    .next()
-                    .map(|m| m.split_once('@').map_or(m.as_str(), |(name, _)| name))
-                    && matches!(manager, "npm" | "pnpm" | "yarn")
+                if let Some((manager, version)) = rest.next().map(|m| {
+                    m.split_once('@')
+                        .map_or((m.as_str(), None), |(n, v)| (n, Some(v)))
+                }) && matches!(manager, "npm" | "pnpm" | "yarn")
                 {
                     let after: Vec<String> = rest.cloned().collect();
-                    findings.extend(node::analyze(manager, &after, &here, cwd, judge));
+                    findings.extend(node::analyze(manager, &after, &here, cwd, judge, version));
                 }
             }
             "brew" => findings.extend(brew::analyze(args)),
