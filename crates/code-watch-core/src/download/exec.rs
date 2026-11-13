@@ -16,7 +16,7 @@ pub struct Output {
     pub code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    /// A stream held more than the cap; the rest was dropped and the process stopped.
+    /// A stream held more than the cap; the rest was read and dropped, the exit code is the tool's own.
     pub truncated: bool,
 }
 
@@ -51,15 +51,15 @@ enum Stream {
     Err,
 }
 
-/// Reads at most `cap` bytes; the flag says there was more.
+/// Keeps at most `cap` bytes and drains the rest, so a noisy tool still ends by itself with its
+/// real exit code (killing it would turn a refusal into "ended by a signal"); the timeout bounds the drain.
 fn read_capped(mut from: impl Read, cap: usize) -> (Vec<u8>, bool) {
     let mut buf = Vec::new();
     let mut limited = (&mut from).take(cap as u64);
     if limited.read_to_end(&mut buf).is_err() {
         return (buf, false);
     }
-    let mut probe = [0u8; 1];
-    let more = matches!(from.read(&mut probe), Ok(n) if n > 0);
+    let more = matches!(std::io::copy(&mut from, &mut std::io::sink()), Ok(n) if n > 0);
     (buf, more)
 }
 
@@ -102,9 +102,6 @@ impl Exec for ProcessExec {
                 Stream::Out => stdout = bytes,
                 Stream::Err => stderr = bytes,
             }
-            if more {
-                let _ = child.kill();
-            }
         }
         let status = child.wait().map_err(|e| ExecError::Io(e.to_string()))?;
         Ok(Output {
@@ -142,10 +139,26 @@ mod tests {
     }
 
     #[test]
-    fn output_over_the_cap_is_cut_and_the_process_stopped() {
-        let r = exec(5000, 100).run("/usr/bin/yes", &[]).unwrap();
+    fn output_over_the_cap_is_cut() {
+        let r = exec(5000, 100)
+            .run("/usr/bin/head", &os(&["-c", "200000", "/dev/zero"]))
+            .unwrap();
         assert!(r.truncated);
         assert_eq!(r.stdout.len(), 100);
+    }
+
+    #[test]
+    fn the_exit_code_survives_output_over_the_cap_on_either_stream() {
+        for script in [
+            "head -c 2000000 /dev/zero >&2; exit 1",
+            "head -c 2000000 /dev/zero; exit 3",
+        ] {
+            let r = exec(5000, 1024)
+                .run("/bin/sh", &os(&["-c", script]))
+                .unwrap();
+            assert!(r.truncated, "{script}");
+            assert!(matches!(r.code, Some(1 | 3)), "{script}: {:?}", r.code);
+        }
     }
 
     #[test]

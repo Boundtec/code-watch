@@ -206,7 +206,7 @@ fn unsigned(kind: Kind, file: &str) -> Finding {
             "The disk image is not signed; the app inside is not checked",
             file,
             "code-watch never mounts an image.",
-            "Open the image, then run `code-watch download` on the .app inside.",
+            "Get the app from its publisher, then run `code-watch download` on the app before opening it.",
         );
     }
     finding(
@@ -328,6 +328,12 @@ mod tests {
             assert_eq!(run(&fake, kind), [(RULE_UNSIGNED.into(), Severity::Block)]);
         }
         assert!(!fake.calls.borrow().contains(&"gatekeeper"));
+    }
+
+    #[test]
+    fn the_unsigned_image_advice_points_at_the_publisher_not_at_opening_the_image() {
+        let advice = unsigned(Kind::Dmg, "x.dmg").remediation;
+        assert!(advice.contains("publisher") && !advice.to_lowercase().contains("open the image"));
     }
 
     #[test]
@@ -485,8 +491,6 @@ mod tests {
         let f = analyze(&subj(Some(Kind::App)), &fake);
         assert!(!f[0].evidence.excerpt.contains('\u{1b}'));
     }
-
-    // kind detection, with real files in a tempdir
 
     fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let p = dir.join(name);

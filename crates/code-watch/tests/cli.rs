@@ -542,3 +542,25 @@ fn download_off_macos_says_the_layer_was_skipped() {
     assert_eq!(out.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&out.stdout).contains("download skipped (macOS only)"));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_repo_file_next_to_a_download_cannot_allow_its_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(
+        dir.path().join(".code-watch.toml"),
+        "schema = 1\n[[allow]]\nrule = \"download/unsigned-image\"\n",
+    )
+    .unwrap();
+    let image = dir.path().join("x.dmg");
+    fs::write(&image, vec![0u8; 4096]).unwrap();
+    let out = code_watch()
+        .env("XDG_CONFIG_HOME", dir.path().join("none"))
+        .arg("download")
+        .arg(&image)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("download/unsigned-image"));
+}

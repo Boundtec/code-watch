@@ -272,11 +272,8 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
             Outcome::Report(engine.scan_dir_osv(dir, &allow, Some(&setup))?)
         }
         Cmd::Download { path } => {
-            let repo = path
-                .parent()
-                .filter(|d| d.is_dir())
-                .and_then(find_repo_root);
-            let allow = Allowlists::load(user_dir.as_deref(), repo.as_deref())?;
+            // A download folder is untrusted: no repo allowlist, only the user's own file.
+            let allow = Allowlists::load(user_dir.as_deref(), None)?;
             let tools = cfg!(target_os = "macos").then(MacOsTools::default);
             let tools = tools.as_ref().map(|t| t as &dyn MacTools);
             Outcome::Report(Engine::embedded()?.check_download(path, tools, &allow)?)
