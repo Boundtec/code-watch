@@ -87,6 +87,17 @@ mod tests {
     }
 
     #[test]
+    fn a_non_zero_exit_is_checked_before_empty_output_counts_as_allow() {
+        let text = render(Path::new("/x"), false).unwrap();
+        let exit_check = text.find("if (code !== 0) throw").unwrap();
+        let empty_check = text.find(r#"text.trim() === """#).unwrap();
+        assert!(text.contains("const code = await proc.exited"));
+        assert!(exit_check < empty_check);
+        let catch = text.find("catch (e)").unwrap();
+        assert!(exit_check < catch && text.contains("if (FAIL_OPEN) return"));
+    }
+
+    #[test]
     fn fail_open_is_baked_into_the_argv_and_the_plugin() {
         let text = render(Path::new("/x"), true).unwrap();
         assert_eq!(argv_of(&text), ["/x", "adapter", "opencode", "--fail-open"]);

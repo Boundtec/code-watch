@@ -11,7 +11,8 @@ export const CodeWatch = async ({ directory }) => ({
       proc.stdin.write(JSON.stringify({ command: output.args.command, cwd: directory }))
       proc.stdin.end()
       const text = await new Response(proc.stdout).text()
-      await proc.exited
+      const code = await proc.exited
+      if (code !== 0) throw new Error("code-watch exited with code " + code)
       if (text.trim() === "") return
       const reply = JSON.parse(text)
       if (reply.decision !== "deny") return
