@@ -71,7 +71,7 @@ trait LlmProvider { fn complete(&self, req: &LlmRequest) -> Result<LlmReply>; }
 One HTTP client per API shape, not per vendor: `openai_compat` (OpenAI, OpenRouter, Ollama, LM Studio, vLLM),
 `anthropic`, plus `local` (the OpenAI-compatible shape pointed at localhost). Config in `~/.config/code-watch/config.toml`
 holds `provider`, `base_url`, `model`, `api_key_env` (the name of an environment variable; the key is never stored in
-the file). No key configured: the layer is off and every report says `llm: off`.
+the file). No key configured: the layer is off and every report says `llm: off`. It runs on `scan` only (never `check`, adapters or shims, and not in the clone hook unless `clone_hook = true`), sends at most 12 files and 96 KiB, caps a model finding at `warn`, and when the provider fails, times out (default 20 s, `timeout_secs` up to 120) or answers something unreadable the layer is `skipped` with the reason and nothing else changes. `local` is loopback-only.
 
 **"The LLM only adds findings" is enforced by types, not by convention:**
 
@@ -188,7 +188,7 @@ Each slice is about one worker-day, one reviewable PR, with its tests and its RE
 | 6 | Lockfiles + OSV | parsers per ecosystem behind one `PackageSource` trait, OSV client behind a trait with a fake, offline cache with injected clock |
 | 7 | Install layer | `npm/pnpm/yarn install`, `pip install`, `brew install` unknown tap: shows what will run before it runs. Built as `install/` (read-only, offline, ids `install/*`, `Layer::Rules`); see `docs/install-layer.md`. The pnpm 10 lockfile has no `requiresBuild`, so installed manifests are read |
 | 8 | Downloads layer | done: `.dmg` / `.pkg` / `.app` / Mach-O; `xattr`, `codesign`, `pkgutil` and `spctl` shell-outs behind `MacTools` and `Exec` traits with fakes, macOS only |
-| 9 | LLM layer | provider trait, openai_compat + anthropic + local, `LlmFindings` newtype, the "only adds" property test, prompt-injection fixtures, `docs/llm-layer.md` |
+| 9 | LLM layer (done) | provider trait, openai_compat + anthropic + local, `LlmFindings` newtype, the "only adds" property test, prompt-injection fixtures, `docs/llm-layer.md`. Runs on `scan` only, not in the clone hook unless `clone_hook = true`; severity capped at `warn`; any failure is `llm: skipped` with a reason |
 | 10 | Adapters 1 | `adapter` subcommand, Claude Code, Cursor, Codex CLI, with fixtures of each agent's stdin JSON |
 | 11 | Adapters 2 + shims | Gemini CLI, OpenCode plugin, PATH shims (symlinks to the binary that dispatch on argv[0]), `docs/adding-an-adapter.md` |
 | 12 | Release | install script and Homebrew tap, `cargo-deny`, release workflow (static binaries macOS arm64/x86_64, Linux musl), SECURITY.md, final README; check the OpenCode plugin against a real OpenCode |

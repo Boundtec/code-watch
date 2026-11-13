@@ -8,6 +8,7 @@ use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use code_watch_core::allow::find_repo_root;
 use code_watch_core::download::{MacOsTools, MacTools};
+use code_watch_core::llm::{self, LlmMode};
 use code_watch_core::osv::{Cache, DEFAULT_TTL, OsvMode, SystemClock, UreqOsv};
 use code_watch_core::{Allowlists, Engine, OsvSetup, Report, render};
 
@@ -45,9 +46,12 @@ enum Cmd {
         /// Do not look up known vulnerabilities (the OSV layer reports "off")
         #[arg(long, conflicts_with = "offline")]
         no_osv: bool,
-        /// Check known vulnerabilities from the fresh local cache only, with no network
+        /// Use no network: known vulnerabilities come from the fresh local cache only and the LLM layer is skipped
         #[arg(long)]
         offline: bool,
+        /// Do not ask a model to review the repository (the LLM layer reports "off")
+        #[arg(long)]
+        no_llm: bool,
     },
     /// Check a downloaded .dmg, .pkg, .app or executable before opening it (macOS only; read-only)
     Download { path: PathBuf },
@@ -247,29 +251,48 @@ fn run(cli: &Cli) -> anyhow::Result<Outcome> {
             user_allow_only,
             no_osv,
             offline,
+            no_llm,
         } => {
             let repo = (!user_allow_only).then_some(dir.as_path());
             let allow = Allowlists::load(user_dir.as_deref(), repo)?;
             let engine = Engine::embedded()?;
-            if *no_osv {
-                return Ok(Outcome::Report(engine.scan_dir_with(dir, &allow)?));
-            }
-            let cache_dir = osv_cache_dir(std::env::var_os("XDG_CACHE_HOME"), dirs::home_dir())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("no home directory for the OSV cache; pass --no-osv")
-                })?;
-            let cache = Cache::new(cache_dir, DEFAULT_TTL, Box::new(SystemClock));
+            let cache;
             let client = UreqOsv::default();
-            let setup = OsvSetup {
-                mode: if *offline {
-                    OsvMode::Offline
-                } else {
-                    OsvMode::Live
-                },
-                client: &client,
-                cache: &cache,
+            let setup = if *no_osv {
+                None
+            } else {
+                let cache_dir = osv_cache_dir(std::env::var_os("XDG_CACHE_HOME"), dirs::home_dir())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no home directory for the OSV cache; pass --no-osv")
+                    })?;
+                cache = Cache::new(cache_dir, DEFAULT_TTL, Box::new(SystemClock));
+                Some(OsvSetup {
+                    mode: if *offline {
+                        OsvMode::Offline
+                    } else {
+                        OsvMode::Live
+                    },
+                    client: &client,
+                    cache: &cache,
+                })
             };
-            Outcome::Report(engine.scan_dir_osv(dir, &allow, Some(&setup))?)
+            // The clone hook is `scan --user-allow-only`: the one scan that runs on every checkout.
+            let resolved = if *no_llm {
+                llm::Resolution::Off
+            } else {
+                llm::resolve(
+                    user_dir.as_deref(),
+                    *user_allow_only,
+                    Box::new(|name| std::env::var(name).ok()),
+                )
+            };
+            let mode = match &resolved {
+                llm::Resolution::Off => LlmMode::Off,
+                llm::Resolution::Skipped(why) => LlmMode::Skipped(why.clone()),
+                llm::Resolution::On(_) if *offline => LlmMode::Skipped("offline".into()),
+                llm::Resolution::On(provider) => LlmMode::On(provider.as_ref()),
+            };
+            Outcome::Report(engine.scan_dir_full(dir, &allow, setup.as_ref(), mode)?)
         }
         Cmd::Download { path } => {
             // A download folder is untrusted: no repo allowlist, only the user's own file.

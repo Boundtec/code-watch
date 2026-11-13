@@ -96,8 +96,16 @@ leaves your git config as it was. It refuses rather than overwrite a template di
 
 `scan` also reads the lockfiles (npm, pnpm, yarn, `requirements*.txt` and `requirements/*.txt`, poetry, uv, cargo, go) and asks [OSV](https://osv.dev) about
 the public-registry packages they pin. Only package names, versions and ecosystems are sent. Answers are cached for 24
-hours in `~/.cache/code-watch/osv/`; `scan --offline` uses only that cache and `scan --no-osv` turns the layer off.
+hours in `~/.cache/code-watch/osv/`; `scan --offline` uses only that cache (and also skips the LLM layer, see below) and `scan --no-osv` turns the layer off.
 A lookup that fails is reported, never treated as clean. Details in [docs/osv.md](docs/osv.md).
+
+## Optional LLM review
+
+`scan` can also ask a model (OpenAI-compatible, Anthropic, or a local one such as Ollama) to read manifests, install
+scripts and flagged files and report extra concerns. It is configured in `~/.config/code-watch/config.toml`, off by
+default, and it only adds findings (at most `warn`): it cannot remove or lower anything the rules found. With a remote
+provider, the text of those files leaves your machine, and the clone hook does not use it unless you set
+`clone_hook = true`. Details in [docs/llm-layer.md](docs/llm-layer.md).
 
 ## Agent hooks
 
@@ -142,8 +150,8 @@ mark, code signature and Gatekeeper verdict, read-only, macOS only (skipped and 
 
 ## Layers
 
-Rules and the OSV layer need no key. The optional LLM layer is not built yet; every report says which layers ran,
-which were skipped (and why) and which are off.
+Rules and the OSV layer need no key. The optional LLM layer is off until you configure it; every report says which
+layers ran, which were skipped (and why) and which are off.
 
 ## License
 

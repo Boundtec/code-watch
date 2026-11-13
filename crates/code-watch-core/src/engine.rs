@@ -11,6 +11,7 @@ use crate::command;
 use crate::download::{self, DownloadError, DownloadStatus, MacTools};
 use crate::finding::{Finding, Severity};
 use crate::install;
+use crate::llm::{self, LlmMode, LlmOutcome};
 use crate::osv::{self, Cache, OsvClient, OsvMode, RULE_IDS};
 use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{HEAD_BYTES, RuleError, RuleSet, Target};
@@ -128,6 +129,19 @@ impl Engine {
         allow: &Allowlists,
         osv: Option<&OsvSetup<'_>>,
     ) -> Result<Report, ScanError> {
+        self.scan_dir_full(dir, allow, osv, LlmMode::Off)
+    }
+
+    /// Like `scan_dir_osv`, and with `llm` on also asks a model to review a bounded selection of
+    /// files. Its findings are added after the allowlists run: they never hide or change what
+    /// the other layers found, and an allowlist cannot hide them.
+    pub fn scan_dir_full(
+        &self,
+        dir: &Path,
+        allow: &Allowlists,
+        osv: Option<&OsvSetup<'_>>,
+        llm: LlmMode<'_>,
+    ) -> Result<Report, ScanError> {
         if !dir.is_dir() {
             return Err(ScanError::NotADirectory(dir.display().to_string()));
         }
@@ -228,10 +242,19 @@ impl Engine {
             }
         }
         let applied = allow.apply(findings, &self.known_rule_ids());
+        let llm = match llm {
+            LlmMode::Off => None,
+            LlmMode::Skipped(why) => Some(LlmOutcome::Skipped(why)),
+            LlmMode::On(provider) => Some(llm::run(dir, &applied.kept, provider)),
+        };
         let report = Report::from_scan(applied.kept, skipped)
             .with_allowlist(applied.suppressed, applied.warnings);
-        Ok(match status {
+        let report = match status {
             Some(status) => report.with_osv(status),
+            None => report,
+        };
+        Ok(match llm {
+            Some(outcome) => report.with_llm(outcome),
             None => report,
         })
     }
