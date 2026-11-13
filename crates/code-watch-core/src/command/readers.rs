@@ -229,14 +229,15 @@ fn interpreter_operands<'a>(simple: &'a Simple, program: &str) -> Vec<&'a str> {
 }
 
 /// `sudo -i` and `sudo -s` start the user's shell, which reads stdin.
+pub const LOGIN_WRAPPERS: &[&str] = &["sudo", "doas"];
+pub const LOGIN_FLAGS: &[&str] = &["-i", "-s", "--login", "--shell"];
+
 fn starts_login_shell(simple: &Simple) -> bool {
     let Some((first, rest)) = simple.words.split_first() else {
         return false;
     };
-    matches!(basename(&first.text), "sudo" | "doas")
-        && rest
-            .iter()
-            .any(|w| matches!(w.text.as_str(), "-i" | "-s" | "--login" | "--shell"))
+    LOGIN_WRAPPERS.contains(&basename(&first.text))
+        && rest.iter().any(|w| LOGIN_FLAGS.contains(&w.text.as_str()))
 }
 
 /// `ssh host` with no command opens a login shell that reads stdin; with a command, the remote

