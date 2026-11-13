@@ -11,14 +11,20 @@ const KEY: &str = "init.templateDir";
 
 /// Directory that holds our template (and nothing of the user's).
 fn template_dir() -> Result<PathBuf> {
-    let var = |name| {
-        std::env::var_os(name)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-    };
-    let data = var("XDG_DATA_HOME")
-        .or_else(|| var("HOME").map(|h| h.join(".local/share")))
-        .context("neither XDG_DATA_HOME nor HOME is set")?;
+    let var = |name| std::env::var_os(name).map(PathBuf::from);
+    template_dir_from(var("XDG_DATA_HOME"), var("HOME"))
+}
+
+/// A relative `XDG_DATA_HOME` or `HOME` is ignored: the template would land in whatever
+/// directory the command happened to run in.
+fn template_dir_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf> {
+    let data = xdg
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            home.filter(|h| h.is_absolute())
+                .map(|h| h.join(".local/share"))
+        })
+        .context("neither an absolute XDG_DATA_HOME nor an absolute HOME is set")?;
     Ok(data.join("code-watch/git-template"))
 }
 
@@ -123,15 +129,15 @@ pub fn install(binary: &Path) -> Result<String> {
     }
     fs::create_dir_all(hook.parent().unwrap_or(&dir))
         .with_context(|| format!("cannot create {}", dir.display()))?;
-    if existed {
-        fs::remove_file(&hook).with_context(|| format!("cannot replace {}", hook.display()))?;
-    }
+    let staged = hook.with_extension("new");
+    let _ = fs::remove_file(&staged);
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o755)
-        .open(&hook)
+        .open(&staged)
         .and_then(|mut f| f.write_all(hook_script(binary).as_bytes()))
+        .and_then(|()| fs::rename(&staged, &hook))
         .with_context(|| format!("cannot write {}", hook.display()))?;
 
     if current.is_none() {
@@ -167,4 +173,22 @@ pub fn uninstall() -> Result<String> {
     git(&["config", "--global", "--unset", KEY])?;
     remove_template(&dir);
     Ok("uninstalled".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_data_home_or_home_is_ignored() {
+        let dir = |xdg: Option<&str>, home: Option<&str>| {
+            template_dir_from(xdg.map(PathBuf::from), home.map(PathBuf::from)).ok()
+        };
+        let want = |p: &str| Some(PathBuf::from(p).join("code-watch/git-template"));
+        assert_eq!(dir(Some("/x"), Some("/h")), want("/x"));
+        assert_eq!(dir(Some("rel"), Some("/h")), want("/h/.local/share"));
+        assert_eq!(dir(Some(""), Some("/h")), want("/h/.local/share"));
+        assert_eq!(dir(None, Some("rel")), None);
+        assert_eq!(dir(Some("rel"), None), None);
+    }
 }
