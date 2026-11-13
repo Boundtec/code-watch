@@ -7,6 +7,20 @@ Linux. Windows is not supported.
 > Status: early. It ships the engine, the CLI, the repo and command rules, allowlists and the OSV layer. See
 > [DESIGN.md](DESIGN.md) for the plan.
 
+## Install
+
+Download the script, read it, then run it. It installs the release binary for your OS and architecture into
+`~/.local/bin` (no sudo) and refuses if the SHA-256 checksum does not match.
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/Boundtec/code-watch/main/install.sh
+less install.sh
+sh install.sh
+```
+
+`CODE_WATCH_VERSION=0.1.0` picks a release instead of the latest, `CODE_WATCH_INSTALL_DIR` changes the directory.
+Homebrew: coming soon. To build from source, see below. Maintainers: [docs/releasing.md](docs/releasing.md).
+
 ## Try it
 
 ```sh
