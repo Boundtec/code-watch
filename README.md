@@ -36,7 +36,9 @@ commands are matched, not run.
 | `repo/vscode-folderopen-task` | block | a VS Code task that runs when the folder opens |
 | `repo/base64-into-shell` | block | base64 decoded straight into a shell in scripts and manifests |
 | `command/base64-into-shell` | block | the same in a command |
-| `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell or a stdin-reading interpreter, or run through `$(...)` or `<(...)` |
+| `command/pipe-to-shell` | warn | `curl` or `wget` piped into a shell or an interpreter that runs stdin or inline code, or run through `$(...)` or `<(...)` |
+| `command/unparsable` | warn | command text the parser rejects (unterminated quote or `$(`, dangling `\|\|`) or over 64 KiB, so it was not checked |
+| `command/nesting-too-deep` | warn / block | shells or substitutions nested past three levels; block when the text at the limit holds a shell |
 | `command/quarantine-removal` | warn | `xattr` removing or rewriting the macOS quarantine flag |
 | `command/lookalike-download-domain` | block / warn | `curl` or `wget` fetching from a domain that imitates a well-known one; block when piped into a shell, warn otherwise |
 | `command/hidden-program-into-shell` | warn | a pipeline into a shell whose program name is hidden behind `$` or a backtick (`$c x \| sh`), or `eval` of a variable |
@@ -55,10 +57,12 @@ Rules live in `crates/code-watch-core/rules/` and ship inside the binary. More i
 
 ## Before a command
 
-`check <command>` splits the command into words with `shlex`, then into pipeline segments on `|`, `;`, `&&`, `||` and
-`&`, so a rule can say "this download reaches that shell": a shell (or an interpreter such as `python3` run without a
-script file) anywhere downstream in the same pipeline counts, and wrappers such as `sudo -u root`, `env`, `nohup`,
-`exec`, `command`, `xargs`, `time` and `nice` are skipped to find the real program. The lookalike check reads the host
+`check <command>` parses the command with a real shell parser (`brush-parser`) and looks at every simple command of every
+list, pipeline, subshell, group, compound command, `$(...)`, backtick and `<(...)`, so a rule can say "this download
+reaches that shell": a shell, an interpreter such as `python3` run without a script file or with inline code (`-c`, `-e`),
+or `source /dev/stdin` anywhere downstream in the same pipeline counts, and wrappers such as `sudo -u root`, `doas`,
+`env`, `busybox`, `nohup`, `exec`, `command`, `xargs`, `time` and `nice` are skipped to find the real program. Text that
+cannot be parsed, a command over 64 KiB, or nesting deeper than three levels is a finding too, never a clean pass. The lookalike check reads the host
 of every argument of `curl` and `wget` (with or without `https://`, `--url=` included), decodes punycode, takes the
 registrable domain from the public suffix list and compares it with a list of well-known domains by Unicode skeleton,
 a single edit, and the same name under another suffix. Real sibling sites (`gitlab.com`, `docker.io`) are never

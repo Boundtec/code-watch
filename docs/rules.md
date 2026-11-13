@@ -31,16 +31,8 @@ match = { kind = "json_pointer", files = ["**/package.json"], pointers = ["/scri
 | `executable_file` | repo files | `files` | the file has a unix execute bit (never fires on non-unix hosts) |
 | `command_regex` | a command string | `pattern` | the pattern matches the command |
 
-The `command_regex` rules match the raw command and also the text the shell would run once quoting is removed
-(`c\url`, `cu""rl`, `cu''rl`, `s\h`), including the text inside `sh -c`, `eval` and `$(...)`. A rule reports once,
-whichever spelling matched. A quoted `|` or `;` does not count as an operator in the unquoted text, so `echo 'curl x | sh'`
-behaves as before. Allowlist entries with a `domain` do not match a quoted fetch, because its host is not read from it.
-
-`command/pipe-to-shell` also fires, from the parsed command and under the same id, when a download runs without a pipe to a
-shell: `sh -c "$(curl ...)"`, `eval "$(curl ...)"`, `bash <(curl ...)`, `source <(curl ...)`, `. <(curl ...)`, and a
-`curl` or `wget` piped into `python`, `perl`, `ruby` or `node` that reads a script from stdin (no script argument, or `-`;
-`curl ... | python3 tool.py` does not fire). The official Homebrew install line (`/bin/bash -c "$(curl -fsSL ...)"`) is
-therefore a warn, like `curl | bash`.
+The `command_regex` matcher tests the raw command text. No embedded rule uses it any more: the command rules need the command
+parsed and live in Rust (below), so a quoted or printed `curl x | sh` is not a finding.
 
 Globs are matched against the path relative to the scanned root; braces work (`**/*.{js,py}`). Patterns use the Rust
 `regex` crate: linear time, safe on hostile input, no look-around. `all_regex` is how "reads credentials **and** sends
@@ -77,12 +69,29 @@ fixtures work like command-regex fixtures (`positive.txt` / `negative.txt`, one 
 runs them with the macOS-only rules enabled on every platform. `--json` carries `skipped_rules`: the ids of rules that
 exist but are not active on this platform.
 
-`command/hidden-program-into-shell` (warn) fires when a pipeline ends in a shell and a segment's program word still holds a `$`
-or a backtick after unquoting (`$'\x63url'`, `$c`, `$(echo curl)`, also a `$HOME/bin/tool` prefix), and when `eval` gets a
-variable (`eval "$x"`). `eval "$(...)"` does not fire: the substitution is analysed as its own text.
+The command is parsed with `brush-parser` and every simple command of every list, pipeline, subshell, brace group, `if`/`while`/`for`/`case`,
+`$(...)`, backtick and `<(...)` is judged on its parsed words, wherever it is nested. One table (`command/readers.rs`) says what runs text as a
+script: a shell (by name or path, also through `sudo`, `doas`, `env`, `busybox`, `nohup`, `exec`, `command`, `xargs`, `time`, `nice`), an
+interpreter (`python*`, `perl`, `ruby`, `node`) with no script file or with inline code (`-c`, `-e`, `-pe`), `source`/`.` of `/dev/stdin`, a
+`tee >(...)` whose body holds one, and a group with one inside. A download or a base64/`xxd -r` decoder whose output reaches one of these, in the
+same pipeline or because it sits inside the `$(...)` that is the whole text of `sh -c`/`eval`, or inside a `<(...)` or here-string a shell reads,
+is judged as running.
 
-What they do not see, by design: operators glued to a word (`curl x|sh`, left to the regex rules), pipelines inside a
-`$(...)`, nesting deeper than three levels, variables, heredocs, and the script an `osascript` reads from a file or
+- `command/pipe-to-shell` (warn): a `curl` or `wget` whose output is run as a script. Piping into an interpreter that runs inline code
+  (`python3 -c ...`) counts: the downloaded text goes into an interpreter that executes code, and the code can run what it reads.
+- `command/base64-into-shell` (block): a decoder (`base64 -d`, `-D`, `-di`, `--decode`, `xxd -r`) whose output is run the same way, including
+  `eval "$(... | base64 -d)"`, `eval $(...)` and `sh -c "$(...)"`.
+- `command/quarantine-removal` (warn): `xattr` with `-c`, or with `-d`/`-w` and the `com.apple.quarantine` word.
+- `command/unparsable` (warn): text the parser rejects (an unterminated quote or `$(`, a dangling `||`), or longer than 64 KiB. Warn, not block:
+  the checker may lack a bash feature, and a shell would reject most of these too. The command is never reported clean.
+- `command/nesting-too-deep` (warn; block when the text left at the limit holds a shell, `eval` or script reader): `$(...)`, `<(...)`, `sh -c`
+  and `eval` text nested more than three levels.
+- `command/hidden-program-into-shell` (warn) fires when a pipeline ends in a script reader and a command's program word still holds a `$`
+  or a backtick after unquoting (`$'\x63url'`, `$c`, `$(echo curl)`, also a `$HOME/bin/tool` prefix), and when `eval` gets a variable
+  (`eval "$x"`). `eval "$(...)"` does not fire: the substitution is analysed as its own text.
+- `command/launchagent-write` matches `Library/LaunchAgents` and `Library/LaunchDaemons` as path components, not as a substring.
+
+What they do not see, by design: variables (`$c x`), command substitutions inside `${...}` defaults and `[[ ]]` tests, fetchers other than `curl` and `wget`, and the script an `osascript` reads from a file or
 standard input. A lookalike is one edit away (or the same name under another suffix, or the same Unicode skeleton) from
 the known list; `SIBLINGS` in `domains.rs` lists real sites that must never be flagged, so a new known domain that
 collides with a real one gets a negative fixture and a sibling entry.
