@@ -17,6 +17,7 @@ struct JsonReport<'a> {
     findings: &'a [Finding],
     skipped: &'a [Skipped],
     skipped_rules: &'a [String],
+    skipped_layers: &'a std::collections::BTreeMap<Layer, String>,
     suppressed: &'a [Suppressed],
     allowlist_warnings: &'a [String],
 }
@@ -29,6 +30,7 @@ pub fn to_json(report: &Report) -> serde_json::Result<String> {
         findings: report.findings(),
         skipped: report.skipped(),
         skipped_rules: report.skipped_rules(),
+        skipped_layers: report.layer_notes(),
         suppressed: report.suppressed(),
         allowlist_warnings: report.allowlist_warnings(),
     };
@@ -56,7 +58,10 @@ pub fn to_human(report: &Report) -> String {
     let layers: Vec<String> = report
         .layers()
         .iter()
-        .map(|(layer, status)| format!("{layer} {status}"))
+        .map(|(layer, status)| match report.layer_notes().get(layer) {
+            Some(why) => format!("{layer} {status} ({why})"),
+            None => format!("{layer} {status}"),
+        })
         .collect();
     let _ = writeln!(out, "layers: {}", layers.join(", "));
     if !report.skipped_rules().is_empty() {

@@ -5,12 +5,14 @@ use serde::Serialize;
 use crate::allow::Suppressed;
 use crate::finding::{Evidence, Finding, Layer, Severity};
 use crate::names::display_as_wire_name;
+use crate::osv::OsvStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LayerStatus {
     Ran,
     Off,
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -59,6 +61,7 @@ pub struct Report {
     layers: BTreeMap<Layer, LayerStatus>,
     skipped: Vec<Skipped>,
     skipped_rules: Vec<String>,
+    layer_notes: BTreeMap<Layer, String>,
     suppressed: Vec<Suppressed>,
     allowlist_warnings: Vec<String>,
 }
@@ -90,9 +93,30 @@ impl Report {
             layers,
             skipped,
             skipped_rules: Vec::new(),
+            layer_notes: BTreeMap::new(),
             suppressed: Vec::new(),
             allowlist_warnings: Vec::new(),
         }
+    }
+
+    /// Records how the OSV layer ended. `Skipped` keeps its reason, so a report never says
+    /// "ran" for a layer that could not look anything up.
+    pub fn with_osv(mut self, status: OsvStatus) -> Self {
+        match status {
+            OsvStatus::Ran => {
+                self.layers.insert(Layer::Osv, LayerStatus::Ran);
+            }
+            OsvStatus::Skipped(why) => {
+                self.layers.insert(Layer::Osv, LayerStatus::Skipped);
+                self.layer_notes.insert(Layer::Osv, why);
+            }
+        }
+        self
+    }
+
+    /// Why each skipped layer was skipped.
+    pub fn layer_notes(&self) -> &BTreeMap<Layer, String> {
+        &self.layer_notes
     }
 
     /// Records rules that exist but are not active on this platform, so a clean verdict never
@@ -212,9 +236,20 @@ mod tests {
     }
 
     #[test]
+    fn osv_layer_status_is_ran_or_skipped_with_its_reason() {
+        let ran = Report::from_rules(vec![]).with_osv(OsvStatus::Ran);
+        assert_eq!(ran.layers()[&Layer::Osv], LayerStatus::Ran);
+        assert!(ran.layer_notes().is_empty());
+        let skipped = Report::from_rules(vec![]).with_osv(OsvStatus::Skipped("offline".into()));
+        assert_eq!(skipped.layers()[&Layer::Osv], LayerStatus::Skipped);
+        assert_eq!(skipped.layer_notes()[&Layer::Osv], "offline");
+    }
+
+    #[test]
     fn llm_and_osv_layers_report_off() {
         let r = Report::from_rules(vec![]);
         assert_eq!(r.layers()[&Layer::Rules], LayerStatus::Ran);
         assert_eq!(r.layers()[&Layer::Llm], LayerStatus::Off);
+        assert_eq!(r.layers()[&Layer::Osv], LayerStatus::Off);
     }
 }

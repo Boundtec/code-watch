@@ -7,6 +7,7 @@ use ignore::WalkBuilder;
 
 use crate::allow::Allowlists;
 use crate::command;
+use crate::osv::{self, Cache, OsvClient, OsvMode, RULE_IDS};
 use crate::report::{Report, SkipReason, Skipped};
 use crate::rules::{HEAD_BYTES, RuleError, RuleSet, Target};
 
@@ -68,6 +69,13 @@ fn error_path(err: &ignore::Error, root: &Path) -> String {
     }
 }
 
+/// What the OSV layer needs: how to behave, where to ask and where to remember.
+pub struct OsvSetup<'a> {
+    pub mode: OsvMode,
+    pub client: &'a dyn OsvClient,
+    pub cache: &'a Cache,
+}
+
 pub struct Engine {
     rules: RuleSet,
 }
@@ -90,7 +98,19 @@ impl Engine {
     }
 
     /// Like `scan_dir`, then hides the findings `allow` allows; they stay listed in the report.
+    /// The OSV layer is off.
     pub fn scan_dir_with(&self, dir: &Path, allow: &Allowlists) -> Result<Report, ScanError> {
+        self.scan_dir_osv(dir, allow, None)
+    }
+
+    /// Like `scan_dir_with`, and with `osv` set also checks the lockfiles for known
+    /// vulnerabilities. The OSV findings go through the allowlists with the rest.
+    pub fn scan_dir_osv(
+        &self,
+        dir: &Path,
+        allow: &Allowlists,
+        osv: Option<&OsvSetup<'_>>,
+    ) -> Result<Report, ScanError> {
         if !dir.is_dir() {
             return Err(ScanError::NotADirectory(dir.display().to_string()));
         }
@@ -151,9 +171,16 @@ impl Engine {
                 }),
             }
         }
+        let outcome = osv.map(|o| osv::run(osv::discover(dir), o.mode, o.client, o.cache));
+        let status = outcome.as_ref().map(|o| o.status.clone());
+        findings.extend(outcome.into_iter().flat_map(|o| o.findings));
         let applied = allow.apply(findings, &self.known_rule_ids());
-        Ok(Report::from_scan(applied.kept, skipped)
-            .with_allowlist(applied.suppressed, applied.warnings))
+        let report = Report::from_scan(applied.kept, skipped)
+            .with_allowlist(applied.suppressed, applied.warnings);
+        Ok(match status {
+            Some(status) => report.with_osv(status),
+            None => report,
+        })
     }
 
     fn known_rule_ids(&self) -> HashSet<String> {
@@ -163,6 +190,7 @@ impl Engine {
             .iter()
             .map(|r| r.id.clone())
             .chain(rust_rules)
+            .chain(RULE_IDS.iter().map(|id| id.to_string()))
             .collect()
     }
 

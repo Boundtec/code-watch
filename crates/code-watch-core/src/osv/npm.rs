@@ -23,8 +23,6 @@ struct Entry {
     version: Option<String>,
     resolved: Option<String>,
     #[serde(default)]
-    link: bool,
-    #[serde(default)]
     dependencies: BTreeMap<String, Entry>,
 }
 
@@ -63,7 +61,7 @@ fn push_if_public(out: &mut Vec<Package>, file: &str, name: &str, entry: &Entry)
         return;
     };
     let public = entry.resolved.as_deref().is_none_or(is_public_npm_url);
-    if entry.link || !public || name.is_empty() {
+    if !public || name.is_empty() {
         return;
     }
     out.push(Package::new(Ecosystem::Npm, name, version, file));

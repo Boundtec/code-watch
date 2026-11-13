@@ -12,7 +12,7 @@ pub mod report;
 pub mod rules;
 
 pub use allow::{AllowError, Allowlists, Source, Suppressed};
-pub use engine::{Engine, ScanError};
+pub use engine::{Engine, OsvSetup, ScanError};
 pub use finding::{Evidence, Finding, Layer, Severity};
 pub use report::{LayerStatus, Report, SkipReason, Skipped, Verdict};
 pub use rules::{Rule, RuleError, RuleSet, Target};

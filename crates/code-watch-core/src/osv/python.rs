@@ -9,7 +9,7 @@ use super::package::{Ecosystem, Package, PackageSource, ParseError};
 const PYPI_INDEX: &str = "https://pypi.org/simple";
 
 /// PEP 503 normalised name, so the same package spelled two ways is one package.
-fn normalise(name: &str) -> Option<String> {
+pub(crate) fn normalise(name: &str) -> Option<String> {
     PackageName::from_str(name).ok().map(|n| n.to_string())
 }
 

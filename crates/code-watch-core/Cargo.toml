@@ -30,6 +30,7 @@ thiserror = "2.0.21"
 toml = "1.2.1"
 unicode-general-category = "1.1.0"
 unicode-security = "0.1.3"
+ureq = "3"
 yarn-lock-parser = "0.14.0"
 
 [target.'cfg(unix)'.dependencies]

@@ -21,6 +21,7 @@ code-watch uninstall-hook   # turn it off; your git config is as it was before
   Warnings exit 0 on purpose: a failing hook makes git report a failed checkout, which would make every warning look
   like a broken clone.
 - Branch switches and file checkouts are not scanned; only a clone or a new worktree is.
+- The scan includes the known-vulnerabilities check, which sends package names and versions to OSV (see [osv.md](osv.md)); with no network it is reported as skipped and the clone is still scanned by the rules.
 - If the `code-watch` binary was moved, the hook tries the `code-watch` on your PATH; if there is none it says so on
   every clone and lets the clone through. Run `code-watch install-hook` again after moving it.
 

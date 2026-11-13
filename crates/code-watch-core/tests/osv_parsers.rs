@@ -119,6 +119,7 @@ fn requirements_keep_exact_pins_with_normalised_names_and_first_line_numbers() {
         got,
         [
             ("django-rest-framework", "3.14.0", Some(3)),
+            ("pandas", "2.0.0", Some(14)),
             ("requests", "2.31.0", Some(2)),
             ("urllib3", "2.0.7", Some(10)),
         ]

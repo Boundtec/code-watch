@@ -7,7 +7,8 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use code_watch_core::allow::find_repo_root;
-use code_watch_core::{Allowlists, Engine, Report, render};
+use code_watch_core::osv::{Cache, DEFAULT_TTL, OsvMode, SystemClock, UreqOsv};
+use code_watch_core::{Allowlists, Engine, OsvSetup, Report, render};
 
 mod hook;
 
@@ -31,7 +32,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Scan a directory (for example a freshly cloned repository) without running anything in it
-    Scan { dir: PathBuf },
+    Scan {
+        dir: PathBuf,
+        /// Do not look up known vulnerabilities (the OSV layer reports "off")
+        #[arg(long, conflicts_with = "offline")]
+        no_osv: bool,
+        /// Check known vulnerabilities from the fresh local cache only, with no network
+        #[arg(long)]
+        offline: bool,
+    },
     /// Check a shell command before it runs
     Check {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -103,9 +112,32 @@ enum Outcome {
 fn run(cli: &Cli) -> anyhow::Result<Outcome> {
     let user_dir = user_config_dir(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir());
     Ok(match &cli.command {
-        Cmd::Scan { dir } => {
+        Cmd::Scan {
+            dir,
+            no_osv,
+            offline,
+        } => {
             let allow = Allowlists::load(user_dir.as_deref(), Some(dir))?;
-            Outcome::Report(Engine::embedded()?.scan_dir_with(dir, &allow)?)
+            let engine = Engine::embedded()?;
+            if *no_osv {
+                return Ok(Outcome::Report(engine.scan_dir_with(dir, &allow)?));
+            }
+            let cache_dir = osv_cache_dir(std::env::var_os("XDG_CACHE_HOME"), dirs::home_dir())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no home directory for the OSV cache; pass --no-osv")
+                })?;
+            let cache = Cache::new(cache_dir, DEFAULT_TTL, Box::new(SystemClock));
+            let client = UreqOsv::default();
+            let setup = OsvSetup {
+                mode: if *offline {
+                    OsvMode::Offline
+                } else {
+                    OsvMode::Live
+                },
+                client: &client,
+                cache: &cache,
+            };
+            Outcome::Report(engine.scan_dir_osv(dir, &allow, Some(&setup))?)
         }
         Cmd::Check { command } => {
             let repo = std::env::current_dir()
@@ -126,9 +158,31 @@ fn user_config_dir(xdg: Option<OsString>, home: Option<PathBuf>) -> Option<PathB
         .or_else(|| home.map(|h| h.join(".config")))
 }
 
+/// `$XDG_CACHE_HOME/code-watch/osv` when the variable is an absolute path, else
+/// `~/.cache/code-watch/osv`; the same on macOS and Linux.
+fn osv_cache_dir(xdg: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
+    xdg.map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| h.join(".cache")))
+        .map(|base| base.join("code-watch").join("osv"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_osv_cache_follows_xdg_cache_home_else_dot_cache() {
+        let home = Some(PathBuf::from("/h"));
+        let dir = |xdg: Option<&str>| osv_cache_dir(xdg.map(OsString::from), home.clone());
+        assert_eq!(dir(Some("/x")), Some(PathBuf::from("/x/code-watch/osv")));
+        assert_eq!(
+            dir(Some("rel")),
+            Some(PathBuf::from("/h/.cache/code-watch/osv"))
+        );
+        assert_eq!(dir(None), Some(PathBuf::from("/h/.cache/code-watch/osv")));
+        assert_eq!(osv_cache_dir(None, None), None);
+    }
 
     #[test]
     fn xdg_config_home_wins_when_absolute_else_home_dot_config() {
