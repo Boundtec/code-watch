@@ -12,6 +12,9 @@ use std::thread;
 
 use tempfile::TempDir;
 
+mod common;
+use common::{output_of, spawn_lock};
+
 const TARGET: &str = "x86_64-unknown-linux-musl";
 
 struct Env {
@@ -38,6 +41,7 @@ impl Env {
         let shim = self.path("shim/uname");
         let script =
             format!("#!/bin/sh\nif [ \"$1\" = -s ]; then echo {os}; else echo {machine}; fi\n");
+        let _guard = spawn_lock();
         fs::write(&shim, script).unwrap();
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -48,20 +52,23 @@ impl Env {
         let stage = self.path("stage").join(&name);
         fs::create_dir_all(&stage).unwrap();
         let bin = stage.join("code-watch");
-        fs::write(&bin, format!("#!/bin/sh\necho {body}\n")).unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        {
+            let _guard = spawn_lock();
+            fs::write(&bin, format!("#!/bin/sh\necho {body}\n")).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let out_dir = self.path("release").join(dir);
         fs::create_dir_all(&out_dir).unwrap();
         let archive = out_dir.join(format!("{name}.tar.gz"));
-        let status = Command::new("tar")
-            .arg("-C")
-            .arg(self.path("stage"))
-            .arg("-czf")
-            .arg(&archive)
-            .arg(&name)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let tar = output_of(
+            Command::new("tar")
+                .arg("-C")
+                .arg(self.path("stage"))
+                .arg("-czf")
+                .arg(&archive)
+                .arg(&name),
+        );
+        assert!(tar.status.success());
         (format!("{name}.tar.gz"), sha256(&archive))
     }
 
@@ -105,7 +112,7 @@ impl Env {
         if let Some(v) = version {
             cmd.env("CODE_WATCH_VERSION", v);
         }
-        cmd.output().unwrap()
+        output_of(&mut cmd)
     }
 
     /// A PATH that holds the shimmed `uname` and links to only the tools the script needs,
@@ -149,13 +156,13 @@ impl Env {
 }
 
 fn sha256(file: &Path) -> String {
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg("if command -v sha256sum >/dev/null; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi")
-        .arg("sh")
-        .arg(file)
-        .output()
-        .unwrap();
+    let out = output_of(
+        Command::new("sh")
+            .arg("-c")
+            .arg("if command -v sha256sum >/dev/null; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi")
+            .arg("sh")
+            .arg(file),
+    );
     String::from_utf8(out.stdout)
         .unwrap()
         .split_whitespace()
@@ -218,9 +225,7 @@ fn serve(root: PathBuf, latest: &'static str) -> String {
 }
 
 fn run_binary(env: &Env) -> String {
-    let out = Command::new(env.install_dir().join("code-watch"))
-        .output()
-        .unwrap();
+    let out = output_of(&mut Command::new(env.install_dir().join("code-watch")));
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 

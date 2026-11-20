@@ -1,31 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
-/// Held while an executable is written and while a child is spawned: a child forked by another
-/// test thread keeps the write fd open until its exec, and exec of that file then fails with
-/// ETXTBSY on Linux.
-static SPAWN_LOCK: Mutex<()> = Mutex::new(());
-
-fn spawn_lock() -> MutexGuard<'static, ()> {
-    SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// `Command::output` with the spawn under the lock and the wait outside it.
-fn output_of(cmd: &mut Command) -> Output {
-    let child = {
-        let _guard = spawn_lock();
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
-    };
-    child.wait_with_output().unwrap()
-}
+mod common;
+use common::{output_of, spawn_lock};
 
 /// A fake home: every git call and every code-watch call in a test runs inside it, and the
 /// real global git config is checked to be untouched when the test ends.
